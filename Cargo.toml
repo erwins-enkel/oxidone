@@ -64,7 +64,8 @@ tracing-appender = "0.2"
 [dev-dependencies]
 wiremock = "0.6"          # request-building + (de)serialization contract tests
 pretty_assertions = "1"
-crossterm = "0.28"        # build KeyEvents in reducer tests
+# NOTE: crossterm/chrono are NOT re-listed here — normal [dependencies] are
+# already available to integration tests; only test-only crates go here.
 
 [profile.release]
 strip = true

@@ -66,7 +66,7 @@ pub struct TaskPatch {
     pub completed: Option<bool>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApiError {
     #[error("network error: {0}")]
     Network(String),

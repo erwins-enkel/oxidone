@@ -32,6 +32,14 @@ pub struct Task {
     pub updated: DateTime<Utc>,
 }
 
+impl Task {
+    /// A Subtask is any Task with a parent. Nesting is capped at one level, so
+    /// `is_subtask()` also means "cannot itself be a parent".
+    pub fn is_subtask(&self) -> bool {
+        self.parent.is_some()
+    }
+}
+
 /// The only two states a Task can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {

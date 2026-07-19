@@ -2,6 +2,12 @@
 //! Token persistence is behind `TokenStore` so a keychain backend can replace
 //! the plaintext-600 file later without touching call sites.
 
+mod oauth;
+mod store;
+
+pub use oauth::{login, YupTokenProvider};
+pub use store::FileTokenStore;
+
 use crate::api::ApiError;
 
 /// Where the refresh token lives. v1 impl: `chmod 600` file in the config dir.
@@ -17,8 +23,13 @@ pub trait TokenProvider: Send + Sync {
     async fn bearer(&self) -> Result<String, ApiError>;
 }
 
-/// First-run: open the system browser to Google's consent URL, run the
-/// `localhost` loopback listener, exchange the code, persist via `TokenStore`.
-pub async fn login(/* client_secret, store */) -> anyhow::Result<()> {
-    todo!("yup-oauth2 InstalledFlow, HTTPRedirect (loopback)")
+/// A fixed bearer token. Used by the `wiremock` contract suite to drive
+/// `RestClient` without touching real OAuth.
+pub struct StaticTokenProvider(pub String);
+
+#[async_trait::async_trait]
+impl TokenProvider for StaticTokenProvider {
+    async fn bearer(&self) -> Result<String, ApiError> {
+        Ok(self.0.clone())
+    }
 }

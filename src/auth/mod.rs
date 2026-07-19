@@ -21,6 +21,13 @@ pub trait TokenStore: Send + Sync {
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     async fn bearer(&self) -> Result<String, ApiError>;
+
+    /// Force a token refresh and return the new bearer, used to retry once after
+    /// a 401 (the cached token may look valid to the provider but be rejected by
+    /// the server). Defaults to `bearer` for providers with no refresh concept.
+    async fn refresh(&self) -> Result<String, ApiError> {
+        self.bearer().await
+    }
 }
 
 /// A fixed bearer token. Used by the `wiremock` contract suite to drive

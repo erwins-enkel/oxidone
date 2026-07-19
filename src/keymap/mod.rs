@@ -15,6 +15,7 @@ pub enum Action {
     SwitchPane,
     SelectNext,
     SelectPrev,
+    ToggleComplete,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -67,6 +68,11 @@ pub fn bindings() -> &'static [Binding] {
             action: Action::SelectPrev,
             help: "select previous",
         },
+        Binding {
+            key: KeyCode::Char(' '),
+            action: Action::ToggleComplete,
+            help: "toggle complete",
+        },
     ];
     BINDINGS
 }
@@ -83,6 +89,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
 /// A short label for a key, for the cheatsheet.
 pub fn key_label(code: KeyCode) -> String {
     match code {
+        KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::Esc => "Esc".to_string(),

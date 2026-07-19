@@ -3,7 +3,9 @@
 //! (api/sync/auth) only ever emit `Message`s into this reducer, and `update`
 //! emits `Command`s for them to run.
 
-use crate::domain::{List, ListId, Task};
+use std::collections::HashMap;
+
+use crate::domain::{List, ListId, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 
 /// Which pane currently has focus.
@@ -37,6 +39,10 @@ pub struct Model {
     pub should_quit: bool,
     /// Transient one-line message (load errors now; toasts later).
     pub status_line: Option<String>,
+    /// Tasks with a completion write in flight, mapped to their pre-write
+    /// snapshot for rollback. Acts as a single-flight guard: a Task already
+    /// mid-write ignores further toggles, so no two writes race the same Task.
+    pending_writes: HashMap<TaskId, Task>,
 }
 
 impl Default for Model {
@@ -50,6 +56,7 @@ impl Default for Model {
             show_help: false,
             should_quit: false,
             status_line: None,
+            pending_writes: HashMap::new(),
         }
     }
 }
@@ -75,6 +82,13 @@ pub enum Message {
     ListsLoaded(Vec<List>),
     /// The Tasks of a specific List. Ignored if that List is no longer active.
     TasksLoaded(ListId, Vec<Task>),
+    /// A write succeeded; reconcile the Model with the server's Task.
+    TaskUpdated(Task),
+    /// A completion write failed; roll back to the pre-write snapshot.
+    TaskWriteFailed {
+        task: TaskId,
+        reason: String,
+    },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
 }
@@ -84,6 +98,12 @@ pub enum Message {
 pub enum Command {
     /// Load the Tasks of a List (from cache, and later a live refresh).
     LoadTasks(ListId),
+    /// Write-through a completion toggle for a Task.
+    SetCompleted {
+        list: ListId,
+        task: TaskId,
+        completed: bool,
+    },
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
@@ -99,10 +119,42 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             set_tasks(model, &list, tasks);
             Vec::new()
         }
+        Message::TaskUpdated(task) => {
+            // The write completed; drop the snapshot and adopt the server Task.
+            // Safe against races: while pending, the single-flight guard blocks
+            // further toggles of this Task, so no newer local intent exists.
+            model.pending_writes.remove(&task.id);
+            if let Some(slot) = model.tasks.iter_mut().find(|t| t.id == task.id) {
+                *slot = task;
+            }
+            Vec::new()
+        }
+        Message::TaskWriteFailed { task, reason } => {
+            if let Some(previous) = model.pending_writes.remove(&task) {
+                if let Some(slot) = model.tasks.iter_mut().find(|t| t.id == previous.id) {
+                    *slot = previous; // exact pre-write state, incl. completed_at
+                }
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
             Vec::new()
         }
+    }
+}
+
+/// Set a Task's completed state (locally). Completing leaves `completed_at` for
+/// the server response to fill; un-completing clears it.
+fn set_completed(task: &mut Task, completed: bool) {
+    task.status = if completed {
+        Status::Completed
+    } else {
+        Status::NeedsAction
+    };
+    if !completed {
+        task.completed_at = None;
     }
 }
 
@@ -174,8 +226,37 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::SwitchPane => model.focus = model.focus.toggled(),
         Action::SelectNext => return move_selection(model, 1),
         Action::SelectPrev => return move_selection(model, -1),
+        Action::ToggleComplete => return toggle_complete(model),
     }
     Vec::new()
+}
+
+/// Toggle the selected Task's completion optimistically and request the
+/// write-through. A no-op unless the task pane is focused with a Task selected.
+fn toggle_complete(model: &mut Model) -> Vec<Command> {
+    if model.focus != Focus::Tasks {
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.selected_task else {
+        return Vec::new();
+    };
+    let id = model.tasks[index].id.clone();
+    // Single-flight: ignore a toggle while this Task's write is in flight.
+    if model.pending_writes.contains_key(&id) {
+        return Vec::new();
+    }
+    let snapshot = model.tasks[index].clone();
+    let completed = model.tasks[index].status == Status::NeedsAction; // completing iff open
+    set_completed(&mut model.tasks[index], completed);
+    model.pending_writes.insert(id.clone(), snapshot);
+    vec![Command::SetCompleted {
+        list,
+        task: id,
+        completed,
+    }]
 }
 
 /// Move the cursor in the focused pane. In the sidebar this changes the active

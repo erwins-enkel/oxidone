@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 
 use crate::app::{Focus, Model};
+use crate::domain::Status;
 use crate::keymap;
 use theme::Theme;
 
@@ -61,7 +62,17 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme)
     let items: Vec<ListItem> = model
         .tasks
         .iter()
-        .map(|t| ListItem::new(t.title.clone()))
+        .map(|t| {
+            // Completed Tasks read dim + struck-through until cleared (#12).
+            let style = if t.status == Status::Completed {
+                Style::new()
+                    .fg(theme.subtext)
+                    .add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::styled(t.title.clone(), style))
+        })
         .collect();
     render_selectable(
         frame,

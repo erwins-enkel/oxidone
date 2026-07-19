@@ -155,6 +155,33 @@ impl Cache {
         Ok(())
     }
 
+    /// Patch a single Task into the cache from a write response (INSERT OR
+    /// REPLACE). Used by write-through so a mutation lands in the cache without
+    /// re-fetching the whole List.
+    pub fn upsert_task(&self, task: &Task) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks
+             (id, list_id, parent, title, notes, status, due, completed_at,
+              position, etag, updated, local_updated, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+            params![
+                task.id.0,
+                task.list.0,
+                task.parent.as_ref().map(|p| &p.0),
+                task.title,
+                task.notes,
+                status_str(task.status),
+                task.due.map(|d| d.format("%Y-%m-%d").to_string()),
+                task.completed_at.map(|c| c.to_rfc3339()),
+                task.position,
+                task.etag,
+                task.updated.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The cached Tasks of a List, in Manual order (`position`).
     pub fn tasks(&self, list: &ListId) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(

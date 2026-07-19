@@ -10,7 +10,7 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use oxidone::api::{NewTask, RestClient, TaskPatch, TasksApi};
+use oxidone::api::{ApiError, NewTask, RestClient, TaskPatch, TasksApi};
 use oxidone::auth::StaticTokenProvider;
 use oxidone::domain::{ListId, Status, TaskId};
 
@@ -449,4 +449,42 @@ async fn other_error_maps_to_rejected_with_message() {
             message: "Invalid task".into()
         }
     );
+}
+
+// ---- Auth-expiry retry (ADR-0002) ----
+
+#[tokio::test]
+async fn a_401_forces_a_refresh_and_retries_once() {
+    let server = MockServer::start().await;
+    // First attempt: 401 (served once, higher priority).
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // The forced-refresh retry sees 200.
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let lists = client(&server).list_lists().await.unwrap();
+    assert!(lists.is_empty());
+}
+
+#[tokio::test]
+async fn a_persistent_401_surfaces_auth_expired() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).list_lists().await.unwrap_err();
+    assert_eq!(err, ApiError::AuthExpired);
 }

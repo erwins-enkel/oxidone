@@ -30,7 +30,7 @@ pub fn view(model: &Model, theme: &Theme, frame: &mut Frame) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(content);
     render_sidebar(frame, panes[0], model, theme);
-    render_pane(frame, panes[1], "Tasks", model.focus == Focus::Tasks, theme);
+    render_task_pane(frame, panes[1], model, theme);
     render_status(frame, status, model, theme);
 
     if model.show_help {
@@ -45,23 +45,63 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
         .iter()
         .map(|l| ListItem::new(l.title.clone()))
         .collect();
-    let list = List::new(items)
-        .block(panel("Lists", focused, theme))
-        .style(Style::new().bg(theme.base).fg(theme.text))
-        .highlight_style(
-            Style::new()
-                .fg(theme.accent)
-                .add_modifier(Modifier::REVERSED),
-        )
-        .highlight_symbol("› ");
-
-    let mut state = ListState::default();
-    state.select(model.selected_list);
-    frame.render_stateful_widget(list, area, &mut state);
+    render_selectable(
+        frame,
+        area,
+        "Lists",
+        items,
+        model.selected_list,
+        focused,
+        theme,
+    );
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, title: &str, focused: bool, theme: &Theme) {
-    frame.render_widget(panel(title, focused, theme), area);
+fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
+    let focused = model.focus == Focus::Tasks;
+    let items: Vec<ListItem> = model
+        .tasks
+        .iter()
+        .map(|t| ListItem::new(t.title.clone()))
+        .collect();
+    render_selectable(
+        frame,
+        area,
+        "Tasks",
+        items,
+        model.selected_task,
+        focused,
+        theme,
+    );
+}
+
+/// A rounded, focus-aware panel wrapping a selectable list. The selection is
+/// highlighted strongly when the pane is focused, faintly when it isn't — so
+/// both the focused pane and the cursor are always visible.
+fn render_selectable(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: Vec<ListItem>,
+    selected: Option<usize>,
+    focused: bool,
+    theme: &Theme,
+) {
+    let highlight = if focused {
+        Style::new()
+            .fg(theme.accent)
+            .add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new().fg(theme.accent)
+    };
+    let list = List::new(items)
+        .block(panel(title, focused, theme))
+        .style(Style::new().bg(theme.base).fg(theme.text))
+        .highlight_style(highlight)
+        .highlight_symbol(if focused { "› " } else { "  " });
+
+    let mut state = ListState::default();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_status(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {

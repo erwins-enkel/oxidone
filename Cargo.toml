@@ -35,7 +35,7 @@ catppuccin = { version = "2", features = ["ratatui"] }  # palette -> ratatui Col
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process"] }
 
 # HTTP + auth (hand-rolled REST; yup-oauth2 for the loopback flow only — see ADR-0004)
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 yup-oauth2 = "12"
 async-trait = "0.1"       # object-safe async TasksApi trait (or drop for RPITIT)
 
@@ -66,6 +66,7 @@ wiremock = "0.6"          # request-building + (de)serialization contract tests
 pretty_assertions = "1"
 # NOTE: crossterm/chrono are NOT re-listed here — normal [dependencies] are
 # already available to integration tests; only test-only crates go here.
+tempfile = "3"            # isolated temp dir for the TokenStore round-trip tests
 
 [profile.release]
 strip = true

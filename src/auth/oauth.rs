@@ -36,6 +36,7 @@ type BearerFn = Box<dyn Fn() -> BearerFuture + Send + Sync>;
 /// closure, so this struct stays a plain, nameable type.
 pub struct YupTokenProvider {
     fetch: BearerFn,
+    force: BearerFn,
 }
 
 impl YupTokenProvider {
@@ -63,12 +64,33 @@ impl YupTokenProvider {
         let auth = Arc::new(auth);
         let scopes: Arc<[String]> = Arc::from(vec![TASKS_SCOPE.to_string()]);
 
-        let fetch: BearerFn = Box::new(move || {
+        let fetch: BearerFn = {
+            let auth = Arc::clone(&auth);
+            let scopes = Arc::clone(&scopes);
+            Box::new(move || {
+                let auth = Arc::clone(&auth);
+                let scopes = Arc::clone(&scopes);
+                Box::pin(async move {
+                    let token = auth
+                        .token(scopes.as_ref())
+                        .await
+                        .map_err(|e| map_token_error(&e))?;
+                    token
+                        .token()
+                        .map(str::to_owned)
+                        .ok_or(ApiError::AuthExpired)
+                })
+            })
+        };
+
+        // Force a fresh access token even if the cached one still looks valid —
+        // used to retry after a server 401.
+        let force: BearerFn = Box::new(move || {
             let auth = Arc::clone(&auth);
             let scopes = Arc::clone(&scopes);
             Box::pin(async move {
                 let token = auth
-                    .token(scopes.as_ref())
+                    .force_refreshed_token(scopes.as_ref())
                     .await
                     .map_err(|e| map_token_error(&e))?;
                 token
@@ -78,7 +100,7 @@ impl YupTokenProvider {
             })
         });
 
-        Ok(Self { fetch })
+        Ok(Self { fetch, force })
     }
 }
 
@@ -86,6 +108,10 @@ impl YupTokenProvider {
 impl TokenProvider for YupTokenProvider {
     async fn bearer(&self) -> Result<String, ApiError> {
         (self.fetch)().await
+    }
+
+    async fn refresh(&self) -> Result<String, ApiError> {
+        (self.force)().await
     }
 }
 

@@ -6,9 +6,9 @@
 
 use anyhow::Result;
 
-use crate::api::TasksApi;
+use crate::api::{ApiError, TaskPatch, TasksApi};
 use crate::cache::Cache;
-use crate::domain::{List, ListId, Task};
+use crate::domain::{List, ListId, Task, TaskId};
 
 /// Refresh Lists: fetch from Google, mirror into the cache (dropping Lists that
 /// no longer exist), and return the cached Lists for the Model.
@@ -42,4 +42,36 @@ pub fn mirror_lists(cache: &Cache, lists: &[List]) -> Result<Vec<List>> {
 pub fn mirror_tasks(cache: &Cache, list: &ListId, tasks: &[Task]) -> Result<Vec<Task>> {
     cache.replace_tasks(list, tasks)?;
     cache.tasks(list)
+}
+
+/// Set a Task's completed state on Google and return the updated Task from the
+/// response. The cache is *not* touched — a caller doing its own locking mirrors
+/// separately (see `main`'s worker); the combined [`write_completed`] is the
+/// convenience used by tests. Auth-expiry retry (with a forced token refresh) is
+/// handled uniformly inside `RestClient`, not here.
+pub async fn patch_completed(
+    api: &dyn TasksApi,
+    list: &ListId,
+    task: &TaskId,
+    completed: bool,
+) -> std::result::Result<Task, ApiError> {
+    let patch = TaskPatch {
+        completed: Some(completed),
+        ..Default::default()
+    };
+    api.patch_task(list, task, patch).await
+}
+
+/// Write-through a completion toggle: patch on Google (retry-once), then mirror
+/// the updated Task into the cache. Returns the updated Task.
+pub async fn write_completed(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    task: &TaskId,
+    completed: bool,
+) -> Result<Task> {
+    let updated = patch_completed(api, list, task, completed).await?;
+    cache.upsert_task(&updated)?;
+    Ok(updated)
 }

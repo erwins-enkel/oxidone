@@ -49,14 +49,31 @@ impl RestClient {
     }
 
     /// Inject a fresh bearer token, send, and map transport failures to
-    /// `ApiError::Network`. HTTP status is checked by [`check_status`].
+    /// `ApiError::Network`. On a 401 the token is force-refreshed and the request
+    /// retried once (ADR-0002) before the status is surfaced by [`check_status`].
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ApiError> {
+        // Clone up front so the request can be replayed on a 401. Our bodies are
+        // in-memory JSON, so `try_clone` always succeeds; if it ever doesn't, we
+        // simply skip the retry.
+        let retry = req.try_clone();
         let bearer = self.auth.bearer().await?;
         let resp = req
             .bearer_auth(bearer)
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        if resp.status().as_u16() == 401 {
+            if let Some(retry) = retry {
+                let bearer = self.auth.refresh().await?;
+                let resp = retry
+                    .bearer_auth(bearer)
+                    .send()
+                    .await
+                    .map_err(|e| ApiError::Network(e.to_string()))?;
+                return check_status(resp).await;
+            }
+        }
         check_status(resp).await
     }
 

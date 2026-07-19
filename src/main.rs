@@ -19,7 +19,7 @@ use oxidone::app::{update, Command, Message, Model};
 use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config};
-use oxidone::domain::{List, ListId};
+use oxidone::domain::{List, ListId, TaskId};
 use oxidone::sync;
 use oxidone::ui::{self, theme::Theme};
 
@@ -134,8 +134,57 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     let _ = tx.send(message);
                 }
             },
+            Command::SetCompleted {
+                list,
+                task,
+                completed,
+            } => match api {
+                Some(api) => spawn_write_completed(
+                    api.clone(),
+                    cache.clone(),
+                    tx.clone(),
+                    list,
+                    task,
+                    completed,
+                ),
+                None => {
+                    // No offline editing in v1 (ADR-0001): roll the optimistic
+                    // change back with an explanation.
+                    let _ = tx.send(Message::TaskWriteFailed {
+                        task,
+                        reason: "not connected to Google".to_string(),
+                    });
+                }
+            },
         }
     }
+}
+
+/// Write-through a completion toggle: patch on Google (retry-once), mirror into
+/// the cache, and report the server Task back (or a rollback on failure).
+fn spawn_write_completed(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+    completed: bool,
+) {
+    tokio::spawn(async move {
+        let message = match sync::patch_completed(api.as_ref(), &list, &task, completed).await {
+            Ok(updated) => {
+                if let Err(e) = cache.lock().unwrap().upsert_task(&updated) {
+                    tracing::warn!(error = %e, "failed to cache task write");
+                }
+                Message::TaskUpdated(updated)
+            }
+            Err(e) => Message::TaskWriteFailed {
+                task,
+                reason: format!("failed to update task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
 }
 
 /// Seed the task pane from cache for the first frame. Each `LoadTasks` the seed
@@ -143,13 +192,14 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
 /// network — the live refresh, dispatched later, does the network round-trip.
 fn seed_tasks_from_cache(model: &mut Model, commands: Vec<Command>, cache: &SharedCache) {
     for command in commands {
-        match command {
-            Command::LoadTasks(list) => match cache.lock().unwrap().tasks(&list) {
+        // The seed only emits LoadTasks (from ListsLoaded); ignore anything else.
+        if let Command::LoadTasks(list) = command {
+            match cache.lock().unwrap().tasks(&list) {
                 Ok(tasks) => {
                     update(model, Message::TasksLoaded(list, tasks));
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to read cached tasks"),
-            },
+            }
         }
     }
 }

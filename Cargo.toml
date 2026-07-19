@@ -64,6 +64,7 @@ tracing-appender = "0.2"
 [dev-dependencies]
 wiremock = "0.6"          # request-building + (de)serialization contract tests
 pretty_assertions = "1"
+crossterm = "0.28"        # build KeyEvents in reducer tests
 
 [profile.release]
 strip = true

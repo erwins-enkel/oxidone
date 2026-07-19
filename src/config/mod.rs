@@ -74,3 +74,8 @@ pub fn log_dir() -> Option<PathBuf> {
             .unwrap_or_else(|| d.data_local_dir().join("logs"))
     })
 }
+
+/// `<data dir>/oxidone.db` — the local SQLite cache.
+pub fn db_path() -> Option<PathBuf> {
+    project_dirs().map(|d| d.data_local_dir().join("oxidone.db"))
+}

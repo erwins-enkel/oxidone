@@ -13,6 +13,8 @@ pub enum Action {
     ToggleHelp,
     CloseOverlay,
     SwitchPane,
+    SelectNext,
+    SelectPrev,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -44,6 +46,26 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Esc,
             action: Action::CloseOverlay,
             help: "close overlay",
+        },
+        Binding {
+            key: KeyCode::Char('j'),
+            action: Action::SelectNext,
+            help: "select next",
+        },
+        Binding {
+            key: KeyCode::Down,
+            action: Action::SelectNext,
+            help: "select next",
+        },
+        Binding {
+            key: KeyCode::Char('k'),
+            action: Action::SelectPrev,
+            help: "select previous",
+        },
+        Binding {
+            key: KeyCode::Up,
+            action: Action::SelectPrev,
+            help: "select previous",
         },
     ];
     BINDINGS

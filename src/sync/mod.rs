@@ -1,19 +1,19 @@
 //! Reconciliation between the cache and Google.
 //!
-//! v1 (ADR-0001): **write-through** — a write hits Google, then patches the
-//! cache from the response. **Refresh** is manual (`r` / startup): pull each
-//! list and diff into the mirror; append newly-seen completions to the
-//! completion_log (ADR-0007). No background poll, no offline queue yet.
-//!
-//! The seam for the future is here: swap "rollback on write failure" for
-//! "keep dirty + retry", and add a `updated_min` background poll.
+//! v1 (ADR-0001): the cache is the source of truth for reads. A refresh pulls
+//! from Google via `TasksApi`, mirrors the result into the cache, and returns
+//! the cached view. Write-through and the offline queue land in later slices.
 
-pub struct Sync {
-    // api: Arc<dyn TasksApi>,
-    // cache: Cache,
+use anyhow::Result;
+
+use crate::api::TasksApi;
+use crate::cache::Cache;
+use crate::domain::List;
+
+/// Refresh Lists: fetch from Google, mirror into the cache (dropping Lists that
+/// no longer exist), and return the cached Lists for the Model.
+pub async fn load_lists(api: &dyn TasksApi, cache: &Cache) -> Result<Vec<List>> {
+    let lists = api.list_lists().await?;
+    cache.replace_lists(&lists)?;
+    cache.lists()
 }
-
-// impl Sync {
-//   async fn refresh(&self, list: &ListId) -> Result<Vec<Task>, ApiError>
-//   async fn write_through(&self, cmd: Command) -> Result<(), ApiError>
-// }

@@ -75,3 +75,43 @@ pub async fn write_completed(
     cache.upsert_task(&updated)?;
     Ok(updated)
 }
+
+/// Patch a Task's title on Google and return the updated Task (no cache write —
+/// see [`patch_completed`] for the split rationale).
+pub async fn patch_title(
+    api: &dyn TasksApi,
+    list: &ListId,
+    task: &TaskId,
+    title: &str,
+) -> std::result::Result<Task, ApiError> {
+    let patch = TaskPatch {
+        title: Some(title.to_string()),
+        ..Default::default()
+    };
+    api.patch_task(list, task, patch).await
+}
+
+/// Write-through a title edit: patch on Google, mirror into the cache.
+pub async fn write_title(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    task: &TaskId,
+    title: &str,
+) -> Result<Task> {
+    let updated = patch_title(api, list, task, title).await?;
+    cache.upsert_task(&updated)?;
+    Ok(updated)
+}
+
+/// Delete a Task on Google and mirror the removal into the cache.
+pub async fn delete_task(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    task: &TaskId,
+) -> Result<()> {
+    api.delete_task(list, task).await?;
+    cache.delete_task(task)?;
+    Ok(())
+}

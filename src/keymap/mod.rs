@@ -31,6 +31,8 @@ pub enum Action {
     DeleteTask,
     CycleSort,
     ToggleShowCompleted,
+    /// Open a URL found in the selected Task's notes.
+    OpenLink,
     ClearCompleted,
     // Manual Refresh: re-pull the List set (and, via the cascade, the active
     // List's Tasks) from Google. Modeless — it is not gated on a pane.
@@ -160,6 +162,11 @@ pub fn bindings() -> &'static [Binding] {
             help: "delete task",
         },
         Binding {
+            key: KeyCode::Char('u'),
+            action: Action::OpenLink,
+            help: "open link",
+        },
+        Binding {
             key: KeyCode::Char('s'),
             action: Action::CycleSort,
             help: "cycle sort (manual/due/title)",
@@ -285,6 +292,8 @@ pub enum LegendContext {
     TextInput,
     /// A Confirm overlay: only y/n/Esc fire.
     Confirm,
+    /// The link picker: j/k move, Enter opens, Esc cancels.
+    LinkPicker,
 }
 
 /// Where a legend cell's key text comes from.
@@ -401,13 +410,21 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             label: "del",
         },
         COMPLETED,
-        // Last two: `Enter` already aliases `e`, and the pane title names the
-        // active Sort view. Both drop first on a narrow pane.
+        // The last three announce themselves elsewhere, so they drop first on a
+        // narrow pane: `Enter` already aliases `e`, the pane title names the
+        // active Sort view, and a Task with links carries the `⧉` marker.
+        // Promoting `link` far enough to show at 80 columns would drop
+        // `c completed`, which outranks it because hiding Completed Tasks
+        // changes the screen with nothing on it to say so.
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::EditTitle]),
             label: "edit",
         },
         SORT,
+        LegendEntry {
+            keys: LegendKeys::Derived(&[Action::OpenLink]),
+            label: "link",
+        },
     ];
 
     const SIDEBAR: &[LegendEntry] = &[
@@ -456,10 +473,28 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // `Enter` opens rather than saves, and `j`/`k` move — neither of which the
+    // text-input legend would have said.
+    const LINK_PICKER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("j/k"),
+            label: "move",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "open",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
         LegendContext::TextInput => TEXT_INPUT,
         LegendContext::Confirm => CONFIRM,
+        LegendContext::LinkPicker => LINK_PICKER,
     }
 }

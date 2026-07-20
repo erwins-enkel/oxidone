@@ -28,6 +28,7 @@ use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config};
 use oxidone::domain::{List, ListId, TaskId};
+use oxidone::links::OpenableUrl;
 use oxidone::sync;
 use oxidone::ui::{self, theme::Theme};
 
@@ -262,6 +263,7 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::OpenUrl(url) => spawn_open_url(tx.clone(), url),
             // `SpawnEditor` never reaches here: it owns the terminal and is
             // handled synchronously in the run loop, not by a background worker.
             Command::SpawnEditor { .. } => {
@@ -527,6 +529,25 @@ fn spawn_write_due(
             },
         };
         let _ = tx.send(message);
+    });
+}
+
+/// Hand a URL to the platform browser.
+///
+/// Detached on purpose: a blocking or inherited-stdio launch lets the opener
+/// (`xdg-open` and friends) write over the alternate screen, and waiting on a
+/// browser would stall the worker for as long as it stays open. The scheme was
+/// already checked — [`OpenableUrl`] cannot exist otherwise — so there is
+/// nothing left to decide here but success or failure.
+///
+/// Runs on a blocking thread: the spawn itself is synchronous work.
+fn spawn_open_url(tx: UnboundedSender<Message>, url: OpenableUrl) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = open::that_detached(url.as_str()) {
+            let _ = tx.send(Message::LinkOpenFailed {
+                reason: e.to_string(),
+            });
+        }
     });
 }
 

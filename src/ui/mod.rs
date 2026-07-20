@@ -22,7 +22,9 @@ use crate::app::{Focus, Model, Overlay};
 use crate::dateparse::format_due_relative;
 use crate::domain::{Status, Task};
 use crate::keymap;
+use crate::links::{self, OpenableUrl};
 use theme::Theme;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use widgets::{dueload, meter};
 
 /// Days of "workload ahead" bucketed into the due-load strip (today + 6).
@@ -63,7 +65,20 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     }
 }
 
+/// Width shared by every overlay, so the picker lines up with the text popups
+/// rather than introducing a second modal size.
+const OVERLAY_WIDTH: u16 = 50;
+/// Cells a bordered overlay spends on its own frame, on either axis: one per
+/// side, so two off the height *and* two off the usable text width. Used for
+/// both deliberately — a `Block::bordered` costs the same in each direction.
+const OVERLAY_BORDERS: u16 = 2;
+/// Rows `view` reserves at the bottom of the frame for the status line and the
+/// legend. The picker is the one overlay tall enough to reach them, and it must
+/// not — the legend down there is what advertises its own keys.
+const BOTTOM_CHROME_ROWS: u16 = 2;
+
 fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+    // Every overlay but the picker is a single line of text in a fixed popup.
     let (title, body): (&str, String) = match overlay {
         Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
         Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
@@ -73,10 +88,81 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
         Overlay::AddList { buffer } => ("Add list", format!("{buffer}▏")),
         Overlay::RenameList { buffer, .. } => ("Rename list", format!("{buffer}▏")),
         Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
+        // The one overlay that is a list, not a line — and the only one whose
+        // height is not fixed.
+        Overlay::OpenLink { urls, selected } => {
+            return render_link_picker(frame, area, urls, *selected, theme)
+        }
     };
-    let popup = centered(area, 50, 3);
+    let popup = centered(area, OVERLAY_WIDTH, 1 + OVERLAY_BORDERS);
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(body).block(panel(title, true, theme)), popup);
+}
+
+/// Height of the link picker: one row per URL plus its borders, never taller
+/// than the space available.
+fn picker_height(urls: usize, available: u16) -> u16 {
+    u16::try_from(urls)
+        .unwrap_or(u16::MAX)
+        .saturating_add(OVERLAY_BORDERS)
+        .min(available)
+}
+
+/// The link picker. Raised only for more than one URL, so it always has rows.
+fn render_link_picker(
+    frame: &mut Frame,
+    area: Rect,
+    urls: &[OpenableUrl],
+    selected: usize,
+    theme: &Theme,
+) {
+    // Centre within the content rows only. A Task with enough URLs would
+    // otherwise grow a popup over the status line and over the legend spelling
+    // out `j/k move  Enter open  Esc cancel` — hiding the instructions for the
+    // very thing on screen.
+    let body = Rect {
+        height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
+        ..area
+    };
+    let popup = centered(body, OVERLAY_WIDTH, picker_height(urls.len(), body.height));
+    // By characters, not bytes: a URL in free-text notes may be multibyte, and
+    // slicing one mid-codepoint would panic. The gutter comes off the budget
+    // too — `render_selectable` spends it on every row.
+    let width =
+        (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
+    let items: Vec<ListItem> = urls
+        .iter()
+        .map(|url| ListItem::new(truncate(url.as_str(), width)))
+        .collect();
+    frame.render_widget(Clear, popup);
+    render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
+}
+
+/// `text` cut to `width` *display cells*, with the last spent on an ellipsis so
+/// a truncated URL never reads as a complete one.
+///
+/// Cells, not chars: a URL pasted from an IRI can carry double-width characters
+/// (`https://例え.jp/…`), and budgeting by `chars().count()` would under-measure
+/// them — ratatui lays out by cell, so the row would overflow and be clipped
+/// with no ellipsis to show for it, which is the very thing this prevents.
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    // `…` is itself one cell.
+    let budget = width.saturating_sub(1);
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cell = c.width().unwrap_or(0);
+        if used + cell > budget {
+            break;
+        }
+        kept.push(c);
+        used += cell;
+    }
+    kept.push('…');
+    kept
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
@@ -104,6 +190,13 @@ const DUE_WIDTH: usize = crate::dateparse::MAX_RENDERED_WIDTH;
 
 /// Indent prefix for a Subtask row (nesting is capped at one level).
 const SUBTASK_INDENT: &str = "  ";
+
+/// The trailing mark on a Task whose notes hold an openable URL, or `None` when
+/// there is nothing to open. Degrades to ASCII with the braille widgets
+/// (ADR-0006) rather than drawing a glyph the terminal cannot show.
+fn link_marker(has_urls: bool, ascii: bool) -> Option<&'static str> {
+    has_urls.then_some(if ascii { " *" } else { " ⧉" })
+}
 
 /// Style for a Task's due-date cell. Overdue reads in the palette's red so it
 /// catches the eye when scanning the column — but Completed wins: a done Task
@@ -161,6 +254,15 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
             spans.push(Span::styled(t.title.clone(), style));
+            // Trails the title so the due gutter and Subtask indent stay
+            // aligned. Driven by the cheap predicate, not by collecting the
+            // URLs: this runs for every visible row on every frame.
+            let has_urls = links::has_openable_url(t.notes.as_deref().unwrap_or_default());
+            if let Some(marker) = link_marker(has_urls, ascii) {
+                // Inherits the row's style, so on a Completed Task it reads dim
+                // and struck-through with the title — its links still open.
+                spans.push(Span::styled(marker, style));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -244,6 +346,14 @@ fn due_load_counts(
     counts
 }
 
+/// The cursor gutter `render_selectable` puts before every row, focused or not.
+/// Callers computing how much room a row's text really has must subtract it —
+/// otherwise ratatui clips the overflow silently, with no ellipsis to show for it.
+/// The two must stay the same width; `the_cursor_gutter_is_the_same_width_either_way`
+/// pins that.
+const LIST_CURSOR: &str = "› ";
+const LIST_CURSOR_BLANK: &str = "  ";
+
 /// A rounded, focus-aware panel wrapping a selectable list. The selection is
 /// highlighted strongly when the pane is focused, faintly when it isn't — so
 /// both the focused pane and the cursor are always visible.
@@ -267,7 +377,11 @@ fn render_selectable(
         .block(panel(title, focused, theme))
         .style(Style::new().bg(theme.base).fg(theme.text))
         .highlight_style(highlight)
-        .highlight_symbol(if focused { "› " } else { "  " });
+        .highlight_symbol(if focused {
+            LIST_CURSOR
+        } else {
+            LIST_CURSOR_BLANK
+        });
 
     let mut state = ListState::default();
     state.select(selected);
@@ -301,9 +415,21 @@ fn help_width() -> usize {
 /// gate `keymap::resolve`, so the pane's verbs keep firing underneath the
 /// cheatsheet and the legend stays true.
 fn legend_context(model: &Model) -> keymap::LegendContext {
+    // Listed per variant rather than caught by a `Some(_)` arm: a new overlay
+    // must be made to declare its legend, not silently inherit the text-input
+    // one and advertise keys it does not have.
     match &model.overlay {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
-        Some(_) => keymap::LegendContext::TextInput,
+        Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
+        Some(
+            Overlay::EditTitle { .. }
+            | Overlay::AddTask { .. }
+            | Overlay::AddSubtask { .. }
+            | Overlay::EditDue { .. }
+            | Overlay::EditNotes { .. }
+            | Overlay::AddList { .. }
+            | Overlay::RenameList { .. },
+        ) => keymap::LegendContext::TextInput,
         None => match model.focus {
             Focus::Tasks => keymap::LegendContext::Tasks,
             Focus::Sidebar => keymap::LegendContext::Sidebar,
@@ -1211,6 +1337,41 @@ mod tests {
             },
         }));
         assert_eq!(legend_context(&model), keymap::LegendContext::Confirm);
+
+        // The picker has no text buffer either; a catch-all arm would have sent
+        // it to `TextInput` and advertised `Enter save`.
+        model.overlay = Some(Overlay::OpenLink {
+            urls: Vec::new(),
+            selected: 0,
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::LinkPicker);
+    }
+
+    #[test]
+    fn the_link_marker_appears_only_when_there_is_something_to_open() {
+        assert_eq!(link_marker(false, false), None);
+        assert_eq!(link_marker(false, true), None);
+        assert_eq!(link_marker(true, false), Some(" ⧉"));
+        assert_eq!(link_marker(true, true), Some(" *"));
+    }
+
+    #[test]
+    fn the_cursor_gutter_is_the_same_width_either_way() {
+        // The picker's truncation budget subtracts `LIST_CURSOR`; if the blank
+        // drifted wider, focused and unfocused rows would wrap differently.
+        assert_eq!(LIST_CURSOR.width(), LIST_CURSOR_BLANK.width());
+    }
+
+    #[test]
+    fn the_picker_is_as_tall_as_its_urls_plus_borders() {
+        // Two is the smallest count that can occur — one URL opens directly.
+        assert_eq!(picker_height(2, 24), 4);
+        assert_eq!(picker_height(7, 24), 9);
+    }
+
+    #[test]
+    fn the_picker_never_outgrows_the_frame() {
+        assert_eq!(picker_height(40, 12), 12);
     }
 
     #[test]

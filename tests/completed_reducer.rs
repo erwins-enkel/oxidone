@@ -272,3 +272,112 @@ fn clear_is_single_flight() {
     assert!(second.is_empty()); // guarded: a clear is already in flight
     assert!(m.status_line.is_some());
 }
+
+fn titles_of(m: &Model) -> Vec<String> {
+    m.tasks.iter().map(|t| t.title.clone()).collect()
+}
+
+// ---- A Clear reply landing *before* a stale refresh (ticket #65) ----
+//
+// `C` sweeps the Completed rows optimistically. When `ClearedCompleted` lands
+// first it drops the rollback snapshot, so a *stale* refresh — its fetch issued
+// before Google swept — would resurrect them. Tombstoning the swept ids on the
+// confirmation lets `set_tasks` drop them from that stale fetch, by id so a Task
+// completed after the sweep is never taken with them.
+
+#[test]
+fn a_confirmed_clear_tombstones_a_stale_refresh_that_still_lists_the_swept_rows() {
+    let all = vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+        task("d", Status::Completed),
+    ];
+    let mut m = model_with(all.clone());
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b, d
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string()))); // confirmed first
+
+    // The refresh still reports b and d: its fetch predated the Clear.
+    update(&mut m, Message::TasksLoaded(ListId("L".to_string()), all));
+    assert_eq!(titles_of(&m), vec!["a", "c"]);
+}
+
+#[test]
+fn a_confirmed_clear_tombstone_keeps_tasks_completed_after_the_sweep() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string())));
+
+    // The stale refresh brings back the swept "b" *and* an "e" completed after
+    // the sweep — which this Clear never swept, so Google still has it.
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("L".to_string()),
+            vec![
+                task("a", Status::NeedsAction),
+                task("b", Status::Completed),
+                task("e", Status::Completed),
+            ],
+        ),
+    );
+    // Only the tombstoned ids go. Matching by status would have eaten "e".
+    assert_eq!(titles_of(&m), vec!["a", "e"]);
+}
+
+// A tombstone is keyed by its List, so a fetch of *another* List must not evict
+// it — otherwise switching away and back would reopen the race on the first List.
+#[test]
+fn a_tombstone_survives_a_fetch_of_another_list() {
+    let other = List {
+        id: ListId("M".to_string()),
+        title: "M".to_string(),
+        etag: "e".to_string(),
+        updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+    };
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![list(), other.clone()]));
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("L".to_string()),
+            vec![
+                task("a", Status::NeedsAction),
+                task("b", Status::NeedsAction),
+            ],
+        ),
+    );
+    update(&mut m, key(KeyCode::Tab)); // focus task pane, cursor on "a"
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y')); // optimistic delete of "a"
+    update(&mut m, Message::TaskDeleted(TaskId("a".to_string()))); // tombstone under L
+    assert_eq!(titles_of(&m), vec!["b"]);
+
+    // The user switches to M and its Tasks load — L's tombstone must be untouched.
+    update(&mut m, key(KeyCode::Tab)); // back to the sidebar
+    update(&mut m, key(KeyCode::Down)); // select M
+    let mut m_task = task("m1", Status::NeedsAction);
+    m_task.list = other.id.clone();
+    update(&mut m, Message::TasksLoaded(other.id.clone(), vec![m_task]));
+    assert_eq!(titles_of(&m), vec!["m1"]);
+
+    // Back on L, a stale in-flight fetch for L still lists "a": the tombstone
+    // survived the M fetch, so the row is dropped again rather than resurrected.
+    update(&mut m, key(KeyCode::Up)); // select L
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("L".to_string()),
+            vec![
+                task("a", Status::NeedsAction),
+                task("b", Status::NeedsAction),
+            ],
+        ),
+    );
+    assert_eq!(titles_of(&m), vec!["b"]);
+}

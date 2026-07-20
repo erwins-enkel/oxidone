@@ -354,3 +354,63 @@ async fn the_delete_prompt_shows_the_display_title_not_the_glyph() {
         other => panic!("expected a Confirm overlay, got {other:?}"),
     }
 }
+
+// ---- A delete reply landing *before* a stale refresh (ticket #65) ----
+//
+// `x` removes the row optimistically. When the success `TaskDeleted` lands first
+// it drops the rollback snapshot, leaving nothing to record the row is gone — so
+// a *stale* refresh (its fetch issued before Google applied the delete) would
+// resurrect it. A tombstone armed on the confirmation lets `set_tasks` drop the
+// id from that stale fetch. Evicted once a fetch of the List omits the id.
+
+#[tokio::test]
+async fn a_confirmed_delete_tombstones_a_stale_refresh_that_still_lists_it() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y')); // optimistic delete of "alpha"
+    update(&mut m, Message::TaskDeleted(tasks[0].id.clone())); // confirmed first
+    assert_eq!(m.tasks.len(), 1);
+
+    // The refresh still reports "alpha": its fetch predated the delete.
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["beta"] // dropped by the tombstone; the untouched row stayed
+    );
+}
+
+#[tokio::test]
+async fn a_tombstone_is_evicted_once_a_fetch_omits_the_id() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y'));
+    update(&mut m, Message::TaskDeleted(tasks[0].id.clone()));
+
+    // Google has caught up: this fetch omits "alpha", so the tombstone is spent.
+    update(
+        &mut m,
+        Message::TasksLoaded(l.id.clone(), vec![tasks[1].clone()]),
+    );
+    assert_eq!(m.tasks.len(), 1);
+
+    // A later fetch that lists "alpha" again is honoured — the tombstone did not
+    // suppress the id forever.
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+}
+
+#[tokio::test]
+async fn a_spurious_task_deleted_arms_no_tombstone() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    // No optimistic delete is in flight, so there is no snapshot: the reply must
+    // arm nothing, or a later fetch of that id would wrongly drop a live row.
+    update(&mut m, Message::TaskDeleted(tasks[1].id.clone()));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+}

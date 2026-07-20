@@ -55,6 +55,25 @@ async fn e_opens_the_editor_prefilled_with_the_title() {
 }
 
 #[tokio::test]
+async fn enter_opens_the_editor_like_e() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, key(KeyCode::Enter));
+    match &m.overlay {
+        Some(Overlay::EditTitle { buffer, .. }) => assert_eq!(buffer, "alpha"),
+        other => panic!("expected EditTitle overlay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn enter_in_the_sidebar_opens_nothing() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, key(KeyCode::Tab)); // back to the sidebar
+    let cmds = update(&mut m, key(KeyCode::Enter));
+    assert!(m.overlay.is_none());
+    assert!(cmds.is_empty());
+}
+
+#[tokio::test]
 async fn editing_and_enter_writes_through_optimistically() {
     let (mut m, l, tasks) = model_with_tasks().await;
     update(&mut m, ch('e'));

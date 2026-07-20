@@ -326,6 +326,10 @@ pub enum LegendContext {
     Sidebar,
     /// A text-capture overlay: chars go to the buffer, Enter saves, Esc cancels.
     TextInput,
+    /// An add-entry capture (add task / subtask): like `TextInput`, but `Enter`
+    /// peels a trailing natural-language date off the title and `Tab` submits it
+    /// verbatim, so the legend advertises the extra key.
+    TaskCapture,
     /// A Confirm overlay: only y/n/Esc fire.
     Confirm,
     /// The link picker: j/k move, Enter opens, Esc cancels.
@@ -514,6 +518,23 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // `Tab` submits the title verbatim (no date parsing) — a key the plain
+    // text-input legend would not have said.
+    const TASK_CAPTURE: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "save",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Tab"),
+            label: "literal",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+    ];
+
     const CONFIRM: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("y"),
@@ -550,6 +571,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
         LegendContext::TextInput => TEXT_INPUT,
+        LegendContext::TaskCapture => TASK_CAPTURE,
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,
     }

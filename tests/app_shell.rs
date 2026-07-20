@@ -217,10 +217,11 @@ fn key_ev(code: KeyCode) -> KeyEvent {
 // inline) and `tests/legend_render.rs`.
 
 /// Every context, so a new one can't skip the guards below.
-const CONTEXTS: [LegendContext; 5] = [
+const CONTEXTS: [LegendContext; 6] = [
     LegendContext::Tasks,
     LegendContext::Sidebar,
     LegendContext::TextInput,
+    LegendContext::TaskCapture,
     LegendContext::Confirm,
     LegendContext::LinkPicker,
 ];
@@ -236,6 +237,7 @@ fn contexts_covers_every_legend_context() {
             LegendContext::Tasks
             | LegendContext::Sidebar
             | LegendContext::TextInput
+            | LegendContext::TaskCapture
             | LegendContext::Confirm
             | LegendContext::LinkPicker => {}
         }

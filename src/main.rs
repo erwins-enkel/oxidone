@@ -362,16 +362,17 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                 temp,
                 title,
                 parent,
+                due,
             } => match api {
-                Some(api) => spawn_add_task(
-                    api.clone(),
-                    cache.clone(),
-                    tx.clone(),
-                    list,
-                    temp,
-                    title,
-                    parent,
-                ),
+                Some(api) => {
+                    let new = oxidone::api::NewTask {
+                        title,
+                        parent,
+                        due,
+                        ..Default::default()
+                    };
+                    spawn_add_task(api.clone(), cache.clone(), tx.clone(), list, temp, new)
+                }
                 None => {
                     let _ = tx.send(Message::TaskAddFailed {
                         temp,
@@ -514,15 +515,9 @@ fn spawn_add_task(
     tx: UnboundedSender<Message>,
     list: ListId,
     temp: TaskId,
-    title: String,
-    parent: Option<TaskId>,
+    new: oxidone::api::NewTask,
 ) {
     tokio::spawn(async move {
-        let new = oxidone::api::NewTask {
-            title,
-            parent,
-            ..Default::default()
-        };
         let message = match api.insert_task(&list, new).await {
             Ok(task) => {
                 if let Err(e) = cache.lock().unwrap().upsert_task(&task) {

@@ -11,7 +11,7 @@
 pub mod theme;
 pub mod widgets;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, Local, NaiveDate};
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
-use crate::dateparse::format_due_relative;
+use crate::dateparse::{format_due_relative, split_title_and_due};
 use crate::domain::{EntryType, Status, Task};
 use crate::keymap;
 use crate::links::{self, Link};
@@ -72,7 +72,7 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
         render_help(frame, area, theme);
     }
     if let Some(overlay) = &model.overlay {
-        render_overlay(frame, area, overlay, theme);
+        render_overlay(frame, area, overlay, model.now, theme);
     }
 }
 
@@ -88,26 +88,60 @@ const OVERLAY_BORDERS: u16 = 2;
 /// not — the legend down there is what advertises its own keys.
 const BOTTOM_CHROME_ROWS: u16 = 2;
 
-fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
-    // Every overlay but the picker is a single line of text in a fixed popup.
-    let (title, body): (&str, String) = match overlay {
-        Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
-        Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
-        Overlay::AddSubtask { buffer, .. } => ("Add subtask", format!("{buffer}▏")),
-        Overlay::EditDue { buffer, .. } => ("Edit due date (blank clears)", format!("{buffer}▏")),
-        Overlay::EditNotes { buffer, .. } => ("Edit notes (blank clears)", format!("{buffer}▏")),
-        Overlay::AddList { buffer } => ("Add list", format!("{buffer}▏")),
-        Overlay::RenameList { buffer, .. } => ("Rename list", format!("{buffer}▏")),
-        Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
+fn render_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    overlay: &Overlay,
+    now: DateTime<Local>,
+    theme: &Theme,
+) {
+    // Every overlay but the picker is one or two lines of text in a popup. The
+    // add-entry captures grow to a second line when a trailing date is
+    // recognised (see `capture_lines`); the rest are always a single line.
+    let (title, lines): (&str, Vec<Line>) = match overlay {
+        Overlay::EditTitle { buffer, .. } => ("Edit title", vec![input_line(buffer)]),
+        Overlay::AddTask { buffer } => ("Add task", capture_lines(buffer, now, theme)),
+        Overlay::AddSubtask { buffer, .. } => ("Add subtask", capture_lines(buffer, now, theme)),
+        Overlay::EditDue { buffer, .. } => {
+            ("Edit due date (blank clears)", vec![input_line(buffer)])
+        }
+        Overlay::EditNotes { buffer, .. } => {
+            ("Edit notes (blank clears)", vec![input_line(buffer)])
+        }
+        Overlay::AddList { buffer } => ("Add list", vec![input_line(buffer)]),
+        Overlay::RenameList { buffer, .. } => ("Rename list", vec![input_line(buffer)]),
+        Overlay::Confirm(confirm) => ("Confirm", vec![Line::from(confirm.prompt.clone())]),
         // The one overlay that is a list, not a line — and the only one whose
         // height is not fixed.
         Overlay::OpenLink { links, selected } => {
             return render_link_picker(frame, area, links, *selected, theme)
         }
     };
-    let popup = centered(area, OVERLAY_WIDTH, 1 + OVERLAY_BORDERS);
+    let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
+    let popup = centered(area, OVERLAY_WIDTH, height + OVERLAY_BORDERS);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(body).block(panel(title, true, theme)), popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(panel(title, true, theme)),
+        popup,
+    );
+}
+
+/// The editable line of a text overlay: the buffer trailed by a cursor bar.
+fn input_line(buffer: &str) -> Line<'static> {
+    Line::from(format!("{buffer}▏"))
+}
+
+/// Lines for an add-entry capture: the input line, plus — only when a trailing
+/// date is recognised — a dim preview of the `title · due` split that submitting
+/// (with `Enter`) will produce. `Tab` submits the buffer verbatim, so what the
+/// preview shows is exactly what a plain `Enter` commits.
+fn capture_lines(buffer: &str, now: DateTime<Local>, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![input_line(buffer)];
+    if let (title, Some(due)) = split_title_and_due(buffer, now) {
+        let preview = format!("→ {title} · {}", format_due_relative(due, now.date_naive()));
+        lines.push(Line::styled(preview, Style::new().fg(theme.subtext)));
+    }
+    lines
 }
 
 /// Height of the link picker: one row per link plus its borders, never taller
@@ -825,10 +859,13 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
     match &model.overlay {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
+        // The add-entry captures parse a trailing date and bind `Tab` for a
+        // literal submit, so they get their own legend rather than `TextInput`'s.
+        Some(Overlay::AddTask { .. } | Overlay::AddSubtask { .. }) => {
+            keymap::LegendContext::TaskCapture
+        }
         Some(
             Overlay::EditTitle { .. }
-            | Overlay::AddTask { .. }
-            | Overlay::AddSubtask { .. }
             | Overlay::EditDue { .. }
             | Overlay::EditNotes { .. }
             | Overlay::AddList { .. }
@@ -1736,7 +1773,22 @@ mod tests {
         let mut model = Model::new();
         model.focus = Focus::Tasks;
 
+        // The add-entry captures carry the date-parsing/`Tab`-literal legend, not
+        // the plain text-input one.
         model.overlay = Some(Overlay::AddTask {
+            buffer: String::new(),
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::TaskCapture);
+
+        model.overlay = Some(Overlay::AddSubtask {
+            parent: TaskId("p".into()),
+            buffer: String::new(),
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::TaskCapture);
+
+        // A different capture (edit due) keeps the plain text-input legend.
+        model.overlay = Some(Overlay::EditDue {
+            task: TaskId("t".into()),
             buffer: String::new(),
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::TextInput);

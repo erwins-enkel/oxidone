@@ -42,6 +42,37 @@ async fn model_with_one_task() -> (Model, List, Task) {
 }
 
 #[tokio::test]
+async fn enter_parses_a_trailing_date_while_tab_keeps_the_title_literal() {
+    // Enter routes through the natural-language split: the trailing date is
+    // peeled off and carried on the insert.
+    let (mut m, _l, _t) = model_with_one_task().await;
+    update(&mut m, ch('a'));
+    typed(&mut m, "ship it friday");
+    let cmds = update(&mut m, key(KeyCode::Enter));
+    match cmds.as_slice() {
+        [Command::AddTask { title, due, .. }] => {
+            assert_eq!(title, "ship it");
+            assert!(due.is_some(), "Enter should peel the trailing date");
+        }
+        other => panic!("expected one AddTask, got {other:?}"),
+    }
+
+    // Tab is the literal submit: the same buffer becomes the title verbatim with
+    // no due date. This exercises the actual keycode -> literal wiring.
+    let (mut m, _l, _t) = model_with_one_task().await;
+    update(&mut m, ch('a'));
+    typed(&mut m, "ship it friday");
+    let cmds = update(&mut m, key(KeyCode::Tab));
+    match cmds.as_slice() {
+        [Command::AddTask { title, due, .. }] => {
+            assert_eq!(title, "ship it friday");
+            assert_eq!(*due, None, "Tab should keep the whole title literal");
+        }
+        other => panic!("expected one AddTask, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_opens_the_capture_overlay() {
     let (mut m, _l, _t) = model_with_one_task().await;
     update(&mut m, ch('a'));
@@ -71,6 +102,7 @@ async fn typing_and_enter_inserts_a_placeholder_at_the_top_and_requests_insert()
             temp: TaskId("temp-0".to_string()),
             title: "second".to_string(),
             parent: None,
+            due: None,
         }]
     );
 }
@@ -152,6 +184,7 @@ async fn temp_ids_are_unique_across_adds() {
             temp: TaskId("temp-1".to_string()),
             title: "three".to_string(),
             parent: None,
+            due: None,
         }]
     );
 }

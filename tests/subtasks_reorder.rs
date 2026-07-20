@@ -148,6 +148,7 @@ fn o_adds_a_subtask_under_the_selected_top_level_task() {
             temp: tid("temp-0"),
             title: "step".to_string(),
             parent: Some(tid("a")),
+            due: None,
         }]
     );
 }

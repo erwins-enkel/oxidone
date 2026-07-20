@@ -1,0 +1,37 @@
+name: release-please
+
+# On every push to main, release-please maintains a release PR (version bump +
+# CHANGELOG from Conventional Commits). Merging that PR tags the release and
+# creates the GitHub Release; the `build` job then attaches the binaries. Running
+# the build in the same workflow (rather than reacting to the release event)
+# sidesteps the GITHUB_TOKEN not triggering downstream workflows.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

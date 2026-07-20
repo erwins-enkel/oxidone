@@ -1004,6 +1004,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::AddTask => open_add_task(model),
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
+        Action::Migrate => return migrate(model),
         Action::EditNotes => return edit_notes(model),
         Action::OpenLink => return open_link(model),
         Action::DeleteTask => open_delete_confirm(model),
@@ -1046,6 +1047,54 @@ fn open_edit_title(model: &mut Model) {
             buffer: task.title.clone(),
         });
     }
+}
+
+/// Migrate the selected Task: push its due date one day past whichever is later,
+/// today or its current due date. Bullet Journal's `>` disposition.
+///
+/// `max(today, due) + 1` rather than a flat "tomorrow" so the verb composes:
+/// an overdue Task lands on tomorrow, a future one shifts a day, and repeated
+/// presses defer repeatedly. An undated Task gets tomorrow — `max` has nothing
+/// to compare against.
+///
+/// Refuses a Completed Task. Migration is for Tasks still `needsAction`;
+/// re-dating a finished one is semantically empty, and `m` is pressed rapidly
+/// down a list where a silent due-date rewrite would go unnoticed. This is not
+/// the same as blocking a state Google permits — `d` still sets any date on a
+/// Completed Task.
+///
+/// Rides `SetDue`, so single-flight guarding and rollback come from that path.
+fn migrate(model: &mut Model) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    if task.status == Status::Completed {
+        model.status_line = Some("completed tasks are not migrated".to_string());
+        return Vec::new();
+    }
+    let (id, current) = (task.id.clone(), task.due);
+    // Single-flight: don't lose the migration silently if a write is running.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
+        return Vec::new();
+    };
+    let today = model.now.date_naive();
+    let due = Some(current.map_or(today, |d| d.max(today)) + chrono::Duration::days(1));
+    model
+        .pending_writes
+        .insert(id.clone(), model.tasks[index].clone());
+    model.tasks[index].due = due;
+    vec![Command::SetDue {
+        list,
+        task: id,
+        due,
+    }]
 }
 
 /// Open the capture overlay for a new Task (needs an active List to add into).

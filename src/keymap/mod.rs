@@ -27,6 +27,10 @@ pub enum Action {
     AddTask,
     EditTitle,
     EditDue,
+    /// Bullet Journal migration — the `>` disposition: push an entry forward a
+    /// day. Not an exit: the Task stays `needsAction`, only its due date moves.
+    /// `>` itself is `Indent`, so the binding is the verb's initial.
+    Migrate,
     EditNotes,
     DeleteTask,
     CycleSort,
@@ -154,6 +158,15 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('d'),
             action: Action::EditDue,
             help: "edit due date",
+        },
+        // Directly after `d`: a due verb, and the position is load-bearing.
+        // `cheatsheet_rows` preserves this order, `help_layout` partitions it
+        // sequentially into columns and drops hidden rows from the *tail* — so
+        // appending at the end would put new verbs first in line to be dropped.
+        Binding {
+            key: KeyCode::Char('m'),
+            action: Action::Migrate,
+            help: "migrate (due + 1 day)",
         },
         Binding {
             key: KeyCode::Char('n'),
@@ -414,6 +427,17 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             label: "del",
         },
         COMPLETED,
+        // Below `completed`, deliberately. At 80 columns the row's budget is 72
+        // and the cells above already total exactly 72, so *any* cell inserted
+        // at or above `completed` evicts it — and `c` outranks `m` on the same
+        // recoverability grounds that put `completed` above `link`: not knowing
+        // `c` means your Tasks vanished, not knowing `m` means you reach for `d`.
+        // Placed here, the 80-column row is unchanged and `migrate` shows only
+        // on wider panes.
+        LegendEntry {
+            keys: LegendKeys::Derived(&[Action::Migrate]),
+            label: "migrate",
+        },
         // The last three announce themselves elsewhere, so they drop first on a
         // narrow pane: `Enter` already aliases `e`, the pane title names the
         // active Sort view, and a Task with links carries the `⧉` marker.

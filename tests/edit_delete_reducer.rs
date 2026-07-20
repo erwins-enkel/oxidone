@@ -21,9 +21,13 @@ fn typed(m: &mut Model, s: &str) {
 }
 
 async fn model_with_tasks() -> (Model, List, Vec<Task>) {
+    model_with_titles(&["alpha", "beta"]).await
+}
+
+async fn model_with_titles(titles: &[&str]) -> (Model, List, Vec<Task>) {
     let api = FakeTasksApi::new();
     let l = api.insert_list("L").await.unwrap();
-    for t in ["alpha", "beta"] {
+    for t in titles {
         api.insert_task(
             &l.id,
             NewTask {
@@ -413,4 +417,92 @@ async fn a_spurious_task_deleted_arms_no_tombstone() {
         m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
         vec!["alpha", "beta"]
     );
+}
+
+// ---- A refresh landing inside the delete round-trip (ticket #51) ----
+//
+// `x` removes the row optimistically. A refresh in that window fetches a set
+// Google has not yet applied the delete to, and `set_tasks` puts the row back.
+// The success reply has to re-remove it — the failure twin already guards the
+// same interleaving.
+
+#[tokio::test]
+async fn a_refresh_mid_delete_is_undone_by_the_confirmed_delete() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y')); // optimistic delete of "alpha"
+    assert_eq!(m.tasks.len(), 1);
+
+    // The refresh still reports "alpha": Google has not processed the delete.
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    assert_eq!(m.tasks.len(), 2); // resurrected
+
+    update(&mut m, Message::TaskDeleted(tasks[0].id.clone()));
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["beta"] // gone again, and the untouched row stayed
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_mid_delete_keeps_a_cursor_the_user_moved_elsewhere() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y'));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    // The delete stepped the cursor off "alpha" onto "beta", which the refresh
+    // then re-anchored at index 1 (behind the resurrected "alpha").
+    assert_eq!(m.selected_task, Some(1));
+
+    update(&mut m, Message::TaskDeleted(tasks[0].id.clone()));
+    // Removing "alpha" shifts "beta" down a slot; the cursor follows it by id
+    // rather than staying on a stale index.
+    assert_eq!(m.tasks.len(), 1);
+    assert_eq!(m.selected_task, Some(0));
+    assert_eq!(m.tasks[0].title, "beta");
+}
+
+#[tokio::test]
+async fn a_refresh_mid_delete_steps_a_cursor_off_the_resurrected_row() {
+    let (mut m, l, tasks) = model_with_titles(&["a", "b", "c"]).await;
+    update(&mut m, ch('j')); // cursor onto "b"
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y')); // optimistic delete of "b"
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    assert_eq!(m.tasks.len(), 3); // resurrected
+    update(&mut m, ch('k')); // and the user parks the cursor back on it
+    assert_eq!(m.selected_task, Some(1));
+
+    update(&mut m, Message::TaskDeleted(tasks[1].id.clone()));
+    // The row under the cursor goes, so the cursor steps to its successor —
+    // not to the top of the pane.
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+    assert_eq!(m.selected_task, Some(1));
+    assert_eq!(m.tasks[1].title, "c");
+}
+
+#[tokio::test]
+async fn a_confirmed_delete_with_nothing_resurrected_changes_nothing() {
+    let (mut m, _l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('x'));
+    update(&mut m, ch('y'));
+    let (before_tasks, before_cursor) = (m.tasks.clone(), m.selected_task);
+
+    // The ordinary case: no refresh intervened, so the reply must not disturb
+    // the pane or the cursor the user may since have moved.
+    update(&mut m, Message::TaskDeleted(tasks[0].id.clone()));
+    assert_eq!(m.tasks, before_tasks);
+    assert_eq!(m.selected_task, before_cursor);
+}
+
+#[tokio::test]
+async fn a_task_deleted_for_a_task_we_are_not_deleting_removes_nothing() {
+    let (mut m, _l, tasks) = model_with_tasks().await;
+    // No optimistic delete is in flight, so there is no snapshot to match and
+    // the reply must not take a live row with it.
+    update(&mut m, Message::TaskDeleted(tasks[1].id.clone()));
+    assert_eq!(m.tasks.len(), 2);
 }

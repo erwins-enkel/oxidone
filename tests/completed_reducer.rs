@@ -382,3 +382,129 @@ fn a_tombstone_survives_a_fetch_of_another_list() {
     );
     assert_eq!(titles_of(&m), vec!["b"]);
 }
+
+// ---- A refresh landing inside the Clear round-trip (ticket #51) ----
+//
+// `C` sweeps the Completed rows optimistically. A refresh in that window fetches
+// a set Google has not yet cleared, and `set_tasks` puts them back. The success
+// reply has to re-remove them — by snapshot id, so Tasks completed *after* the
+// sweep are not swept along with them.
+
+#[test]
+fn a_refresh_mid_clear_is_undone_by_the_confirmed_clear() {
+    let all = vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+        task("d", Status::Completed),
+    ];
+    let mut m = model_with(all.clone());
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b, d
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+
+    // The refresh still reports b and d: Google has not processed the Clear.
+    update(&mut m, Message::TasksLoaded(ListId("L".to_string()), all));
+    assert_eq!(m.tasks.len(), 4); // resurrected
+
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string())));
+    // Swept again, and the Tasks that were never Completed kept their order.
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+}
+
+#[test]
+fn a_refresh_mid_clear_steps_a_cursor_off_a_resurrected_swept_row() {
+    let all = vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+    ];
+    let mut m = model_with(all.clone());
+    update(&mut m, ch('c')); // reveal Completed, so the cursor can sit on "b"
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b
+    update(&mut m, Message::TasksLoaded(ListId("L".to_string()), all));
+    assert_eq!(m.tasks.len(), 3); // resurrected
+    update(&mut m, key(KeyCode::Down)); // the user parks the cursor on "b"
+    assert_eq!(m.selected_task, Some(1));
+
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string())));
+    // The row under the cursor goes, so the cursor steps to the nearest row that
+    // survives — not to the top of the pane.
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+    assert_eq!(m.selected_task, Some(1)); // "c"
+}
+
+#[test]
+fn a_confirmed_clear_keeps_tasks_completed_after_the_sweep() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b
+
+    // The refresh brings back the swept "b" *and* an "e" completed after the
+    // sweep — which this Clear never swept, so Google still has it.
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("L".to_string()),
+            vec![
+                task("a", Status::NeedsAction),
+                task("b", Status::Completed),
+                task("e", Status::Completed),
+            ],
+        ),
+    );
+
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string())));
+    // Only the snapshot ids go. Re-removing by status would have eaten "e".
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "e"]
+    );
+}
+
+#[test]
+fn a_confirmed_clear_for_an_inactive_list_touches_nothing() {
+    let other = List {
+        id: ListId("M".to_string()),
+        title: "M".to_string(),
+        etag: "e".to_string(),
+        updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+    };
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![list(), other.clone()]));
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("L".to_string()),
+            vec![task("a", Status::NeedsAction), task("b", Status::Completed)],
+        ),
+    );
+    update(&mut m, key(KeyCode::Tab)); // focus task pane
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b in list L
+
+    // The user switches to M before the Clear reports back.
+    update(&mut m, key(KeyCode::Tab)); // back to the sidebar
+    update(&mut m, key(KeyCode::Down)); // select M
+    let mut m_task = task("m1", Status::Completed);
+    m_task.list = other.id.clone();
+    update(&mut m, Message::TasksLoaded(other.id.clone(), vec![m_task]));
+    let before = m.tasks.clone();
+
+    update(&mut m, Message::ClearedCompleted(ListId("L".to_string())));
+    // The reply belongs to a pane that is no longer on screen.
+    assert_eq!(m.tasks, before);
+}

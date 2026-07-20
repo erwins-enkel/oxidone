@@ -118,6 +118,14 @@ pub struct Model {
     /// Private like the other reducer-owned bookkeeping: the view reads it
     /// through [`Model::list_meter`], which decides live-versus-cached.
     list_counts: HashMap<ListId, (usize, usize)>,
+    /// The one bit that tells [`set_lists`]'s two callers apart. A manual Refresh
+    /// (`r`) is a **full** fan-out — every List's Tasks — so its meters all reflect
+    /// Google; the startup cascade is **lazy**, fetching only Lists the cache
+    /// aggregate did not already cover. Set in [`refresh`] (after the offline
+    /// guard, so an offline `r` never latches a flag no `ListsLoaded` consumes) and
+    /// consumed — read-and-cleared — by [`set_lists`], so it can never persist into
+    /// a later lazy load. Private, like `list_counts`.
+    pending_refresh: bool,
 }
 
 /// A modal overlay drawn over the panes.
@@ -214,6 +222,8 @@ impl Default for Model {
             // Seeded from the cache aggregate at startup, then re-derived on
             // every cache change; empty until then means "no meters yet".
             list_counts: HashMap::new(),
+            // No Refresh in flight; the startup cascade is lazy.
+            pending_refresh: false,
         }
     }
 }
@@ -338,6 +348,15 @@ impl Model {
             .filter(|t| t.parent.is_none())
             .map(|t| &t.id)
             .collect()
+    }
+
+    /// Whether any per-List sidebar meter has been seeded from the cache
+    /// aggregate. False only before the first `recount`, or on a cache holding no
+    /// Tasks. The runtime asserts this holds (against a non-empty cache) before the
+    /// seed `ListsLoaded`, because [`set_lists`]'s lazy fan-out reads `list_counts`
+    /// to decide coverage — a check the pure-reducer tests cannot observe.
+    pub fn has_seeded_meters(&self) -> bool {
+        !self.list_counts.is_empty()
     }
 
     /// `(done, total)` for a List's sidebar meter, or `None` when there is
@@ -611,6 +630,14 @@ pub enum Message {
     NotesEdited {
         task: TaskId,
         notes: Option<String>,
+    },
+    /// A List's Tasks failed to load. Attributed to its List (unlike the id-less
+    /// `LoadFailed`) so a fan-out failure surfaces only when that List is active —
+    /// a background List's failure must not read as the active pane failing, and a
+    /// cold start would otherwise emit one per uncovered List.
+    TasksLoadFailed {
+        list: ListId,
+        reason: String,
     },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
@@ -920,6 +947,15 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             model.status_line = Some(format!("could not open link: {reason}"));
             Vec::new()
         }
+        Message::TasksLoadFailed { list, reason } => {
+            // Surface only the active List's failure. A background List's is
+            // dropped, which is the fail-closed outcome: no `TasksLoaded` means no
+            // counts, means no meter on that row — the honest state.
+            if model.selected_list_id() == Some(&list) {
+                model.status_line = Some(reason);
+            }
+            Vec::new()
+        }
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
             Vec::new()
@@ -941,7 +977,24 @@ fn set_completed(task: &mut Task, completed: bool) {
 }
 
 /// Replace the List set, keeping the active List selected by id where possible,
-/// then request that List's Tasks.
+/// then request Tasks — the active List's always, plus a fan-out to fill the
+/// **sidebar meters** of Lists whose Tasks are not already loaded.
+///
+/// The fan-out policy turns on [`Model::pending_refresh`], read-and-cleared here:
+///
+/// - **full** (a manual Refresh): every List. `r` promises the latest from Google
+///   for *all* meters, so a Refresh that touched only the active pane would lie.
+/// - **lazy** (the startup cascade): only Lists the cache aggregate did not cover
+///   (absent from `list_counts`), so a List never opened on this machine gets a
+///   meter without a visit, while covered ones are left alone.
+///
+/// The active List is **never** part of the fan-out — [`request_selected_tasks`]
+/// already emitted its `LoadTasks`, and re-emitting would fetch it twice on a cold
+/// cache. So the commands come back **active List first**, then the fan-out.
+///
+/// A background List's fetch reports through [`Message::TasksLoadFailed`], not the
+/// id-less `LoadFailed`, so one List's failure never splashes onto the active
+/// pane's status line (see the reducer arm).
 fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     let previously_selected = model.selected_list_id().cloned();
     model.lists = lists;
@@ -957,7 +1010,23 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     // Only wipe the pane when the active List actually changed; a refresh that
     // keeps the same List reloads its Tasks in place, without a blank flash.
     let list_changed = previously_selected.as_ref() != model.selected_list_id();
-    request_selected_tasks(model, list_changed)
+    let mut commands = request_selected_tasks(model, list_changed);
+
+    // Consume the flag unconditionally, so a Refresh's `full` never carries into a
+    // later lazy cascade.
+    let full = std::mem::take(&mut model.pending_refresh);
+    let active = model.selected_list_id().cloned();
+    for list in &model.lists {
+        // The active List's `LoadTasks` is already the head of `commands`.
+        if active.as_ref() == Some(&list.id) {
+            continue;
+        }
+        // Lazy: skip a List the aggregate already covers. Full: take every List.
+        if full || !model.list_counts.contains_key(&list.id) {
+            commands.push(Command::LoadTasks(list.id.clone()));
+        }
+    }
+    commands
 }
 
 /// Request the active List's Tasks. When `clear_pane`, the pane is emptied
@@ -1612,6 +1681,10 @@ fn refresh(model: &mut Model) -> Vec<Command> {
         model.status_line = Some(OFFLINE.to_string());
         return Vec::new();
     }
+    // Set *after* the offline guard: an offline `r` returns above without a
+    // `RefreshLists`, so no `ListsLoaded` follows to consume the flag — setting it
+    // unconditionally would latch it into the next (lazy) startup cascade.
+    model.pending_refresh = true;
     model.status_line = Some("refreshing…".to_string());
     vec![Command::RefreshLists]
 }

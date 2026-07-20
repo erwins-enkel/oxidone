@@ -293,15 +293,18 @@ fn a_completed_subtask_never_sets_the_group_key() {
         ),
     ];
 
+    // This is the assertion that pins the key rule: were the Completed Subtask to
+    // contribute, "parent" would take its 2020 date and sort *above* "later".
     let hidden = model(tasks.clone(), SortView::Due);
     assert_eq!(titles(&hidden.visible_tasks()), vec!["later", "parent"]);
 
+    // Revealing it adds a row without moving any — though that follows from
+    // ordering never reading `show_completed`, not from the key rule above.
     let mut shown = model(tasks, SortView::Due);
     shown.show_completed = true;
     assert_eq!(
         titles(&shown.sorted_tasks()),
         vec!["later", "parent", "done"],
-        "revealing a Completed Task must not reorder the groups",
     );
 }
 

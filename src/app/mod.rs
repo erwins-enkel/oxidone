@@ -219,8 +219,8 @@ impl Model {
     ///   or per-sibling-group (Google).
     /// - `Due`: children by due date ascending (undated last); a group sorts by
     ///   the earliest due among its **incomplete** Tasks, so an urgent Subtask
-    ///   lifts its parent and a Completed one never does — group order is the
-    ///   same whether or not `show_completed` reveals them.
+    ///   lifts its parent and a Completed one never does — the position a group
+    ///   takes is always explained by a date visible in it.
     /// - `Title`: children and groups case-insensitive by title.
     ///
     /// Ordering is **stable over stored order** everywhere: groups are built in
@@ -413,9 +413,14 @@ fn due_key(due: Option<NaiveDate>) -> (bool, Option<NaiveDate>) {
 }
 
 /// The `Due` key for a group: the earliest due date among its **incomplete**
-/// Tasks, so an urgent Subtask lifts its parent out of the tail. Completed Tasks
-/// never contribute — otherwise a row hidden by `show_completed` could set the
-/// group's position, and toggling the filter would reorder the pane.
+/// Tasks, so an urgent Subtask lifts its parent out of the tail.
+///
+/// Completed Tasks never contribute, so a group is never placed by a date the
+/// user cannot see in it — with the filter on, a group whose only dated member is
+/// Completed would sit high in the pane with nothing on screen to explain why.
+/// Note this is *not* what keeps the order stable across the filter: ordering
+/// reads only `tasks`, never `show_completed` (the flag is applied afterwards, by
+/// `visible_tasks`), so toggling adds and removes rows without moving any.
 fn group_due_key(group: &[&Task]) -> Option<NaiveDate> {
     group
         .iter()

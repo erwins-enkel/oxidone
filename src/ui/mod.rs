@@ -224,19 +224,21 @@ fn sidebar_row(
         (area_width.saturating_sub(PANEL_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
     let title_width = title.width();
 
-    // Measured, not assumed: `103/247` is 7 columns where `3/8` is 3, and a
-    // hardcoded width would clip the bar on a busy List.
+    // Each candidate is built and then measured, never predicted: the spacing
+    // lives in the `format!` alone, so changing it cannot leave an arithmetic
+    // twin behind. It also measures the ratio for free — `103/247` is 7 columns
+    // where `3/8` is 3.
     let ratio = format!("{done}/{total}");
-    let with_bar = 2 + SIDEBAR_METER_WIDTH as usize + 1 + ratio.width();
-    let text_only = 2 + ratio.width();
+    let with_bar = format!(
+        "  {} {ratio}",
+        meter::render(done, total, SIDEBAR_METER_WIDTH, ascii)
+    );
+    let text_only = format!("  {ratio}");
 
-    let segment = if title_width + with_bar <= usable {
-        format!(
-            "  {} {ratio}",
-            meter::render(done, total, SIDEBAR_METER_WIDTH, ascii)
-        )
-    } else if title_width + text_only <= usable {
-        format!("  {ratio}")
+    let segment = if title_width + with_bar.width() <= usable {
+        with_bar
+    } else if title_width + text_only.width() <= usable {
+        text_only
     } else {
         return title.to_string();
     };
@@ -280,14 +282,18 @@ fn subtask_segment(
         return String::new();
     };
 
+    // Built then measured, as in `sidebar_row`: the spacing has one home.
     let ratio = format!("{done}/{total}");
-    if 2 + SUBTASK_METER_WIDTH as usize + 1 + ratio.width() <= room {
-        format!(
-            "  {} {ratio}",
-            meter::render(done, total, SUBTASK_METER_WIDTH, ascii)
-        )
-    } else if 2 + ratio.width() <= room {
-        format!("  {ratio}")
+    let with_bar = format!(
+        "  {} {ratio}",
+        meter::render(done, total, SUBTASK_METER_WIDTH, ascii)
+    );
+    let text_only = format!("  {ratio}");
+
+    if with_bar.width() <= room {
+        with_bar
+    } else if text_only.width() <= room {
+        text_only
     } else {
         String::new()
     }

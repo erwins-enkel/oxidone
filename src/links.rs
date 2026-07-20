@@ -50,6 +50,13 @@ fn is_openable(raw: &str) -> bool {
     }
 }
 
+/// Whether `c` can sit between two URLs glued together in prose. The
+/// punctuation that ends a URL, plus the brackets that open one — `<a><b>` and
+/// `](a)[…](b)` separate two links just as surely as a comma does.
+fn is_glue(c: char) -> bool {
+    TRAILING.contains(&c) || matches!(c, '(' | '[' | '{' | '<')
+}
+
 /// The only schemes oxidone will hand to a browser. Shared by
 /// [`OpenableUrl::parse`] and the scanner's scheme-boundary search so the two
 /// can never disagree about what "openable" means.
@@ -126,8 +133,11 @@ impl<'a> Iterator for UrlTokens<'a> {
             let end = self.rest[after..]
                 .find(char::is_whitespace)
                 .map_or(self.rest.len(), |i| after + i);
+            // A wrapped URL ends at its own closer, before any glue search:
+            // `[a](url)` and `<url>` bound the URL more tightly than whitespace.
+            let end = wrapped_end(self.rest, start, after, end).unwrap_or(end);
             let end = self.next_url_start(start, after, end).unwrap_or(end);
-            let token = self.rest[start..end].trim_end_matches(TRAILING);
+            let token = trim_token(&self.rest[start..end]);
             self.rest = &self.rest[end..];
             // Reject a bare `https://` with no authority: it is a scheme, not a
             // link, and counting it would inflate "N links found".
@@ -165,7 +175,7 @@ impl UrlTokens<'_> {
             let sep = from + hit;
             let split = scheme_start(self.rest, sep)
                 .filter(|&next| next > start)
-                .filter(|&next| TRAILING.contains(&char::from(bytes[next - 1])));
+                .filter(|&next| is_glue(char::from(bytes[next - 1])));
             if split.is_some() {
                 return split;
             }
@@ -173,6 +183,74 @@ impl UrlTokens<'_> {
         }
         None
     }
+}
+
+/// End of a URL that prose wrapped in brackets — `[text](url)`, `<url>`, or a
+/// parenthetical aside — at the closer matching the opener in front of it.
+///
+/// Nesting is counted, so a URL that legitimately contains the same bracket
+/// survives: `(https://en.wikipedia.org/wiki/Foo_(bar))` ends at the *outer*
+/// `)`, not the inner one.
+///
+/// This is what makes `[a](https://a.dev)[b](https://b.dev)` two links. Ending
+/// only at whitespace would run the first URL through the closing bracket and
+/// on into the second, producing one address that is not a URL at all — and
+/// that [`is_openable`] would nonetheless accept.
+fn wrapped_end(text: &str, start: usize, after: usize, end: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let opener = *bytes.get(start.checked_sub(1)?)?;
+    let closer = match opener {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        _ => return None,
+    };
+    // ASCII brackets only, so a UTF-8 continuation byte can never match one.
+    let mut depth = 1usize;
+    for (i, b) in bytes.iter().enumerate().take(end).skip(after) {
+        if *b == opener {
+            depth += 1;
+        } else if *b == closer {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Strip the prose punctuation trailing a URL, keeping a closing bracket the
+/// URL actually owns.
+///
+/// `https://a.dev)` ends in a stray bracket from the surrounding sentence, but
+/// `https://en.wikipedia.org/wiki/Foo_(bar)` ends in one of its own — trimming
+/// by character alone cannot tell them apart and silently breaks the second.
+fn trim_token(token: &str) -> &str {
+    let mut end = token.len();
+    while let Some(last) = token[..end].chars().last() {
+        let strip = match last {
+            ')' | ']' | '}' => !bracket_balanced(&token[..end], last),
+            other => TRAILING.contains(&other),
+        };
+        if !strip {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    &token[..end]
+}
+
+/// Whether `slice` opens `closer`'s bracket at least as often as it closes it —
+/// i.e. whether the final closer has an opener to match.
+fn bracket_balanced(slice: &str, closer: char) -> bool {
+    let opener = match closer {
+        ')' => '(',
+        ']' => '[',
+        _ => '{',
+    };
+    slice.matches(opener).count() >= slice.matches(closer).count()
 }
 
 /// Byte index where the scheme preceding `sep` starts, if there is a valid one.

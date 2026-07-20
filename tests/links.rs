@@ -175,6 +175,40 @@ fn a_nested_url_does_not_hide_a_glued_sibling_behind_it() {
 }
 
 #[test]
+fn bracket_wrapped_urls_are_separate_links() {
+    // Markdown and angle-bracket forms are ordinary in notes. Ending only at
+    // whitespace ran the first URL through its closer and into the second,
+    // yielding one address that is not a URL — which `is_openable` still accepts.
+    assert_eq!(
+        scan_urls("[a](https://a.dev)[b](https://b.dev)"),
+        vec!["https://a.dev", "https://b.dev"],
+    );
+    assert_eq!(
+        scan_urls("<https://a.dev><https://b.dev>"),
+        vec!["https://a.dev", "https://b.dev"],
+    );
+    assert_eq!(scan_urls("[a](https://a.dev)"), vec!["https://a.dev"]);
+}
+
+#[test]
+fn a_url_keeps_a_closing_bracket_it_owns() {
+    // The other half of the same rule: `)` ends the URL when prose opened it,
+    // and belongs to the URL when the URL opened it.
+    assert_eq!(
+        scan_urls("https://en.wikipedia.org/wiki/Foo_(bar)"),
+        vec!["https://en.wikipedia.org/wiki/Foo_(bar)"],
+    );
+    // Wrapped *and* self-parenthesised: nesting is counted, so it ends at the
+    // outer closer rather than the inner one.
+    assert_eq!(
+        scan_urls("(https://en.wikipedia.org/wiki/Foo_(bar))"),
+        vec!["https://en.wikipedia.org/wiki/Foo_(bar)"],
+    );
+    // A stray closer with nothing to match is still prose.
+    assert_eq!(scan_urls("see https://a.dev/x)"), vec!["https://a.dev/x"]);
+}
+
+#[test]
 fn a_schemeless_host_is_not_a_url() {
     assert!(scan_urls("see www.example.com for details").is_empty());
 }
@@ -274,6 +308,9 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
         "https://maps.example.com/@52.5,13.4",
         "https://a.dev/x?u=https://b.dev",
         "https://a.dev/x?u=https://b.dev,https://c.dev",
+        "[a](https://a.dev)[b](https://b.dev)",
+        "<https://a.dev><https://b.dev>",
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
     ];
     for notes in fixtures {
         assert_eq!(

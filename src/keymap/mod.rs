@@ -232,6 +232,36 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         .map(|b| b.action)
 }
 
+/// The cheatsheet's rows: one per distinct `(action, help)` pair, labelled with
+/// every key bound to it, joined with `/` (`j/Down`, `e/Enter`).
+///
+/// Rows come back in first-appearance order within `bindings()`, and that is
+/// part of the contract, not an accident of the implementation: the `?` popup
+/// splits this slice into columns positionally, so the order decides which rows
+/// share a column and therefore how wide each column is. Hence the linear
+/// group-by rather than a `HashMap`, whose iteration order would reshuffle the
+/// popup between runs.
+///
+/// Distinct from `LegendEntry::key_text`, which resolves a *curated* list of
+/// `Action`s to the *first* key bound to each. The legend wants one compact key
+/// per verb; the cheatsheet wants every key that triggers one.
+pub fn cheatsheet_rows() -> Vec<(String, &'static str)> {
+    let mut groups: Vec<(Action, &'static str, Vec<String>)> = Vec::new();
+    for b in bindings() {
+        match groups
+            .iter_mut()
+            .find(|(action, help, _)| *action == b.action && *help == b.help)
+        {
+            Some((_, _, labels)) => labels.push(key_label(b.key)),
+            None => groups.push((b.action, b.help, vec![key_label(b.key)])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, help, labels)| (labels.join("/"), help))
+        .collect()
+}
+
 /// A short label for a key, for the cheatsheet.
 pub fn key_label(code: KeyCode) -> String {
     match code {

@@ -36,6 +36,9 @@ recurrence and reminders (not exposed by the API).
 
 ## Install
 
+oxidone supports terminals of 80x24 and up; the `?` cheatsheet is laid out to fit
+that in full, and says so on its bottom border if it ever cannot.
+
 ### Prebuilt binaries
 
 Each [release](https://github.com/erwins-enkel/oxidone/releases) ships prebuilt

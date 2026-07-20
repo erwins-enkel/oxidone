@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Focus, Message, Model, Overlay};
 use oxidone::keymap::{self, Action, LegendContext, LegendKeys};
+use std::collections::HashSet;
 
 fn press(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -297,4 +298,94 @@ fn overlay_legends_advertise_only_keys_the_overlay_handles() {
         .map(|c| c.text())
         .collect();
     assert_eq!(confirm, ["y yes", "n no", "Esc cancel"]);
+}
+
+// --- The `?` cheatsheet ---------------------------------------------------
+//
+// A third view of the same binding table, and the widest: every binding appears,
+// with aliases collapsed onto one row. The layout and rendering live in `ui`
+// (private, tested inline).
+
+#[test]
+fn the_cheatsheet_labels_every_bound_key_exactly_once() {
+    // The `/`-split below is only sound while no single label contains a slash.
+    // `key_label` falls through to `format!("{other:?}")` for unlisted keys, so
+    // a future `KeyCode` could Debug-format with one and split a label in two —
+    // which would pass the set comparison for the wrong reason.
+    assert!(
+        keymap::bindings()
+            .iter()
+            .all(|b| !keymap::key_label(b.key).contains('/')),
+        "a key label contains '/', which the cheatsheet uses as its join"
+    );
+
+    let labelled: HashSet<String> = keymap::cheatsheet_rows()
+        .iter()
+        .flat_map(|(label, _)| label.split('/').map(str::to_string))
+        .collect();
+    let bound: HashSet<String> = keymap::bindings()
+        .iter()
+        .map(|b| keymap::key_label(b.key))
+        .collect();
+
+    // Both directions: no binding missing from the cheatsheet, and nothing in
+    // the cheatsheet that isn't bound. `contains` would not do — `"n"` is a
+    // substring of `"j/Down"`, and `"a"` and `"c"` of `"Space"`.
+    assert_eq!(labelled, bound);
+}
+
+#[test]
+fn the_cheatsheet_collapses_aliases_onto_one_row() {
+    let rows = keymap::cheatsheet_rows();
+
+    // Derived, never a literal: one row per distinct (action, help) pair.
+    // `Action` is `PartialEq` but not `Hash`, so count with a `Vec` rather than
+    // widen the enum's derives for a test's convenience.
+    let mut distinct: Vec<(Action, &str)> = Vec::new();
+    for b in keymap::bindings() {
+        if !distinct.contains(&(b.action, b.help)) {
+            distinct.push((b.action, b.help));
+        }
+    }
+    assert_eq!(rows.len(), distinct.len());
+    assert!(
+        rows.len() < keymap::bindings().len(),
+        "no aliases collapsed"
+    );
+
+    let joined: Vec<&str> = rows
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .filter(|label| label.contains('/'))
+        .collect();
+    assert_eq!(joined, ["h/Left", "l/Right", "j/Down", "k/Up", "e/Enter"]);
+}
+
+#[test]
+fn the_cheatsheet_keeps_binding_table_order() {
+    // Load-bearing: `ui` splits these rows into columns positionally, so the
+    // order decides each column's width. A HashMap group-by would reshuffle the
+    // popup between runs.
+    //
+    // Rows are identified by their leading key, not by help text alone: two
+    // distinct verbs are free to share the same help string, and comparing only
+    // that column would let such a pair swap places undetected. A key appears in
+    // `bindings` once, so the first label of each row names it uniquely.
+    let mut seen: Vec<(Action, &str)> = Vec::new();
+    let mut expected: Vec<(String, &str)> = Vec::new();
+    for b in keymap::bindings() {
+        if !seen.contains(&(b.action, b.help)) {
+            seen.push((b.action, b.help));
+            expected.push((keymap::key_label(b.key), b.help));
+        }
+    }
+
+    let actual: Vec<(String, &str)> = keymap::cheatsheet_rows()
+        .iter()
+        .map(|(label, help)| {
+            let first = label.split('/').next().expect("split yields one part");
+            (first.to_string(), *help)
+        })
+        .collect();
+    assert_eq!(actual, expected);
 }

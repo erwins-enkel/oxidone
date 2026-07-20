@@ -7,11 +7,18 @@
 //! feed the results back as `Message`s. With no credentials the app runs purely
 //! against the cache.
 
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::NaiveDate;
 use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 
@@ -83,17 +90,42 @@ async fn run(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    // Blocking terminal-event reader on its own thread; feeds key presses into
-    // the reducer loop. Exits when the receiver is dropped (quit) or on error.
+    // Editor for the notes feature (`$VISUAL`/`$EDITOR`). Resolved once: its
+    // presence decides the reducer's notes path, and the tokens drive the spawn.
+    let editor = resolve_editor();
+
+    // While the external notes editor owns the terminal, the reader thread must
+    // not also read from it (it would steal the editor's keystrokes). The gate
+    // coordinates that hand-off.
+    let gate = ReaderGate {
+        paused: Arc::new(AtomicBool::new(false)),
+        parked: Arc::new(AtomicBool::new(false)),
+    };
+
+    // Terminal-event reader on its own thread; feeds key presses into the reducer
+    // loop. It polls (rather than blocking in `read`) so it can observe the gate
+    // between reads. Exits when the receiver is dropped (quit) or on error.
     let reader_tx = tx.clone();
+    let reader_paused = gate.paused.clone();
+    let reader_parked = gate.parked.clone();
     std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                if reader_tx.send(Message::Key(key)).is_err() {
-                    break;
+        if reader_paused.load(Ordering::Acquire) {
+            reader_parked.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        reader_parked.store(false, Ordering::Release);
+        match event::poll(Duration::from_millis(50)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    if reader_tx.send(Message::Key(key)).is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(_) => {}
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            Ok(false) => {}
             Err(_) => break,
         }
     });
@@ -102,6 +134,7 @@ async fn run(
     // emitted commands, their Tasks read straight from cache even when online.
     // Then a background refresh (if online) updates both from Google.
     let mut model = Model::new();
+    model.editor_available = editor.is_some();
     let seed = update(&mut model, Message::ListsLoaded(initial_lists));
     seed_tasks_from_cache(&mut model, seed, &cache);
     if let Some(reason) = load_error {
@@ -130,7 +163,20 @@ async fn run(
                 // reducer must not resolve "tomorrow" against the clock as it
                 // read when the frame was painted.
                 model.now = chrono::Local::now();
-                dispatch(update(&mut model, msg), &api, &cache, &tx);
+                let commands = update(&mut model, msg);
+                // `SpawnEditor` owns the terminal, so it runs here synchronously
+                // rather than in a background worker; its follow-up write joins the
+                // rest of the commands for the normal worker dispatch.
+                let mut deferred = Vec::with_capacity(commands.len());
+                for command in commands {
+                    match command {
+                        Command::SpawnEditor { task, notes } => deferred.extend(run_notes_editor(
+                            terminal, &editor, &gate, &mut model, task, notes,
+                        )),
+                        other => deferred.push(other),
+                    }
+                }
+                dispatch(deferred, &api, &cache, &tx);
                 if model.should_quit {
                     break;
                 }
@@ -204,6 +250,22 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::SetNotes { list, task, notes } => match api {
+                Some(api) => {
+                    spawn_write_notes(api.clone(), cache.clone(), tx.clone(), list, task, notes)
+                }
+                None => {
+                    let _ = tx.send(Message::TaskWriteFailed {
+                        task,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            // `SpawnEditor` never reaches here: it owns the terminal and is
+            // handled synchronously in the run loop, not by a background worker.
+            Command::SpawnEditor { .. } => {
+                tracing::error!("SpawnEditor reached the worker dispatch; ignoring");
+            }
             Command::DeleteTask { list, task } => match api {
                 Some(api) => spawn_delete_task(api.clone(), cache.clone(), tx.clone(), list, task),
                 None => {
@@ -356,6 +418,33 @@ fn spawn_write_due(
 ) {
     tokio::spawn(async move {
         let message = match sync::patch_due(api.as_ref(), &list, &task, due).await {
+            Ok(updated) => {
+                if let Err(e) = cache.lock().unwrap().upsert_task(&updated) {
+                    tracing::warn!(error = %e, "failed to cache task write");
+                }
+                Message::TaskUpdated(updated)
+            }
+            Err(e) => Message::TaskWriteFailed {
+                task,
+                reason: format!("failed to update task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Write-through a notes change: patch on Google, mirror into the cache, report
+/// the server Task back (or a rollback on failure). `notes = None` clears them.
+fn spawn_write_notes(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+    notes: Option<String>,
+) {
+    tokio::spawn(async move {
+        let message = match sync::patch_notes(api.as_ref(), &list, &task, notes).await {
             Ok(updated) => {
                 if let Err(e) = cache.lock().unwrap().upsert_task(&updated) {
                     tracing::warn!(error = %e, "failed to cache task write");
@@ -525,6 +614,135 @@ fn spawn_load_tasks(
         };
         let _ = tx.send(message);
     });
+}
+
+/// Handshake flags for pausing the terminal-event reader while the external
+/// editor owns the terminal. `paused` asks the reader to stop; `parked` is its
+/// acknowledgement that it is idle (not blocked inside a read), so the runtime
+/// can hand the terminal over without racing it for the editor's keystrokes.
+struct ReaderGate {
+    paused: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
+}
+
+/// Resolve the user's editor from `$VISUAL` then `$EDITOR`, split into program +
+/// leading args (e.g. `EDITOR="code -w"`). `None` when neither is set, which
+/// selects the inline fallback overlay instead.
+fn resolve_editor() -> Option<Vec<String>> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(var) {
+            let tokens: Vec<String> = value.split_whitespace().map(String::from).collect();
+            if !tokens.is_empty() {
+                return Some(tokens);
+            }
+        }
+    }
+    None
+}
+
+/// Run the notes editor for `task` and feed the outcome back through the reducer:
+/// a change becomes an optimistic write-through (`NotesEdited`), an unchanged
+/// buffer is a no-op, and a failure lands on the status line.
+fn run_notes_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    editor: &Option<Vec<String>>,
+    gate: &ReaderGate,
+    model: &mut Model,
+    task: TaskId,
+    notes: Option<String>,
+) -> Vec<Command> {
+    let Some(tokens) = editor else {
+        // editor_available is stamped from the same source, so this is unreachable
+        // in practice; fail closed rather than silently drop the edit.
+        return update(
+            model,
+            Message::LoadFailed("no editor configured".to_string()),
+        );
+    };
+    match edit_in_external_editor(terminal, gate, tokens, notes.as_deref()) {
+        Ok(Some(text)) => {
+            let notes = (!text.is_empty()).then_some(text);
+            update(model, Message::NotesEdited { task, notes })
+        }
+        Ok(None) => Vec::new(), // unchanged: nothing to write
+        Err(e) => update(
+            model,
+            Message::LoadFailed(format!("notes editor failed: {e}")),
+        ),
+    }
+}
+
+/// Suspend the TUI, open `current` notes in the external editor, and return the
+/// edited text — or `None` when it is unchanged. The reader gate is released and
+/// the temp file removed on every exit path, so a teardown failure can't leave
+/// the reader parked or leak the file.
+fn edit_in_external_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    gate: &ReaderGate,
+    editor: &[String],
+    current: Option<&str>,
+) -> io::Result<Option<String>> {
+    let original = current.unwrap_or("");
+    let path = std::env::temp_dir().join(format!("oxidone-notes-{}.txt", std::process::id()));
+    std::fs::write(&path, original)?;
+
+    // Ask the reader thread to stand down and wait (bounded) for it to confirm it
+    // is idle, so it can't consume the editor's keystrokes. Proceed anyway if it
+    // doesn't ack in time (e.g. it was mid-read of an already-buffered key).
+    gate.paused.store(true, Ordering::Release);
+    for _ in 0..20 {
+        if gate.parked.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let outcome = run_suspended_editor(terminal, editor, &path, original);
+
+    // Release the reader and drop the temp file whatever happened above — an early
+    // `?` inside the suspend/resume must not leave either dangling.
+    gate.paused.store(false, Ordering::Release);
+    let _ = std::fs::remove_file(&path);
+    outcome
+}
+
+/// Leave the TUI, run the editor on `path`, re-enter the TUI, and read the result
+/// back — `None` when unchanged. Re-entry (raw mode + alternate screen) runs
+/// before the editor's exit status is propagated, so the terminal is restored on
+/// both success and editor-failure paths.
+fn run_suspended_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    editor: &[String],
+    path: &std::path::Path,
+    original: &str,
+) -> io::Result<Option<String>> {
+    // Leave the TUI so the editor gets a clean terminal.
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+
+    let status = std::process::Command::new(&editor[0])
+        .args(&editor[1..])
+        .arg(path)
+        .status();
+
+    // Re-enter the TUI regardless of how the editor exited, then force a full
+    // repaint (the alternate screen was cleared underneath us).
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    if !status?.success() {
+        return Err(io::Error::other("editor exited with a non-zero status"));
+    }
+
+    // Editors habitually append a trailing newline; ignore it when comparing so
+    // an untouched buffer reads as "no change".
+    let edited = std::fs::read_to_string(path)?;
+    let trimmed = edited.trim_end_matches('\n');
+    if trimmed == original.trim_end_matches('\n') {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Build the live Google client from BYO credentials, running the first-run

@@ -56,6 +56,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
         Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
         Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
         Overlay::EditDue { buffer, .. } => ("Edit due date (blank clears)", format!("{buffer}▏")),
+        Overlay::EditNotes { buffer, .. } => ("Edit notes (blank clears)", format!("{buffer}▏")),
         Overlay::AddList { buffer } => ("Add list", format!("{buffer}▏")),
         Overlay::RenameList { buffer, .. } => ("Rename list", format!("{buffer}▏")),
         Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),

@@ -19,6 +19,7 @@ pub enum Action {
     AddTask,
     EditTitle,
     EditDue,
+    EditNotes,
     DeleteTask,
     CycleSort,
     // Sidebar List management. Bound to capitals so they never clash with the
@@ -106,6 +107,11 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('d'),
             action: Action::EditDue,
             help: "edit due date",
+        },
+        Binding {
+            key: KeyCode::Char('n'),
+            action: Action::EditNotes,
+            help: "edit notes ($EDITOR)",
         },
         Binding {
             key: KeyCode::Char('x'),

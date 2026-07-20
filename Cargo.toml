@@ -31,8 +31,8 @@ path = "src/main.rs"
 # was dropped here — it was declared but never used, and `cargo machete` fails
 # the gate on unused deps. Re-add it with `cargo add tui-textarea` in the same
 # change that actually wires up the editor fallback.
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 catppuccin = { version = "2", features = ["ratatui"] }  # palette -> ratatui Color
 
 # Async runtime — scoped features only

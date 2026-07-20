@@ -58,7 +58,16 @@ async fn main() -> Result<()> {
     // `ratatui::init` enters the alternate screen + raw mode and installs a
     // panic hook that restores the terminal. `restore` reverses it.
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &theme, api, cache, initial_lists, load_error).await;
+    let result = run(
+        &mut terminal,
+        &theme,
+        config.ascii_fallback,
+        api,
+        cache,
+        initial_lists,
+        load_error,
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -66,6 +75,7 @@ async fn main() -> Result<()> {
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     theme: &Theme,
+    ascii: bool,
     api: Api,
     cache: SharedCache,
     initial_lists: Vec<List>,
@@ -102,7 +112,7 @@ async fn run(
     }
 
     loop {
-        terminal.draw(|frame| ui::view(&model, theme, frame))?;
+        terminal.draw(|frame| ui::view(&model, theme, ascii, frame))?;
         match rx.recv().await {
             Some(msg) => {
                 // Stamp the clock at the impure edge so the reducer stays pure

@@ -74,11 +74,18 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
+/// Width of the leading due-date column: `YYYY-MM-DD`.
+const DUE_WIDTH: usize = 10;
+
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
     // The current sort is a read-only lens over `tasks`: the display order comes
     // from `sorted_tasks()`, while `tasks` (Manual order) stays untouched.
     let ordered = model.sorted_tasks();
+    // Due dates lead the row in a fixed-width gutter so they scan vertically.
+    // The gutter only exists when something in view has a due date — otherwise
+    // every title would sit behind a column of blanks.
+    let due_gutter = ordered.iter().any(|t| t.due.is_some());
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -90,14 +97,18 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme)
             } else {
                 Style::new()
             };
-            let mut spans = vec![Span::styled(t.title.clone(), style)];
-            // A dim trailing ISO due date, when set.
-            if let Some(due) = t.due {
+            let mut spans = Vec::new();
+            if due_gutter {
+                let due = match t.due {
+                    Some(d) => d.format("%Y-%m-%d").to_string(),
+                    None => " ".repeat(DUE_WIDTH),
+                };
                 spans.push(Span::styled(
-                    format!("  {}", due.format("%Y-%m-%d")),
+                    format!("{due}  "),
                     Style::new().fg(theme.subtext),
                 ));
             }
+            spans.push(Span::styled(t.title.clone(), style));
             ListItem::new(Line::from(spans))
         })
         .collect();

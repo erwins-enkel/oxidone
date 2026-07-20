@@ -459,7 +459,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
         // The last four announce themselves elsewhere, so they drop first on a
         // narrow pane: `Enter` already aliases `e`, the pane title names the
-        // active Sort view, a Task with links carries the `⧉` marker, and a
+        // active Sort view, a Task with links carries the `⧉` link marker, and a
         // typed entry carries its signifier. Promoting `link` far enough to show
         // at 80 columns would drop `c completed`, which outranks it because
         // hiding Completed Tasks changes the screen with nothing on it to say so.

@@ -309,6 +309,60 @@ fn link_marker(has_urls: bool, ascii: bool) -> Option<&'static str> {
     has_urls.then_some(if ascii { " *" } else { " ⧉" })
 }
 
+/// The trailing mark on a Task carrying notes — the free-text body edited with
+/// `n` — or `None` when it has none.
+///
+/// Not to be confused with [`EntryType::Note`], whose `—` signifier *leads* the
+/// row: the two can share a line (`— call the notary ≡`). They are unrelated — a
+/// Note-typed entry need not have notes, and any entry type may. "Notes" here
+/// always means the body; the entry type is always spelled `EntryType::Note`.
+///
+/// Degrades to ASCII with the braille widgets (ADR-0006), following
+/// [`link_marker`]: `=` echoes `≡` without colliding with the link marker's `*`.
+/// `unicode-width` reports `≡` as one cell under its non-CJK default, and
+/// `ascii_fallback` is the remedy for a terminal that disagrees.
+fn notes_marker(has_notes: bool, ascii: bool) -> Option<&'static str> {
+    has_notes.then_some(if ascii { " =" } else { " ≡" })
+}
+
+/// Whether `notes` holds anything a reader could see.
+///
+/// Not a whitespace test. A body of only invisible formatting — bidi controls or
+/// other C0/format characters — renders as nothing at all, and a `≡` beside it
+/// would promise text the editor will not show. Invisible formatting is not
+/// information.
+///
+/// This asks only whether something is *visible*, not whether it is safe to draw:
+/// nothing here puts the notes on screen, so nothing can be reordered or
+/// mis-measured by them. Sanitising those same characters is a different question,
+/// for the change that lays a notes preview out (#54's follow-up).
+///
+/// Short-circuits on the first visible character, so an 8192-char body costs one
+/// character — the same per-frame reasoning [`links::has_openable_url`] carries,
+/// in the same row loop.
+fn has_notes_body(notes: &str) -> bool {
+    notes.chars().any(|c| !is_invisible(c))
+}
+
+/// Whether `c` occupies no visible space of its own: whitespace, a control, or
+/// one of the Unicode format characters that steer bidirectional text.
+///
+/// The bidi set is enumerated rather than derived: `char::is_control` covers only
+/// `Cc`, and these are `Cf`, so they would otherwise read as visible content. Nine
+/// code points do not justify a Unicode-category dependency.
+///
+/// Combining marks are deliberately absent — they are zero-width by design but
+/// part of legitimate text (a decomposed `é`), and a body holding one *is* visible.
+fn is_invisible(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(c,
+            '\u{061c}'                    // ARABIC LETTER MARK
+            | '\u{200e}' | '\u{200f}'     // LRM, RLM
+            | '\u{202a}'..='\u{202e}'     // LRE, RLE, PDF, LRO, RLO
+            | '\u{2066}'..='\u{2069}') // LRI, RLI, FSI, PDI
+}
+
 /// The Bullet Journal signifier for an entry type: `Event` and `Note` carry a
 /// glyph, `Task` a blank of the same width — every variant occupies the same
 /// cell so titles stay aligned down the pane
@@ -430,23 +484,34 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // Trails the title so the due gutter and Subtask indent stay
             // aligned. Driven by the cheap predicate, not by collecting the
             // URLs: this runs for every visible row on every frame.
-            let has_urls = links::has_openable_url(t.notes.as_deref().unwrap_or_default());
+            let notes = t.notes.as_deref().unwrap_or_default();
+            let has_urls = links::has_openable_url(notes);
             let marker = link_marker(has_urls, ascii);
             if let Some(marker) = marker {
                 // Inherits the row's style, so on a Completed Task it reads dim
                 // and struck-through with the title — its links still open.
                 spans.push(Span::styled(marker, style));
             }
-            // The Subtask meter trails both, because the marker belongs to this
+            // Then the notes mark, in the same row style: `⧉` and `≡` are the same
+            // class of thing — facts about this Task's own text — so they must
+            // read at the same brightness. They answer different questions, so a
+            // row with links carries both: `u` has something to open, `n` has
+            // something to read.
+            let notes_mark = notes_marker(has_notes_body(notes), ascii);
+            if let Some(notes_mark) = notes_mark {
+                spans.push(Span::styled(notes_mark, style));
+            }
+            // The Subtask meter trails both markers, because they belong to this
             // Task's own text while the meter summarises the rows beneath it.
-            // The marker is never dropped for the meter's sake: it is not this
-            // widget's information to spend.
+            // Neither marker is dropped for the meter's sake: they are not this
+            // widget's information to spend — so both widths come off its budget,
+            // or it would lay itself out over cells the row has already spent.
             let segment = subtask_segment(
                 subtask_counts.get(&t.id).copied(),
                 area.width,
                 due_gutter,
                 drawn_width,
-                marker.map_or(0, |m| m.width()),
+                marker.map_or(0, |m| m.width()) + notes_mark.map_or(0, |m| m.width()),
                 ascii,
             );
             if !segment.is_empty() {
@@ -1572,6 +1637,60 @@ mod tests {
     }
 
     #[test]
+    fn the_notes_marker_appears_only_when_there_is_something_to_read() {
+        assert_eq!(notes_marker(false, false), None);
+        assert_eq!(notes_marker(false, true), None);
+        assert_eq!(notes_marker(true, false), Some(" ≡"));
+        assert_eq!(notes_marker(true, true), Some(" ="));
+    }
+
+    #[test]
+    fn both_markers_are_the_same_width_so_a_row_carrying_both_stays_predictable() {
+        assert_eq!(notes_marker(true, false).map(str::width), Some(2));
+        assert_eq!(notes_marker(true, true).map(str::width), Some(2));
+        assert_eq!(
+            notes_marker(true, false).map(str::width),
+            link_marker(true, false).map(str::width),
+        );
+    }
+
+    #[test]
+    fn a_notes_body_of_nothing_visible_earns_no_marker() {
+        // Each of these renders as blank, so a marker beside it would promise
+        // text the editor will not show.
+        for blank in [
+            "",
+            "   ",
+            "\n\n",
+            "\t",
+            "\r\n  \r\n",
+            "\u{202e}",             // a lone RLO
+            "\u{2066}\u{2069}",     // LRI immediately closed
+            " \u{200e}\n\u{061c} ", // whitespace and marks, several lines
+        ] {
+            assert!(
+                !has_notes_body(blank),
+                "expected no visible content in {blank:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_notes_body_with_any_visible_character_earns_a_marker() {
+        for body in [
+            "buy milk",
+            "\n\n  ring first\n",
+            "\u{202e}reversed",       // hostile *and* visible: still content
+            "e\u{301}",               // a combining mark is part of the text
+            "❤\u{fe0f}",              // VS16 emoji
+            "👩\u{200d}👩\u{200d}👧", // ZWJ sequence
+            ".",
+        ] {
+            assert!(has_notes_body(body), "expected visible content in {body:?}");
+        }
+    }
+
+    #[test]
     fn the_cursor_gutter_is_the_same_width_either_way() {
         // The picker's truncation budget subtracts `LIST_CURSOR`; if the blank
         // drifted wider, focused and unfocused rows would wrap differently.
@@ -1744,7 +1863,11 @@ mod tests {
     fn a_subtask_meter_never_exceeds_its_budget() {
         for width in 0u16..=40 {
             for due_gutter in [false, true] {
-                for marker in [0usize, 2] {
+                // 0, one marker, and both: a row can carry `⧉` and `≡` at once.
+                // This pins the arithmetic *inside* the segment for that width —
+                // whether the call site actually passes both is a question only a
+                // rendered row can answer, and `notes_render.rs` asks it.
+                for marker in [0usize, 2, 4] {
                     for ascii in [false, true] {
                         let title = 8usize;
                         let seg = subtask_segment(

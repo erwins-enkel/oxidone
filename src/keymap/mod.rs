@@ -16,6 +16,7 @@ pub enum Action {
     SelectNext,
     SelectPrev,
     ToggleComplete,
+    AddTask,
     EditTitle,
     DeleteTask,
     CycleSort,
@@ -75,6 +76,11 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char(' '),
             action: Action::ToggleComplete,
             help: "toggle complete",
+        },
+        Binding {
+            key: KeyCode::Char('a'),
+            action: Action::AddTask,
+            help: "add task",
         },
         Binding {
             key: KeyCode::Char('e'),

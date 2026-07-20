@@ -45,6 +45,7 @@ pub fn view(model: &Model, theme: &Theme, frame: &mut Frame) {
 fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
     let (title, body): (&str, String) = match overlay {
         Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
+        Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
         Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
     };
     let popup = centered(area, 50, 3);

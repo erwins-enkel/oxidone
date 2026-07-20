@@ -143,25 +143,28 @@ fn render_link_picker(
         (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
     let items: Vec<ListItem> = links
         .iter()
-        .map(|link| ListItem::new(truncate(&link.display(), width)))
+        .map(|link| ListItem::new(truncate(&link.display(), width, "…")))
         .collect();
     frame.render_widget(Clear, popup);
     render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
 }
 
-/// `text` cut to `width` *display cells*, with the last spent on an ellipsis so
-/// a truncated URL never reads as a complete one.
+/// `text` cut to `width` *display cells*, the last spent on `ellipsis` so a
+/// truncated URL or preview never reads as a complete one.
 ///
 /// Cells, not chars: a URL pasted from an IRI can carry double-width characters
 /// (`https://例え.jp/…`), and budgeting by `chars().count()` would under-measure
 /// them — ratatui lays out by cell, so the row would overflow and be clipped
 /// with no ellipsis to show for it, which is the very thing this prevents.
-fn truncate(text: &str, width: usize) -> String {
+///
+/// `ellipsis` is a parameter, not a constant, because the notes preview folds `…`
+/// down to `...` under `ascii_fallback`; its own display width is reserved, so a
+/// three-cell `...` still leaves the result within `width`.
+fn truncate(text: &str, width: usize, ellipsis: &str) -> String {
     if text.width() <= width {
         return text.to_string();
     }
-    // `…` is itself one cell.
-    let budget = width.saturating_sub(1);
+    let budget = width.saturating_sub(ellipsis.width());
     let mut kept = String::new();
     let mut used = 0;
     for c in text.chars() {
@@ -172,7 +175,7 @@ fn truncate(text: &str, width: usize) -> String {
         kept.push(c);
         used += cell;
     }
-    kept.push('…');
+    kept.push_str(ellipsis);
     kept
 }
 
@@ -325,42 +328,147 @@ fn notes_marker(has_notes: bool, ascii: bool) -> Option<&'static str> {
     has_notes.then_some(if ascii { " =" } else { " ≡" })
 }
 
-/// Whether `notes` holds anything a reader could see.
+/// The first line of `notes` a reader could see — the source for both the `≡`
+/// marker and the inline preview, found in one scan of the body.
 ///
-/// Not a whitespace test. A body of only invisible formatting — bidi controls or
-/// other C0/format characters — renders as nothing at all, and a `≡` beside it
-/// would promise text the editor will not show. Invisible formatting is not
-/// information.
+/// The marker is `is_some()`; the preview is built from the same line by
+/// [`notes_preview_segment`] when the row has room. Sharing one scan is the point:
+/// an 8192-char body costs the first visible character in the common case, where
+/// two scans would pay for it twice per visible row per frame.
 ///
-/// This asks only whether something is *visible*, not whether it is safe to draw:
-/// nothing here puts the notes on screen, so nothing can be reordered or
-/// mis-measured by them. Sanitising those same characters is a different question,
-/// for the change that lays a notes preview out (#54's follow-up).
-///
-/// Short-circuits on the first visible character, so an 8192-char body costs one
-/// character — the same per-frame reasoning [`links::has_openable_url`] carries,
-/// in the same row loop.
-fn has_notes_body(notes: &str) -> bool {
-    notes.chars().any(|c| !is_invisible(c))
+/// Selects on [`is_invisible`], **not** on `str::trim`: a line of only
+/// layout-hostile characters is non-blank yet sanitises to spaces, so a
+/// trim-first test would pick it and then draw nothing, and skip a later line that
+/// does have prose. Because [`is_layout_hostile`] `⊆` [`is_invisible`], the line
+/// returned here always keeps a character through sanitising — the drawn preview
+/// is never empty.
+fn notes_preview_line(notes: &str) -> Option<&str> {
+    notes
+        .lines()
+        .find(|line| line.chars().any(|c| !is_invisible(c)))
 }
 
-/// Whether `c` occupies no visible space of its own: whitespace, a control, or
-/// one of the Unicode format characters that steer bidirectional text.
+/// The authority to show in place of a preview line that is *nothing but* a URL —
+/// `https://a.dev/1` → `a.dev` — sparing a preview that only restates what the
+/// `⧉` marker already announced, and clips mid-path doing it. `None` when the line
+/// carries prose (shown as-is) or the URL has no authority (`file:///x`).
 ///
-/// The bidi set is enumerated rather than derived: `char::is_control` covers only
-/// `Cc`, and these are `Cf`, so they would otherwise read as visible content. Nine
-/// code points do not justify a Unicode-category dependency.
+/// Gated on the scanner seeing exactly one URL spanning the whole line, so
+/// [`links::authority`] only ever slices a token [`links::scan_urls`] has already
+/// validated — the two cannot disagree about *where* the URL is.
+fn url_only_authority(line: &str) -> Option<&str> {
+    match links::scan_urls(line).as_slice() {
+        [only] if *only == line => links::authority(only),
+        _ => None,
+    }
+}
+
+/// The inline notes preview drawn at the very end of a row: [`PREVIEW_SEPARATOR`]
+/// then `line` — sanitised, a URL-only line shortened to its authority, truncated
+/// to what remains — or `None` when the row cannot spare [`MIN_PREVIEW_CELLS`]
+/// after everything else.
+///
+/// Ordered last, after the Subtask meter, so this variable-length tail can never
+/// clip a bounded widget; the meter keeps priority for scarce columns. `spent` is
+/// every cell the row already drew *before* the preview — the signifier cell, the
+/// *display* title (never `t.title`), the two markers, and the Subtask meter — so
+/// the caller keeps the single definition of what a row has spent. The Subtask
+/// indent is subtracted here too, which [`subtask_segment`] never has to: the
+/// meter draws only on non-indented parent rows, the preview draws on every row.
+fn notes_preview_segment(
+    line: &str,
+    area_width: u16,
+    due_gutter: bool,
+    is_subtask: bool,
+    spent: usize,
+    ascii: bool,
+) -> Option<String> {
+    let gutter = if due_gutter { DUE_WIDTH + 2 } else { 0 };
+    let indent = if is_subtask {
+        SUBTASK_INDENT.width()
+    } else {
+        0
+    };
+    let usable = (area_width.saturating_sub(PANEL_BORDERS) as usize)
+        .saturating_sub(LIST_CURSOR.width())
+        .saturating_sub(gutter)
+        .saturating_sub(indent);
+    let budget = usable.checked_sub(spent + PREVIEW_SEPARATOR.width())?;
+    if budget < MIN_PREVIEW_CELLS {
+        return None;
+    }
+
+    // Sanitise, then re-trim: leading or trailing hostile characters have become
+    // spaces. The chosen line carries a reader-visible character, and
+    // `is_layout_hostile ⊆ is_invisible`, so that character survives here — what
+    // remains is never empty.
+    let sanitised: String = line
+        .chars()
+        .map(|c| if is_layout_hostile(c) { ' ' } else { c })
+        .collect();
+    let trimmed = sanitised.trim();
+    let shown = url_only_authority(trimmed).unwrap_or(trimmed);
+    let ellipsis = if ascii { "..." } else { "…" };
+    Some(format!(
+        "{PREVIEW_SEPARATOR}{}",
+        truncate(shown, budget, ellipsis)
+    ))
+}
+
+/// The least room, in cells, worth spending on a notes preview; below it the row
+/// carries the `≡` marker alone. A taste knob — small enough that a scrap of prose
+/// still earns its column, large enough that a two-character sliver does not.
+const MIN_PREVIEW_CELLS: usize = 8;
+
+/// The single space charged between a row's trailing widgets and its notes
+/// preview. Charged once, in [`notes_preview_segment`]'s budget.
+const PREVIEW_SEPARATOR: &str = " ";
+
+/// Whether `c` occupies no visible space of its own: whitespace, a control, or
+/// one of the Unicode format characters that steer bidirectional text
+/// ([`is_bidi_control`]).
+///
+/// #54's marker predicate — asks whether a notes body has anything a reader could
+/// see, so a `≡` beside it does not promise text the editor will not show. A
+/// different question from [`is_layout_hostile`]: this decides *whether to draw*,
+/// that decides *what to neutralise* in text being laid out.
 ///
 /// Combining marks are deliberately absent — they are zero-width by design but
 /// part of legitimate text (a decomposed `é`), and a body holding one *is* visible.
 fn is_invisible(c: char) -> bool {
-    c.is_whitespace()
-        || c.is_control()
-        || matches!(c,
-            '\u{061c}'                    // ARABIC LETTER MARK
-            | '\u{200e}' | '\u{200f}'     // LRM, RLM
-            | '\u{202a}'..='\u{202e}'     // LRE, RLE, PDF, LRO, RLO
-            | '\u{2066}'..='\u{2069}') // LRI, RLI, FSI, PDI
+    c.is_whitespace() || c.is_control() || is_bidi_control(c)
+}
+
+/// Whether `c` must be replaced with a space before its line is laid out.
+///
+/// [`truncate`] measures with `c.width().unwrap_or(0)`, counting a control or
+/// format character as zero cells the terminal does not spend: a bidi control
+/// ([`is_bidi_control`]) reorders the whole drawn row, due gutter and all, and a
+/// C0/C1 control such as a mid-line tab expands to a tab stop and shifts it.
+/// Neutralising both lets the row be measured and drawn honestly.
+///
+/// Narrower than [`is_invisible`], and deliberately so: combining marks are kept
+/// (zero-width legitimate text), and `is_layout_hostile ⊆ is_invisible` — every
+/// hostile character is also invisible, so a line chosen by [`notes_preview_line`]
+/// (which has a *non*-invisible character) always survives sanitising non-empty.
+/// VS16/ZWJ under-measure rather than reorder, so they clip; mangling user text to
+/// buy a column back is worse than the residual.
+fn is_layout_hostile(c: char) -> bool {
+    c.is_control() || is_bidi_control(c)
+}
+
+/// The nine Unicode format characters (`Cf`) that steer bidirectional text.
+///
+/// Enumerated rather than derived: `char::is_control` covers only `Cc` and misses
+/// these, and nine code points do not justify a Unicode-category dependency. One
+/// home, shared by [`is_invisible`] and [`is_layout_hostile`] so the set cannot
+/// drift between "is this visible" and "must this be neutralised".
+fn is_bidi_control(c: char) -> bool {
+    matches!(c,
+        '\u{061c}'                    // ARABIC LETTER MARK
+        | '\u{200e}' | '\u{200f}'     // LRM, RLM
+        | '\u{202a}'..='\u{202e}'     // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}') // LRI, RLI, FSI, PDI
 }
 
 /// The Bullet Journal signifier for an entry type: `Event` and `Note` carry a
@@ -462,7 +570,8 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // Subtasks sit indented under their parent so the hierarchy reads.
             // An orphan (parent gone) draws flush-left rather than claiming the
             // row above it as its parent.
-            if renders_as_subtask(&top_level, t) {
+            let is_subtask = renders_as_subtask(&top_level, t);
+            if is_subtask {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
             // *After* the indent: hoisted outside it, a Subtask's glyph would
@@ -492,15 +601,18 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 // and struck-through with the title — its links still open.
                 spans.push(Span::styled(marker, style));
             }
-            // Then the notes mark, in the same row style: `⧉` and `≡` are the same
-            // class of thing — facts about this Task's own text — so they must
-            // read at the same brightness. They answer different questions, so a
-            // row with links carries both: `u` has something to open, `n` has
-            // something to read.
-            let notes_mark = notes_marker(has_notes_body(notes), ascii);
+            // One scan of the body: the first reader-visible line drives both the
+            // `≡` mark and the preview below. `⧉` and `≡` are the same class of
+            // thing — facts about this Task's own text — so they read at the same
+            // brightness, and a row with links carries both: `u` has something to
+            // open, `n` has something to read.
+            let preview_line = notes_preview_line(notes);
+            let notes_mark = notes_marker(preview_line.is_some(), ascii);
             if let Some(notes_mark) = notes_mark {
                 spans.push(Span::styled(notes_mark, style));
             }
+            let marker_width =
+                marker.map_or(0, |m| m.width()) + notes_mark.map_or(0, |m| m.width());
             // The Subtask meter trails both markers, because they belong to this
             // Task's own text while the meter summarises the rows beneath it.
             // Neither marker is dropped for the meter's sake: they are not this
@@ -511,9 +623,10 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 area.width,
                 due_gutter,
                 drawn_width,
-                marker.map_or(0, |m| m.width()) + notes_mark.map_or(0, |m| m.width()),
+                marker_width,
                 ascii,
             );
+            let meter_width = segment.width();
             if !segment.is_empty() {
                 // The row's style *minus* the strike: braille struck through is
                 // unreadable, but dropping the style outright would leave the
@@ -522,6 +635,22 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                     segment,
                     style.remove_modifier(Modifier::CROSSED_OUT),
                 ));
+            }
+            // Last of all, after the meter, so this variable-length tail can never
+            // clip a bounded widget. Dim prose (`subtext`), and the strike is
+            // *kept* on a Completed row — struck prose stays legible, the opposite
+            // of the meter just above, whose braille it would render unreadable.
+            if let Some(line) = preview_line {
+                if let Some(preview) = notes_preview_segment(
+                    line,
+                    area.width,
+                    due_gutter,
+                    is_subtask,
+                    drawn_width + marker_width + meter_width,
+                    ascii,
+                ) {
+                    spans.push(Span::styled(preview, style.fg(theme.subtext)));
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -1656,9 +1785,9 @@ mod tests {
     }
 
     #[test]
-    fn a_notes_body_of_nothing_visible_earns_no_marker() {
-        // Each of these renders as blank, so a marker beside it would promise
-        // text the editor will not show.
+    fn a_notes_body_of_nothing_visible_yields_no_preview_line() {
+        // Each of these renders as blank, so no line is selected — and the marker,
+        // which is `is_some()` of this, is absent too.
         for blank in [
             "",
             "   ",
@@ -1670,14 +1799,14 @@ mod tests {
             " \u{200e}\n\u{061c} ", // whitespace and marks, several lines
         ] {
             assert!(
-                !has_notes_body(blank),
+                notes_preview_line(blank).is_none(),
                 "expected no visible content in {blank:?}",
             );
         }
     }
 
     #[test]
-    fn a_notes_body_with_any_visible_character_earns_a_marker() {
+    fn a_notes_body_with_any_visible_character_yields_a_preview_line() {
         for body in [
             "buy milk",
             "\n\n  ring first\n",
@@ -1687,8 +1816,55 @@ mod tests {
             "👩\u{200d}👩\u{200d}👧", // ZWJ sequence
             ".",
         ] {
-            assert!(has_notes_body(body), "expected visible content in {body:?}");
+            assert!(
+                notes_preview_line(body).is_some(),
+                "expected visible content in {body:?}"
+            );
         }
+    }
+
+    #[test]
+    fn the_preview_line_skips_a_hostile_only_line_for_a_later_prose_one() {
+        // Selecting on `trim` would pick the RLO line (non-blank, sanitises to
+        // spaces) and draw nothing; selecting on `is_invisible` falls through.
+        assert_eq!(
+            notes_preview_line("\u{202e}\n  \nring Bob"),
+            Some("ring Bob")
+        );
+        assert_eq!(notes_preview_line("first line\nsecond"), Some("first line"));
+    }
+
+    #[test]
+    fn is_layout_hostile_covers_controls_and_bidi_not_marks() {
+        assert!(is_layout_hostile('\t')); // a tab expands to a tab stop
+        assert!(is_layout_hostile('\u{7}')); // a C0 control
+        assert!(is_layout_hostile('\u{202e}')); // RLO, reorders the row
+        assert!(is_layout_hostile('\u{61c}')); // ALM: Cf that is_control misses
+        assert!(!is_layout_hostile('\u{301}')); // combining acute: legitimate text
+        assert!(!is_layout_hostile('a'));
+        assert!(!is_layout_hostile(' '));
+        // The invariant the single scan leans on: every hostile char is invisible.
+        for c in ['\t', '\u{7}', '\u{202e}', '\u{61c}'] {
+            assert!(
+                is_layout_hostile(c) && is_invisible(c),
+                "{c:?} must be both"
+            );
+        }
+    }
+
+    #[test]
+    fn url_only_authority_shortens_only_a_whole_line_url() {
+        assert_eq!(url_only_authority("https://a.dev/1"), Some("a.dev"));
+        assert_eq!(
+            url_only_authority("https://a.dev:8080/x"),
+            Some("a.dev:8080")
+        );
+        // Prose beside the URL is not URL-only — shown as-is.
+        assert_eq!(url_only_authority("see https://a.dev/1"), None);
+        assert_eq!(url_only_authority("https://a.dev/1 and more"), None);
+        // Nothing to shorten, or no authority to show.
+        assert_eq!(url_only_authority("file:///x"), None);
+        assert_eq!(url_only_authority("just prose"), None);
     }
 
     #[test]
@@ -1890,6 +2066,107 @@ mod tests {
                             title + marker + seg.width() <= usable,
                             "width {width}, due {due_gutter}, marker {marker}: {seg:?}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    // --- The inline notes preview ----------------------------------------
+
+    #[test]
+    fn truncate_reserves_the_ellipsis_width() {
+        // A one-cell `…` and a three-cell `...` both leave the result within the
+        // budget — the whole reason the ellipsis is a parameter.
+        assert_eq!(truncate("hello world", 8, "…").width(), 8);
+        assert!(truncate("hello world", 8, "...").width() <= 8);
+        // Fits whole: no ellipsis, either spelling.
+        assert_eq!(truncate("hi", 8, "…"), "hi");
+    }
+
+    #[test]
+    fn a_notes_preview_needs_min_cells_of_room() {
+        // Concrete widths, not `MIN_PREVIEW_CELLS`, pin the floor: at a computed
+        // budget of 7 the row shows only the marker, at 8 the preview appears.
+        // usable = (40-2)-2 = 36; budget = 36 - spent - 1(sep) = 35 - spent.
+        let seg = |spent| notes_preview_segment("some prose here", 40, false, false, spent, false);
+        assert_eq!(seg(28), None, "spent 28 leaves budget 7 — below the floor");
+        assert!(
+            seg(27).is_some(),
+            "spent 27 leaves budget 8 — clears the floor"
+        );
+    }
+
+    #[test]
+    fn a_url_only_preview_line_is_shortened_to_its_authority() {
+        // The whole point of the operator's choice: a bare-URL line collapses.
+        let seg = notes_preview_segment("https://a.dev/some/deep/path", 80, false, false, 9, false)
+            .expect("room at 80 cols");
+        assert_eq!(seg, " a.dev");
+    }
+
+    #[test]
+    fn a_truncated_preview_folds_its_ellipsis_to_ascii_under_fallback() {
+        let long = "prose that certainly will not fit in a very narrow budget here";
+        let braille = notes_preview_segment(long, 30, false, false, 5, false).expect("room");
+        let ascii = notes_preview_segment(long, 30, false, false, 5, true).expect("room");
+        assert!(braille.ends_with('…'), "{braille:?}");
+        assert!(ascii.ends_with("..."), "{ascii:?}");
+        assert!(
+            !ascii.contains('…'),
+            "no braille-era glyph under fallback: {ascii:?}"
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_only_line_rides_the_separator_space() {
+        // Accepted residual: a lone combining mark is legitimate zero-width text,
+        // not `is_invisible`, so it earns a marker and a preview — one that
+        // attaches to the leading separator space (a space-with-accent, width 1,
+        // no layout shift).
+        let line = notes_preview_line("\u{301}").expect("a combining mark is visible");
+        let seg =
+            notes_preview_segment(line, 80, false, false, 5, false).expect("a wide row has room");
+        assert_eq!(seg, " \u{301}", "the mark rides the separator space");
+    }
+
+    #[test]
+    fn a_notes_preview_never_exceeds_its_budget() {
+        // The segment's own arithmetic, re-derived independently — as the Subtask
+        // meter's budget test does, and for the same reason: a shared helper would
+        // cancel a bug on both sides of the inequality.
+        // `spent` sweeps the title/marker/meter combinations a real row produces:
+        // a bare title, one and both markers, and a text or bar meter beside them.
+        for area in 0u16..=60 {
+            for due_gutter in [false, true] {
+                for is_subtask in [false, true] {
+                    for spent in [6usize, 8, 10, 16, 20] {
+                        for ascii in [false, true] {
+                            let Some(seg) = notes_preview_segment(
+                                "a fairly long preview line of prose",
+                                area,
+                                due_gutter,
+                                is_subtask,
+                                spent,
+                                ascii,
+                            ) else {
+                                continue;
+                            };
+                            let gutter = if due_gutter { DUE_WIDTH + 2 } else { 0 };
+                            let indent = if is_subtask {
+                                SUBTASK_INDENT.width()
+                            } else {
+                                0
+                            };
+                            let usable = (area.saturating_sub(PANEL_BORDERS) as usize)
+                                .saturating_sub(LIST_CURSOR.width())
+                                .saturating_sub(gutter)
+                                .saturating_sub(indent);
+                            assert!(
+                                spent + seg.width() <= usable,
+                                "area {area}, due {due_gutter}, sub {is_subtask}, spent {spent}: {seg:?}"
+                            );
+                        }
                     }
                 }
             }

@@ -34,6 +34,27 @@ fn rows(model: &Model) -> Vec<String> {
     rows_at(model, 80)
 }
 
+/// The link picker popup's own rows: its `Links` title down through its rounded
+/// bottom border. Both panes draw `│` and `╰` of their own, so a row cannot be
+/// told from a pane row by counting borders — the popup's title and its
+/// bottom-right `╯` (`BorderType::Rounded`) are what bound it. Anchoring here keeps
+/// a picker assertion from being met instead by the notes preview now drawn on the
+/// pane behind the popup.
+fn picker_lines(drawn: &[String]) -> Vec<String> {
+    let start = drawn
+        .iter()
+        .position(|r| r.contains("Links"))
+        .expect("the picker's Links title");
+    let mut out = Vec::new();
+    for row in &drawn[start..] {
+        out.push(row.clone());
+        if row.contains('╯') {
+            break;
+        }
+    }
+    out
+}
+
 fn task(id: &str, title: &str, notes: Option<&str>) -> Task {
     task_with_links(id, title, notes, Vec::new())
 }
@@ -139,15 +160,21 @@ fn the_picker_draws_a_links_entry_as_description_then_url() {
     )]);
     ui_update(&mut model, Message::Key(press('u')));
 
-    let drawn = rows(&model).join("\n");
+    let drawn = rows(&model);
+    let frame = drawn.join("\n");
+    let picker = picker_lines(&drawn).join("\n");
 
+    // Frame-wide: the pane preview shows the notes URL, never the `links[]`
+    // description, so only the picker can carry this row.
     assert!(
-        drawn.contains("from Gmail — https://a.dev/1"),
-        "expected the described links[] row:\n{drawn}"
+        frame.contains("from Gmail — https://a.dev/1"),
+        "expected the described links[] row:\n{frame}"
     );
+    // Scoped: the notes `also https://b.dev/2` now draw whole on the pane behind
+    // the popup, so this must prove the picker drew the URL, not the preview.
     assert!(
-        drawn.contains("https://b.dev/2"),
-        "expected the bare notes URL row:\n{drawn}"
+        picker.contains("https://b.dev/2"),
+        "expected the bare notes URL row in the picker:\n{frame}"
     );
 }
 
@@ -197,19 +224,25 @@ fn the_picker_draws_its_urls() {
     )]);
     ui_update(&mut model, Message::Key(press('u')));
 
-    let drawn = rows(&model).join("\n");
+    let drawn = rows(&model);
+    let picker = picker_lines(&drawn).join("\n");
 
     assert!(
-        drawn.contains("Links"),
-        "expected the picker panel:\n{drawn}"
+        picker.contains("Links"),
+        "expected the picker panel:\n{}",
+        drawn.join("\n")
+    );
+    // Scoped to the picker: this Task's 35-cell notes fit the pane preview whole,
+    // so an unscoped search would pass without the picker drawing anything.
+    assert!(
+        picker.contains("https://a.dev/1"),
+        "first URL missing from the picker:\n{}",
+        drawn.join("\n")
     );
     assert!(
-        drawn.contains("https://a.dev/1"),
-        "first URL missing:\n{drawn}"
-    );
-    assert!(
-        drawn.contains("https://b.dev/2"),
-        "second URL missing:\n{drawn}"
+        picker.contains("https://b.dev/2"),
+        "second URL missing from the picker:\n{}",
+        drawn.join("\n")
     );
 }
 
@@ -243,11 +276,12 @@ fn an_over_long_url_is_truncated_rather_than_overflowing_the_popup() {
 
     let drawn = rows(&model);
     assert!(
-        drawn.iter().any(|r| r.contains('…')),
-        "expected an ellipsis on the truncated row:\n{}",
+        picker_lines(&drawn).iter().any(|r| r.contains('…')),
+        "expected an ellipsis on the truncated picker row:\n{}",
         drawn.join("\n")
     );
-    // The popup is 50 wide; nothing may spill past it into the pane behind.
+    // Frame-wide, and a stronger claim than the ellipsis: nothing may spill the
+    // whole URL anywhere — the pane preview truncates it too.
     assert!(!drawn.join("\n").contains(&long));
 }
 
@@ -265,14 +299,18 @@ fn a_double_width_url_is_truncated_by_cells_not_characters() {
     ui_update(&mut model, Message::Key(press('u')));
 
     let drawn = rows(&model);
-    let truncated = drawn
+    // Both rows are scoped to the picker: the wide URL's preview now draws on the
+    // pane too, so an unscoped `find` would compare a pane row's borders against a
+    // popup row's — different layouts, and the assertion below would be meaningless.
+    let picker = picker_lines(&drawn);
+    let truncated = picker
         .iter()
         .find(|r| r.contains('…'))
-        .unwrap_or_else(|| panic!("expected a truncated row:\n{}", drawn.join("\n")));
-    let plain = drawn
+        .unwrap_or_else(|| panic!("expected a truncated picker row:\n{}", drawn.join("\n")));
+    let plain = picker
         .iter()
         .find(|r| r.contains("https://b.dev/2"))
-        .expect("the short URL renders untruncated");
+        .expect("the short URL renders untruncated in the picker");
 
     // Border *columns*, not byte offsets — the truncated row is full of
     // multibyte characters. Identical layouts on both picker rows is precisely

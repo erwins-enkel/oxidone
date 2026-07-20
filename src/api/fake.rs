@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{ApiError, NewTask, TaskPatch, TasksApi};
-use crate::domain::{List, ListId, Status, Task, TaskId};
+use crate::domain::{List, ListId, Status, Task, TaskId, TaskLink};
 
 /// Fixed epoch for the deterministic clock (2023-11-14T22:13:20Z). Each mutation
 /// advances one second, so timestamps strictly increase in creation order.
@@ -109,6 +109,17 @@ impl FakeTasksApi {
     /// Make the *next* trait call fail with `err` (one-shot).
     pub fn fail_next(&self, err: ApiError) {
         self.state.lock().unwrap().next_error = Some(err);
+    }
+
+    /// Seed a Task's output-only `links[]` (#55). There is no write path for
+    /// links in the real API, so this is the only way for a test to give a stored
+    /// Task the links Google would have attached at creation — `list_tasks` then
+    /// returns them like any other mirrored field. A no-op if `id` is unknown.
+    pub fn set_links(&self, id: &TaskId, links: Vec<TaskLink>) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.tasks.iter_mut().find(|e| &e.task.id == id) {
+            entry.task.links = links;
+        }
     }
 }
 
@@ -209,6 +220,9 @@ impl TasksApi for FakeTasksApi {
             status: Status::NeedsAction,
             due: task.due,
             completed_at: None,
+            // `links[]` is output-only, so a newly inserted Task never has one
+            // (there is no way to write it). Tests seed it via `set_links`.
+            links: Vec::new(),
             position,
             etag: format!("etag-{seq}"),
             updated: ts,

@@ -30,6 +30,7 @@ fn task(id: &str, status: Status, parent: Option<&str>) -> Task {
         status,
         due: None,
         completed_at: (status == Status::Completed).then(|| ts(10)),
+        links: Vec::new(),
         position: format!("{id:0>20}"),
         etag: "etag".to_string(),
         updated: ts(0),

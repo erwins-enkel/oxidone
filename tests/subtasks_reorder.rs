@@ -45,6 +45,7 @@ fn task(id: &str, parent: Option<&str>) -> Task {
         status: Status::NeedsAction,
         due: None,
         completed_at: None,
+        links: Vec::new(),
         position: format!("{id:0>20}"),
         etag: "e".to_string(),
         updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),

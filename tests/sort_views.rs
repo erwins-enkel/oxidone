@@ -194,6 +194,7 @@ fn task(id: &str, parent: Option<&str>, due: Option<NaiveDate>, status: Status) 
         status,
         due,
         completed_at: None,
+        links: Vec::new(),
         position: String::new(),
         etag: String::new(),
         updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),

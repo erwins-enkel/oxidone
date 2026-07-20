@@ -26,10 +26,37 @@ pub struct Task {
     /// Date only — the API discards any time component (see CONTEXT.md).
     pub due: Option<NaiveDate>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Google's output-only `links[]`: URLs a Task acquired from the surface it
+    /// was created on (Gmail, Chat, Keep, Docs). A pure mirror (ADR-0003), never
+    /// written back — `NewTask`/`TaskPatch` carry no links. Empty for the common
+    /// case of a Task created in oxidone or a plain Google client.
+    pub links: Vec<TaskLink>,
     /// Opaque Manual-order key; changed only via a Move.
     pub position: String,
     pub etag: String,
     pub updated: DateTime<Utc>,
+}
+
+/// One entry of Google's output-only `links[]` on a Task — the faithful mirror
+/// of `{type, description, link}` (ADR-0003).
+///
+/// `kind` is Google's `type` and stays a `String`: the API documents an open set
+/// (`email`, `generic`, `chat_message`, `keep_note`, …) and a value oxidone has
+/// never seen must not break parsing. It is mirrored and persisted but not
+/// surfaced — the picker shows the description, not the type, matching Google's
+/// own clients.
+///
+/// `Serialize`/`Deserialize` are for the cache's JSON `links` column (this is
+/// oxidone's own on-disk shape, not Google's wire format — the wire mapping lives
+/// in `api::rest`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskLink {
+    /// The link target, stored verbatim. May be non-openable (a `mailto:` or a
+    /// deep link): the http/https allowlist in `crate::links` decides that at
+    /// open time, not here — the mirror keeps what Google sent.
+    pub url: String,
+    pub description: Option<String>,
+    pub kind: Option<String>,
 }
 
 impl Task {
@@ -328,6 +355,7 @@ mod tests {
             status: Status::NeedsAction,
             due: None,
             completed_at: None,
+            links: Vec::new(),
             position: "0".into(),
             etag: String::new(),
             updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),

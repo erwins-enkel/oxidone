@@ -5,6 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Focus, Message, Model, Overlay};
+use oxidone::domain::TaskLink;
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -16,24 +17,40 @@ fn ch(c: char) -> Message {
 
 /// A single Task carrying `notes`, with the task pane focused.
 async fn model_with_notes(notes: &str) -> Model {
+    model_with(notes, Vec::new()).await
+}
+
+/// A single Task carrying `notes` and Google's output-only `links[]` (seeded via
+/// the fake, since there is no write path), with the task pane focused.
+async fn model_with(notes: &str, links: Vec<TaskLink>) -> Model {
     let api = FakeTasksApi::new();
     let l = api.insert_list("L").await.unwrap();
-    api.insert_task(
-        &l.id,
-        NewTask {
-            title: "alpha".to_string(),
-            notes: (!notes.is_empty()).then(|| notes.to_string()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let t = api
+        .insert_task(
+            &l.id,
+            NewTask {
+                title: "alpha".to_string(),
+                notes: (!notes.is_empty()).then(|| notes.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    api.set_links(&t.id, links);
     let tasks = api.list_tasks(&l.id, true, false, None).await.unwrap();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab)); // focus task pane
     m
+}
+
+fn link(url: &str, description: Option<&str>) -> TaskLink {
+    TaskLink {
+        url: url.to_string(),
+        description: description.map(str::to_string),
+        kind: Some("email".to_string()),
+    }
 }
 
 fn opened(cmds: &[Command]) -> &str {
@@ -65,7 +82,7 @@ async fn u_with_no_links_says_so() {
     let cmds = update(&mut m, ch('u'));
 
     assert!(cmds.is_empty());
-    assert_eq!(m.status_line.as_deref(), Some("no links in these notes"));
+    assert_eq!(m.status_line.as_deref(), Some("no links on this task"));
 }
 
 #[tokio::test]
@@ -117,8 +134,8 @@ async fn u_with_several_links_raises_the_picker_instead_of_guessing() {
 
     assert!(cmds.is_empty(), "nothing opens until one is chosen");
     match &m.overlay {
-        Some(Overlay::OpenLink { urls, selected }) => {
-            assert_eq!(urls.len(), 2);
+        Some(Overlay::OpenLink { links, selected }) => {
+            assert_eq!(links.len(), 2);
             assert_eq!(*selected, 0);
         }
         other => panic!("expected OpenLink overlay, got {other:?}"),
@@ -132,8 +149,8 @@ async fn the_picker_only_counts_openable_links() {
     update(&mut m, ch('u'));
 
     match &m.overlay {
-        Some(Overlay::OpenLink { urls, .. }) => {
-            let shown: Vec<&str> = urls.iter().map(|u| u.as_str()).collect();
+        Some(Overlay::OpenLink { links, .. }) => {
+            let shown: Vec<&str> = links.iter().map(|l| l.url().as_str()).collect();
             assert_eq!(shown, vec!["https://a.dev/1", "https://b.dev/2"]);
         }
         other => panic!("expected OpenLink overlay, got {other:?}"),
@@ -224,4 +241,80 @@ async fn a_failed_open_is_reported_rather_than_swallowed() {
         m.status_line.as_deref(),
         Some("could not open link: no browser configured"),
     );
+}
+
+// ---- Google's output-only `links[]`, merged with notes URLs (#55) ----
+
+#[tokio::test]
+async fn u_opens_a_links_entry_on_a_task_with_no_notes() {
+    // The whole point of #55: a Gmail-created Task carries an openable URL in
+    // `links[]` and none in its (empty) notes.
+    let mut m = model_with("", vec![link("https://mail.example/msg", Some("Re: hi"))]).await;
+
+    let cmds = update(&mut m, ch('u'));
+
+    assert_eq!(opened(&cmds), "https://mail.example/msg");
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("opening https://mail.example/msg")
+    );
+    assert!(m.overlay.is_none(), "one link needs no picker");
+}
+
+#[tokio::test]
+async fn a_links_entry_and_the_same_url_in_notes_open_as_one() {
+    // Exact-string dedup across the two sources: it is one link, so `u` opens it
+    // directly rather than raising a two-row picker of the same URL twice.
+    let mut m = model_with(
+        "see https://a.dev/1",
+        vec![link("https://a.dev/1", Some("the ticket"))],
+    )
+    .await;
+
+    let cmds = update(&mut m, ch('u'));
+
+    assert_eq!(opened(&cmds), "https://a.dev/1");
+    assert!(m.overlay.is_none(), "the duplicate must not force a picker");
+}
+
+#[tokio::test]
+async fn a_non_openable_links_entry_is_found_but_never_opens() {
+    // Plausible for a `type=email` link: a `mailto:` is mirrored and counted,
+    // but the http/https allowlist refuses it — so nothing opens, and the report
+    // distinguishes "found, refused" from "no links".
+    let mut m = model_with("", vec![link("mailto:a@b.c", Some("email the reporter"))]).await;
+
+    let cmds = update(&mut m, ch('u'));
+
+    assert!(cmds.is_empty(), "a mailto: is not a browser link");
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("1 link found, none openable (http/https only)"),
+    );
+}
+
+#[tokio::test]
+async fn the_picker_shows_links_before_notes_urls_with_their_descriptions() {
+    let mut m = model_with(
+        "also https://b.dev/2",
+        vec![link("https://a.dev/1", Some("from Gmail"))],
+    )
+    .await;
+
+    update(&mut m, ch('u'));
+
+    match &m.overlay {
+        Some(Overlay::OpenLink { links, .. }) => {
+            // `links[]` first (it carries the description), then the notes URL.
+            let shown: Vec<String> = links.iter().map(|l| l.display()).collect();
+            assert_eq!(
+                shown,
+                vec![
+                    "from Gmail — https://a.dev/1".to_string(),
+                    "https://b.dev/2".to_string(),
+                ],
+            );
+        }
+        other => panic!("expected OpenLink overlay, got {other:?}"),
+    }
 }

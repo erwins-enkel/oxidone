@@ -4,7 +4,7 @@
 //! `legend_render.rs`.
 
 use oxidone::app::{Focus, Message, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Status, Task, TaskId, TaskLink};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -35,6 +35,10 @@ fn rows(model: &Model) -> Vec<String> {
 }
 
 fn task(id: &str, title: &str, notes: Option<&str>) -> Task {
+    task_with_links(id, title, notes, Vec::new())
+}
+
+fn task_with_links(id: &str, title: &str, notes: Option<&str>, links: Vec<TaskLink>) -> Task {
     Task {
         id: TaskId(id.into()),
         list: ListId("l".into()),
@@ -44,9 +48,18 @@ fn task(id: &str, title: &str, notes: Option<&str>) -> Task {
         status: Status::NeedsAction,
         due: None,
         completed_at: None,
+        links,
         position: id.into(),
         etag: String::new(),
         updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+    }
+}
+
+fn link(url: &str, description: Option<&str>) -> TaskLink {
+    TaskLink {
+        url: url.into(),
+        description: description.map(str::to_string),
+        kind: Some("email".into()),
     }
 }
 
@@ -78,6 +91,63 @@ fn a_task_with_an_openable_url_in_its_notes_is_marked() {
     assert!(
         drawn.contains("alpha ⧉"),
         "expected the marker after the title, got:\n{drawn}"
+    );
+}
+
+#[test]
+fn a_task_with_an_openable_links_entry_but_no_notes_is_marked() {
+    // #55: a Gmail-created Task has its URL in `links[]`, not its notes.
+    let model = model_with(vec![task_with_links(
+        "1",
+        "alpha",
+        None,
+        vec![link("https://mail.example/msg", Some("Re: hi"))],
+    )]);
+
+    let drawn = rows(&model).join("\n");
+
+    assert!(
+        drawn.contains("alpha ⧉"),
+        "expected the marker after the title, got:\n{drawn}"
+    );
+}
+
+#[test]
+fn a_task_with_only_a_non_openable_links_entry_is_not_marked() {
+    // A `mailto:` in `links[]` is refused by the http/https allowlist, so the
+    // marker must not promise `u` will open it.
+    let model = model_with(vec![task_with_links(
+        "1",
+        "alpha",
+        None,
+        vec![link("mailto:a@b.c", Some("email"))],
+    )]);
+
+    let drawn = rows(&model).join("\n");
+
+    assert!(drawn.contains("alpha"), "the task itself should render");
+    assert!(!drawn.contains('⧉'), "expected no marker, got:\n{drawn}");
+}
+
+#[test]
+fn the_picker_draws_a_links_entry_as_description_then_url() {
+    let mut model = model_with(vec![task_with_links(
+        "1",
+        "alpha",
+        Some("also https://b.dev/2"),
+        vec![link("https://a.dev/1", Some("from Gmail"))],
+    )]);
+    ui_update(&mut model, Message::Key(press('u')));
+
+    let drawn = rows(&model).join("\n");
+
+    assert!(
+        drawn.contains("from Gmail — https://a.dev/1"),
+        "expected the described links[] row:\n{drawn}"
+    );
+    assert!(
+        drawn.contains("https://b.dev/2"),
+        "expected the bare notes URL row:\n{drawn}"
     );
 }
 

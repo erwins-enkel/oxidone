@@ -13,6 +13,8 @@
 //!
 //! No I/O and no terminal: every entry point is a pure function over `&str`.
 
+use crate::domain::TaskLink;
+
 /// A URL that oxidone is willing to open.
 ///
 /// The field is private and [`OpenableUrl::parse`] is the only constructor, so
@@ -103,6 +105,92 @@ pub fn openable_urls(notes: &str) -> Vec<OpenableUrl> {
 /// URL just to test emptiness.
 pub fn has_openable_url(notes: &str) -> bool {
     url_tokens(notes).any(is_openable)
+}
+
+/// A link oxidone will open, merged from a Task's `links[]` and its notes URLs.
+///
+/// Carries an [`OpenableUrl`], not a raw string: possessing a `Link` is proof
+/// the URL passed the http/https allowlist, so the picker can hand it straight to
+/// the [`OpenableUrl`]-typed open path with no re-check. The description is shown
+/// in the picker; a notes-derived link has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    url: OpenableUrl,
+    description: Option<String>,
+}
+
+impl Link {
+    pub fn url(&self) -> &OpenableUrl {
+        &self.url
+    }
+
+    /// The picker row: `description — url` when the link carries one, else the
+    /// bare URL. Notes-derived links render bare, so the two sources read alike
+    /// on screen except where `links[]` adds the human label Google supplied.
+    pub fn display(&self) -> String {
+        match &self.description {
+            Some(d) => format!("{d} — {}", self.url.as_str()),
+            None => self.url.as_str().to_string(),
+        }
+    }
+}
+
+/// The result of merging a Task's `links[]` with its notes URLs: the openable
+/// rows the picker shows, plus `found` — the count of *distinct* URLs discovered
+/// (openable or not), which the "none openable" report needs so it can tell
+/// "nothing here" from "nothing a browser should touch".
+pub struct MergedLinks {
+    pub openable: Vec<Link>,
+    pub found: usize,
+}
+
+/// Merge a Task's `links[]` with the URLs scanned from its `notes`.
+///
+/// `links[]` come first (they carry Google's descriptions), then notes URLs. The
+/// union is deduped by **exact URL string, before** the openable filter — the
+/// same exact-match rule [`scan_urls`] uses within notes, extended across the two
+/// sources — so a Gmail link and the identical URL pasted into notes collapse to
+/// one row and count once. `found` is the size of that deduped union; `openable`
+/// its http/https subset, in the same order.
+pub fn openable_links(task_links: &[TaskLink], notes: &str) -> MergedLinks {
+    let from_links = task_links
+        .iter()
+        .map(|l| (l.url.as_str(), l.description.as_deref()));
+    let from_notes = scan_urls(notes).into_iter().map(|url| (url, None));
+
+    let mut seen: Vec<&str> = Vec::new();
+    let mut openable = Vec::new();
+    for (url, description) in from_links.chain(from_notes) {
+        if seen.contains(&url) {
+            continue;
+        }
+        seen.push(url);
+        if let Some(url) = OpenableUrl::parse(url) {
+            openable.push(Link {
+                url,
+                // A blank description is no description: it would render as a
+                // dangling `" — url"` in the picker.
+                description: description
+                    .map(str::to_string)
+                    .filter(|d| !d.trim().is_empty()),
+            });
+        }
+    }
+
+    MergedLinks {
+        found: seen.len(),
+        openable,
+    }
+}
+
+/// Whether a Task has at least one openable URL, across `links[]` and notes.
+///
+/// The `links[]`-aware companion to [`has_openable_url`]: same allocation-free,
+/// short-circuiting contract, because the `⧉` row marker asks it for every
+/// visible row on every frame. Tests `links[]` through [`is_openable`] directly —
+/// no [`OpenableUrl`] built, no `Vec` collected.
+pub fn has_openable_link(task_links: &[TaskLink], notes: &str) -> bool {
+    task_links.iter().any(|l| is_openable(&l.url)) || has_openable_url(notes)
 }
 
 /// Iterate the `scheme://` tokens of `notes` lazily, so callers that only need

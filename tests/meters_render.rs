@@ -73,6 +73,7 @@ fn task(id: &str, title: &str, status: Status, parent: Option<&str>, notes: Opti
         status,
         due: None,
         completed_at: (status == Status::Completed).then(|| Utc.timestamp_opt(1, 0).unwrap()),
+        links: Vec::new(),
         position: format!("{id:0>20}"),
         etag: String::new(),
         updated: Utc.timestamp_opt(0, 0).unwrap(),

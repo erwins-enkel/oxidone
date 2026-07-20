@@ -124,7 +124,14 @@ async fn list_tasks_sends_show_flags_and_updated_min() {
                     "id": "T1", "title": "buy milk", "etag": "e1",
                     "updated": "2023-11-14T22:13:20.000Z",
                     "status": "needsAction", "position": "00000000000000000000",
-                    "due": "2023-12-25T00:00:00.000Z", "notes": "2%"
+                    "due": "2023-12-25T00:00:00.000Z", "notes": "2%",
+                    "links": [
+                        {
+                            "type": "email",
+                            "description": "Re: milk run",
+                            "link": "https://mail.google.com/mail/u/0/#inbox/abc"
+                        }
+                    ]
                 },
                 {
                     "id": "T2", "title": "done thing", "etag": "e2",
@@ -151,11 +158,20 @@ async fn list_tasks_sends_show_flags_and_updated_min() {
     assert_eq!(t1.due, Some(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap()));
     assert_eq!(t1.notes.as_deref(), Some("2%"));
     assert!(t1.parent.is_none());
+    // The output-only `links[]` mirror: `type` maps to `kind`, kept as a String.
+    assert_eq!(t1.links.len(), 1);
+    let l = &t1.links[0];
+    assert_eq!(l.url, "https://mail.google.com/mail/u/0/#inbox/abc");
+    assert_eq!(l.description.as_deref(), Some("Re: milk run"));
+    assert_eq!(l.kind.as_deref(), Some("email"));
 
     let t2 = &tasks[1];
     assert_eq!(t2.status, Status::Completed);
     assert_eq!(t2.parent, Some(TaskId("T1".into())));
     assert!(t2.completed_at.is_some());
+    // No `links` key in the JSON: `#[serde(default)]` yields an empty vec, not a
+    // parse failure for the whole page.
+    assert!(t2.links.is_empty());
 }
 
 #[tokio::test]

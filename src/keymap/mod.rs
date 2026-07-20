@@ -35,9 +35,12 @@ pub enum Action {
     // Manual Refresh: re-pull the List set (and, via the cascade, the active
     // List's Tasks) from Google. Modeless — it is not gated on a pane.
     Refresh,
-    // Subtasks & reorder — all Move operations (task pane; a Move from a Sort
-    // view switches back to Manual first).
+    // Add a Subtask under the selected Task. An insert, not a Move: it sets
+    // `parent` at creation, so it is not gated on the lens.
     AddSubtask,
+    // The Move operations (task pane). Each writes Manual order or `parent` and
+    // computes against stored order, so one pressed from a Sort view switches
+    // the pane back to Manual first; the next press performs it.
     Indent,
     Outdent,
     MoveDown,

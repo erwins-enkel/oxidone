@@ -345,13 +345,6 @@ fn display_neighbour(model: &Model, task: &TaskId, keep: impl Fn(&Task) -> bool)
         .map(|t| t.id.clone())
 }
 
-/// Stored index of the first Task in display order, or `None` when there are no
-/// Tasks. The cursor's home when there is no selection to preserve.
-fn first_displayed_index(model: &Model) -> Option<usize> {
-    let first = model.sorted_tasks().first().map(|t| t.id.clone())?;
-    model.tasks.iter().position(|t| t.id == first)
-}
-
 /// Sort key for a due date under `Due`: dated ascending, undated last. The
 /// leading flag does the sinking — `Option`'s own ordering would put `None`
 /// first — and every undated value compares equal, so a stable sort leaves the
@@ -807,13 +800,12 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
         .and_then(|i| model.tasks.get(i))
         .map(|t| t.id.clone());
     model.tasks = tasks;
-    // Keep the cursor on the same Task; if it is gone, fall back to the first
-    // *displayed* row rather than stored index 0, which is an arbitrary row in
-    // every lens but Manual.
-    model.selected_task = previously_selected
-        .and_then(|id| model.tasks.iter().position(|t| t.id == id))
-        .or_else(|| first_displayed_index(model));
-    // Don't leave the cursor on a Task hidden by the completed filter.
+    // Keep the cursor on the same Task. If it is gone, leave the selection empty
+    // and let `reselect_visible` anchor it: with nothing to preserve it takes the
+    // first *visible* row in display order, never stored index 0 — an arbitrary
+    // row in every lens but Manual.
+    model.selected_task =
+        previously_selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
     reselect_visible(model);
 }
 

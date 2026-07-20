@@ -112,11 +112,23 @@ async fn run(
     }
 
     loop {
+        // Stamp before drawing: the view reads `now` to render due dates
+        // relative (`ui::render_task_pane`) and to bucket the due-load strip
+        // (`ui::due_load_counts`), so the first frame — seeded from cache,
+        // before any event has arrived — must not read the placeholder epoch.
+        // Every repaint re-stamps, so a long-lived session that crosses midnight
+        // corrects itself on its next redraw. Note it only redraws on an event:
+        // an idle session shows a stale "today" until something wakes it, which
+        // would need a periodic tick to fix and is beyond this change.
+        model.now = chrono::Local::now();
         terminal.draw(|frame| ui::view(&model, theme, ascii, frame))?;
         match rx.recv().await {
             Some(msg) => {
-                // Stamp the clock at the impure edge so the reducer stays pure
-                // yet can resolve relative due dates (ADR-0005).
+                // Re-stamp at the impure edge so the reducer stays pure yet can
+                // resolve relative due dates (ADR-0005). Distinct from the draw
+                // stamp above: `recv` blocks for an unbounded time, so the
+                // reducer must not resolve "tomorrow" against the clock as it
+                // read when the frame was painted.
                 model.now = chrono::Local::now();
                 dispatch(update(&mut model, msg), &api, &cache, &tx);
                 if model.should_quit {

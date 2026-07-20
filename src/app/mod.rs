@@ -135,7 +135,10 @@ impl Default for Model {
             pending_list_writes: HashMap::new(),
             pending_list_deletes: HashMap::new(),
             next_temp: 0,
-            // A fixed placeholder; the runtime overwrites it before each event.
+            // A fixed placeholder, deliberately not the real clock: `Default`
+            // stays pure so tests construct a deterministic Model and set `now`
+            // themselves. The runtime overwrites it before each draw and each
+            // event, so the epoch is never what the view or reducer sees.
             now: chrono::DateTime::from_timestamp(0, 0)
                 .expect("epoch is valid")
                 .with_timezone(&chrono::Local),

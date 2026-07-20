@@ -1,12 +1,14 @@
-//! Pure due-date parser. Accepts natural language (`today`, `tomorrow`, `mon`,
-//! `+3d`) via `interim` and ISO `YYYY-MM-DD`, resolves everything in the caller's
-//! reference timezone, and strips any time component down to a `chrono::NaiveDate`
-//! (CONTEXT.md: a due date is a date, never a time).
+//! Pure due-date parsing and display. Parsing accepts natural language (`today`,
+//! `tomorrow`, `mon`, `+3d`) via `interim` and ISO `YYYY-MM-DD`, resolves
+//! everything in the caller's reference timezone, and strips any time component
+//! down to a `chrono::NaiveDate` (CONTEXT.md: a due date is a date, never a
+//! time). Display is the inverse: a date rendered relative to a reference day.
 //!
-//! No I/O and no clock of its own: the timezone-aware entry point takes an
-//! explicit `now`, so relative expressions and local-boundary behaviour are
-//! resolved by the caller (the runtime stamps the clock at the impure edge) and
-//! are deterministically testable without touching the machine clock.
+//! No I/O and no clock of its own: both entry points take an explicit reference
+//! (`now` / `today`), so relative expressions, local-boundary behaviour and
+//! relative rendering are resolved by the caller (the runtime stamps the clock at
+//! the impure edge) and are deterministically testable without touching the
+//! machine clock.
 
 use chrono::{DateTime, NaiveDate, TimeZone};
 use interim::{parse_date_string, Dialect};
@@ -47,6 +49,32 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
     parse_date_string(relative, now, Dialect::Uk)
         .map(|dt| dt.date_naive())
         .map_err(|_| DueParseError(input.to_string()))
+}
+
+/// How far either side of `today` a due date still reads as a day count. Beyond
+/// this an offset stops being legible ("in 43d" says less than a date), so the
+/// absolute ISO date takes over.
+const RELATIVE_HORIZON_DAYS: i64 = 7;
+
+/// The widest string `format_due_relative` can return, in cells: the
+/// `YYYY-MM-DD` fallback. Every relative form is shorter. Exported because the
+/// task pane sizes its due column to it — this is the formatter's contract with
+/// any caller laying dates out in a fixed width, and
+/// `no_rendering_is_wider_than_the_iso_fallback` holds it to it.
+pub const MAX_RENDERED_WIDTH: usize = 10;
+
+/// Render `due` relative to `today`: `today`, `tomorrow`, `yesterday`, `in 3d`,
+/// `3d ago` — falling back to ISO `YYYY-MM-DD` past `RELATIVE_HORIZON_DAYS` in
+/// either direction. Pure, with `today` injected, so the view stays clock-free.
+pub fn format_due_relative(due: NaiveDate, today: NaiveDate) -> String {
+    match (due - today).num_days() {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        -1 => "yesterday".to_string(),
+        d if (2..=RELATIVE_HORIZON_DAYS).contains(&d) => format!("in {d}d"),
+        d if (-RELATIVE_HORIZON_DAYS..=-2).contains(&d) => format!("{}d ago", -d),
+        _ => due.format("%Y-%m-%d").to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +142,60 @@ mod tests {
         assert_eq!(
             parse_due_relative_to("2026-08-01 18:30", now()),
             Ok(ymd(2026, 8, 1))
+        );
+    }
+
+    #[test]
+    fn formats_near_dates_as_day_offsets() {
+        let today = ymd(2026, 7, 20);
+        let cases = [
+            (ymd(2026, 7, 20), "today"),
+            (ymd(2026, 7, 21), "tomorrow"),
+            (ymd(2026, 7, 19), "yesterday"),
+            (ymd(2026, 7, 22), "in 2d"),
+            (ymd(2026, 7, 18), "2d ago"),
+            // The horizon itself is still relative, on both sides.
+            (ymd(2026, 7, 27), "in 7d"),
+            (ymd(2026, 7, 13), "7d ago"),
+        ];
+        for (due, expected) in cases {
+            assert_eq!(format_due_relative(due, today), expected, "due {due}");
+        }
+    }
+
+    #[test]
+    fn formats_far_dates_as_absolute_iso() {
+        let today = ymd(2026, 7, 20);
+        // One day past the horizon, each way, and far out.
+        assert_eq!(format_due_relative(ymd(2026, 7, 28), today), "2026-07-28");
+        assert_eq!(format_due_relative(ymd(2026, 7, 12), today), "2026-07-12");
+        assert_eq!(format_due_relative(ymd(2027, 1, 15), today), "2027-01-15");
+    }
+
+    /// The task pane lays due dates out in a fixed-width column sized to
+    /// `MAX_RENDERED_WIDTH`, so nothing may render wider than that — a longer
+    /// string would push the titles out of alignment. Asserted against the
+    /// constant itself, so widening the column can't silently outrun the test.
+    #[test]
+    fn no_rendering_is_wider_than_the_iso_fallback() {
+        let today = ymd(2026, 7, 20);
+        for offset in -400..=400 {
+            let due = today + chrono::Duration::days(offset);
+            let rendered = format_due_relative(due, today);
+            assert!(
+                rendered.chars().count() <= MAX_RENDERED_WIDTH,
+                "{rendered:?} (offset {offset}) exceeds the \
+                 {MAX_RENDERED_WIDTH}-cell due column"
+            );
+        }
+    }
+
+    #[test]
+    fn formats_across_a_month_boundary_by_elapsed_days_not_calendar_fields() {
+        // 31 Jul → 2 Aug is two days, though the month and day-of-month both jump.
+        assert_eq!(
+            format_due_relative(ymd(2026, 8, 2), ymd(2026, 7, 31)),
+            "in 2d"
         );
     }
 

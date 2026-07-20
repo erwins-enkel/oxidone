@@ -110,7 +110,13 @@ A local, append-only record of completion events (`task_id`, `list_id`, `title`,
 
 **Signifier**:
 The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task.
-_Avoid_: bullet, icon, marker (that is the link `⧉`).
+_Avoid_: bullet, icon, marker (a marker *trails* the title — the link `⧉` or the **Notes marker** `≡`).
+
+**Notes marker**:
+The `≡` a row carries when its Task's **notes** hold anything visible. Trails the title, after the link `⧉` and before the Subtask meter, and degrades to `=` under `ascii_fallback`. A body of only whitespace or invisible formatting draws nothing — the marker promises text `n` will show.
+
+Not the same thing as an **Entry type** of `Note`, despite the word: that is a *signifier*, it *leads* the row, and it says what an entry **is**. `≡` says the entry **has a notes body**. The two are independent — a Note need not carry notes, and any entry type may (`— call the notary ≡`).
+_Avoid_: note marker (ambiguous with the Entry type), notes icon.
 
 **Completion meter**:
 A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown in the task-pane header, per List in the sidebar, and per parent Task for its Subtasks. Braille gives 8× horizontal resolution over a block bar.

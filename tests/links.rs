@@ -154,6 +154,27 @@ fn a_nested_url_in_a_query_string_stays_with_its_parent() {
 }
 
 #[test]
+fn a_nested_url_does_not_hide_a_glued_sibling_behind_it() {
+    // Every inner `://` is examined, not just the first: the nested one is URL
+    // structure and must not split, but the comma-glued one after it still must.
+    assert_eq!(
+        scan_urls("https://a.dev/x?u=https://b.dev,https://c.dev"),
+        vec!["https://a.dev/x?u=https://b.dev", "https://c.dev"],
+    );
+    assert_eq!(
+        scan_urls("https://a.dev/x?u=https://b.dev;https://c.dev,https://d.dev"),
+        vec![
+            "https://a.dev/x?u=https://b.dev",
+            "https://c.dev",
+            "https://d.dev"
+        ],
+    );
+    // Two nested parameters and no prose separator anywhere: still one link.
+    let both_nested = "https://a.dev/x?u=https://b.dev&v=https://c.dev";
+    assert_eq!(scan_urls(both_nested), vec![both_nested]);
+}
+
+#[test]
 fn a_schemeless_host_is_not_a_url() {
     assert!(scan_urls("see www.example.com for details").is_empty());
 }
@@ -252,6 +273,7 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
         "https://a.dev,https://b.dev",
         "https://maps.example.com/@52.5,13.4",
         "https://a.dev/x?u=https://b.dev",
+        "https://a.dev/x?u=https://b.dev,https://c.dev",
     ];
     for notes in fixtures {
         assert_eq!(

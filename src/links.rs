@@ -141,13 +141,27 @@ impl UrlTokens<'_> {
     /// `https://maps.example.com/@52.5,13.4` must stay whole, and so must a
     /// nested `https://a.dev/x?u=https://b.dev`, where the `=` before the inner
     /// scheme is URL structure rather than prose.
+    ///
+    /// *Every* inner `://` is examined, not just the first: one URL can carry a
+    /// nested one and still be glued to a sibling
+    /// (`https://a.dev/x?u=https://b.dev,https://c.dev`), so stopping at the
+    /// first non-prose separator would miss the split that does exist.
     fn next_url_start(&self, start: usize, after: usize, end: usize) -> Option<usize> {
         let bytes = self.rest.as_bytes();
-        let sep = after + self.rest[after..end].find("://")?;
-        let next = scheme_start(self.rest, sep)?;
-        let prose_separated =
-            next > start && TRAILING.contains(&char::from(*bytes.get(next.checked_sub(1)?)?));
-        prose_separated.then_some(next)
+        let mut from = after;
+        // `find` only matches a `://` lying wholly inside `from..end`, so
+        // `sep + 3 <= end` and the cursor always advances.
+        while let Some(hit) = self.rest[from..end].find("://") {
+            let sep = from + hit;
+            let split = scheme_start(self.rest, sep)
+                .filter(|&next| next > start)
+                .filter(|&next| TRAILING.contains(&char::from(bytes[next - 1])));
+            if split.is_some() {
+                return split;
+            }
+            from = sep + "://".len();
+        }
+        None
     }
 }
 

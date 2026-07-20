@@ -13,8 +13,8 @@ A Google TaskList; a named container of Tasks.
 _Avoid_: folder, group, category, tasklist.
 
 **Task**:
-A single item in a List.
-_Avoid_: todo, item, entry.
+A single item in a List, and one of the three **Entry types** — the actionable one, as against an Event or a Note. Unqualified "Task" still means the actionable type; **entry** is the umbrella term when the type does not matter.
+_Avoid_: todo, item.
 
 **Subtask**:
 A Task with a `parent`. Capped at **one nesting level** — a Subtask cannot itself have Subtasks — matching Google's own clients.

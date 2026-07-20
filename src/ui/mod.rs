@@ -314,11 +314,15 @@ fn link_marker(has_urls: bool, ascii: bool) -> Option<&'static str> {
 /// cell so titles stay aligned down the pane
 /// (`every_signifier_occupies_the_same_cell` pins that).
 ///
-/// Degrades with the braille widgets (ADR-0006) exactly as `link_marker` does —
-/// a Unicode-only signifier would be the one non-ASCII element in the pane
-/// ignoring `ascii_fallback`. This affects rendering only: `EntryType::apply`
-/// always writes the Unicode glyph, or toggling the flag would silently revert
-/// every typed entry to `Task` on the next read.
+/// Degrades with the braille widgets (ADR-0006), following `link_marker`: both
+/// are per-row *data* glyphs, and data is what `ascii_fallback` governs. Chrome
+/// does not follow it — the panel borders, the `LIST_CURSOR` arrow and the pane
+/// title's em dash stay Unicode either way — so this is consistency with the
+/// marker beside it, not a claim about every glyph on screen.
+///
+/// Rendering only: `EntryType::apply` always writes the Unicode glyph, or
+/// toggling the flag would silently revert every typed entry to `Task` on the
+/// next read.
 ///
 /// `○` and `—` are East Asian Ambiguous, so a terminal configured to render
 /// Ambiguous as double-width shifts signifier rows by a column. `ascii_fallback`
@@ -1768,11 +1772,14 @@ mod tests {
     fn every_signifier_occupies_the_same_cell() {
         // Derived, not a magic constant: whatever width `Task`'s blank is, the
         // glyphs must match it or titles stagger down the pane.
+        // Columns, not chars — the property is on-screen alignment, and it is
+        // the same measure `the_cursor_gutter_is_the_same_width_either_way`
+        // uses on the gutter this cell sits beside.
         for ascii in [false, true] {
-            let width = signifier(EntryType::Task, ascii).chars().count();
+            let width = signifier(EntryType::Task, ascii).width();
             for entry in [EntryType::Event, EntryType::Note] {
                 assert_eq!(
-                    signifier(entry, ascii).chars().count(),
+                    signifier(entry, ascii).width(),
                     width,
                     "{entry:?} ascii={ascii}"
                 );

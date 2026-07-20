@@ -24,6 +24,12 @@ pub enum Action {
     CycleSort,
     ToggleShowCompleted,
     ClearCompleted,
+    // Subtasks & reorder — all Move operations (task pane, Manual order).
+    AddSubtask,
+    Indent,
+    Outdent,
+    MoveDown,
+    MoveUp,
     // Sidebar List management. Bound to capitals so they never clash with the
     // task-pane verbs (`a`/`e`/`x`); the reducer additionally gates them on the
     // sidebar being focused.
@@ -134,6 +140,31 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('C'),
             action: Action::ClearCompleted,
             help: "clear completed",
+        },
+        Binding {
+            key: KeyCode::Char('o'),
+            action: Action::AddSubtask,
+            help: "add subtask",
+        },
+        Binding {
+            key: KeyCode::Char('>'),
+            action: Action::Indent,
+            help: "indent (make subtask)",
+        },
+        Binding {
+            key: KeyCode::Char('<'),
+            action: Action::Outdent,
+            help: "outdent (to top-level)",
+        },
+        Binding {
+            key: KeyCode::Char('J'),
+            action: Action::MoveDown,
+            help: "move task down",
+        },
+        Binding {
+            key: KeyCode::Char('K'),
+            action: Action::MoveUp,
+            help: "move task up",
         },
         Binding {
             key: KeyCode::Char('A'),

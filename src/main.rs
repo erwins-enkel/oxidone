@@ -275,13 +275,46 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
-            Command::AddTask { list, temp, title } => match api {
-                Some(api) => {
-                    spawn_add_task(api.clone(), cache.clone(), tx.clone(), list, temp, title)
-                }
+            Command::AddTask {
+                list,
+                temp,
+                title,
+                parent,
+            } => match api {
+                Some(api) => spawn_add_task(
+                    api.clone(),
+                    cache.clone(),
+                    tx.clone(),
+                    list,
+                    temp,
+                    title,
+                    parent,
+                ),
                 None => {
                     let _ = tx.send(Message::TaskAddFailed {
                         temp,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::Move {
+                list,
+                task,
+                parent,
+                previous,
+            } => match api {
+                Some(api) => spawn_move(
+                    api.clone(),
+                    cache.clone(),
+                    tx.clone(),
+                    list,
+                    task,
+                    parent,
+                    previous,
+                ),
+                None => {
+                    let _ = tx.send(Message::MoveFailed {
+                        list,
                         reason: OFFLINE.to_string(),
                     });
                 }
@@ -393,10 +426,12 @@ fn spawn_add_task(
     list: ListId,
     temp: TaskId,
     title: String,
+    parent: Option<TaskId>,
 ) {
     tokio::spawn(async move {
         let new = oxidone::api::NewTask {
             title,
+            parent,
             ..Default::default()
         };
         let message = match api.insert_task(&list, new).await {
@@ -409,6 +444,51 @@ fn spawn_add_task(
             Err(e) => Message::TaskAddFailed {
                 temp,
                 reason: format!("failed to add task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Reposition/reparent a Task on Google (indent, outdent, or reorder), then
+/// re-mirror the active view so the cache reflects the renumbered positions.
+/// Reports success (with the reconciled Tasks) or a rollback on failure.
+fn spawn_move(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+    parent: Option<TaskId>,
+    previous: Option<TaskId>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = api
+            .move_task(&list, &task, parent.as_ref(), previous.as_ref())
+            .await
+        {
+            let _ = tx.send(Message::MoveFailed {
+                list,
+                reason: format!("failed to move task: {e}"),
+            });
+            return;
+        }
+        // A Move renumbers many positions; re-fetch the active view and mirror it
+        // so the pane reconciles to Google's authoritative order.
+        let message = match sync::fetch_active_tasks(api.as_ref(), &list).await {
+            Ok(tasks) => match sync::mirror_tasks(&cache.lock().unwrap(), &list, &tasks) {
+                Ok(cached) => Message::MoveSucceeded {
+                    list,
+                    tasks: cached,
+                },
+                Err(e) => Message::MoveFailed {
+                    list,
+                    reason: format!("failed to cache move: {e}"),
+                },
+            },
+            Err(e) => Message::MoveFailed {
+                list,
+                reason: format!("failed to refresh after move: {e}"),
             },
         };
         let _ = tx.send(message);

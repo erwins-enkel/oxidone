@@ -70,6 +70,7 @@ async fn typing_and_enter_inserts_a_placeholder_at_the_top_and_requests_insert()
             list: l.id,
             temp: TaskId("temp-0".to_string()),
             title: "second".to_string(),
+            parent: None,
         }]
     );
 }
@@ -150,6 +151,7 @@ async fn temp_ids_are_unique_across_adds() {
             list: l.id,
             temp: TaskId("temp-1".to_string()),
             title: "three".to_string(),
+            parent: None,
         }]
     );
 }

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::domain::{List, ListId, Status, Task, TaskId};
+use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 
 /// Which pane currently has focus.
@@ -34,6 +34,9 @@ pub struct Model {
     pub tasks: Vec<Task>,
     /// Index into `tasks` of the cursor, if any.
     pub selected_task: Option<usize>,
+    /// Local, read-only reordering of the task pane. Never mutates `tasks`
+    /// (Manual order) and never writes `position` to Google.
+    pub sort: SortView,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -81,6 +84,7 @@ impl Default for Model {
             selected_list: None,
             tasks: Vec::new(),
             selected_task: None,
+            sort: SortView::Manual,
             focus: Focus::Sidebar,
             show_help: false,
             should_quit: false,
@@ -102,6 +106,35 @@ impl Model {
         self.selected_list
             .and_then(|i| self.lists.get(i))
             .map(|l| &l.id)
+    }
+
+    /// The Tasks in the current `sort`'s **display order**. A pure, read-only
+    /// lens: it borrows `tasks` and never mutates Manual order (`position`) nor
+    /// emits any Command — the view renders this, the model is untouched.
+    ///
+    /// - `Manual`: stored order (by `position`, i.e. the current Vec order).
+    /// - `Due`: due date ascending; Tasks with no due date sink to the bottom,
+    ///   stable within that no-due group (a deterministic tail).
+    /// - `Title`: case-insensitive by title, stable on ties.
+    ///
+    /// Known limitation: `j`/`k` still move `selected_task` in stored order, so
+    /// under `Due`/`Title` the highlight can jump between non-adjacent rows.
+    /// Making navigation follow the display order is a follow-up.
+    pub fn sorted_tasks(&self) -> Vec<&Task> {
+        let mut ordered: Vec<&Task> = self.tasks.iter().collect();
+        match self.sort {
+            SortView::Manual => {}
+            // Stable sort keeps the stored order as the tie-breaker, so the
+            // no-due tail (and same-day Tasks) stay in Manual order.
+            SortView::Due => ordered.sort_by(|a, b| match (a.due, b.due) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }),
+            SortView::Title => ordered.sort_by_cached_key(|t| t.title.to_lowercase()),
+        }
+        ordered
     }
 }
 
@@ -298,6 +331,10 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::ToggleComplete => return toggle_complete(model),
         Action::EditTitle => open_edit_title(model),
         Action::DeleteTask => open_delete_confirm(model),
+        // View-only: cycle the local lens. `tasks` (Manual order) is untouched
+        // and `selected_task` keeps indexing it, so the cursor stays on the
+        // same Task by id across the re-sort. Never emits a Command.
+        Action::CycleSort => model.sort = model.sort.next(),
     }
     Vec::new()
 }

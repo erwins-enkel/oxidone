@@ -18,6 +18,7 @@ pub enum Action {
     ToggleComplete,
     EditTitle,
     DeleteTask,
+    CycleSort,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -84,6 +85,11 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('x'),
             action: Action::DeleteTask,
             help: "delete task",
+        },
+        Binding {
+            key: KeyCode::Char('s'),
+            action: Action::CycleSort,
+            help: "cycle sort (manual/due/title)",
         },
     ];
     BINDINGS

@@ -54,7 +54,28 @@ pub enum SortView {
     Manual,
     /// By due date; Tasks with no due date sink to the bottom deterministically.
     Due,
+    /// Case-insensitive by title.
     Title,
+}
+
+impl SortView {
+    /// The next view in the triage cycle: Manual → Due → Title → Manual.
+    pub fn next(self) -> Self {
+        match self {
+            SortView::Manual => SortView::Due,
+            SortView::Due => SortView::Title,
+            SortView::Title => SortView::Manual,
+        }
+    }
+
+    /// A short lower-case label for the pane title (`None` for the home state).
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            SortView::Manual => None,
+            SortView::Due => Some("due"),
+            SortView::Title => Some("title"),
+        }
+    }
 }
 
 // Newtypes keep List and Task ids from being swapped by accident.

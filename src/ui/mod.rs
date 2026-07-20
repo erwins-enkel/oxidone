@@ -72,11 +72,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
 
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
-    let items: Vec<ListItem> = model
-        .tasks
+    // The current sort is a read-only lens over `tasks`: the display order comes
+    // from `sorted_tasks()`, while `tasks` (Manual order) stays untouched.
+    let ordered = model.sorted_tasks();
+    let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
-            // Completed Tasks read dim + struck-through until cleared (#12).
+            // Completed Tasks read dim + struck-through until cleared.
             let style = if t.status == Status::Completed {
                 Style::new()
                     .fg(theme.subtext)
@@ -87,15 +89,19 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme)
             ListItem::new(Line::styled(t.title.clone(), style))
         })
         .collect();
-    render_selectable(
-        frame,
-        area,
-        "Tasks",
-        items,
-        model.selected_task,
-        focused,
-        theme,
-    );
+
+    // `selected_task` indexes `tasks`; translate it to the cursor's position in
+    // the displayed (sorted) order so the highlight tracks the same Task by id.
+    let selected = model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
+
+    let title = match model.sort.label() {
+        Some(label) => format!("Tasks — {label}"),
+        None => "Tasks".to_string(),
+    };
+    render_selectable(frame, area, &title, items, selected, focused, theme);
 }
 
 /// A rounded, focus-aware panel wrapping a selectable list. The selection is

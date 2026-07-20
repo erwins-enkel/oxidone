@@ -95,6 +95,41 @@ impl Cache {
         Ok(())
     }
 
+    /// Patch a single List into the cache from a write response (an insert or a
+    /// rename). Uses UPSERT (not INSERT OR REPLACE) so an existing row keeps its
+    /// `rowid` — and thus its sidebar position — across a rename; a genuinely new
+    /// List lands at the end, matching where Google appends it.
+    pub fn upsert_list(&self, list: &List) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO lists (id, title, etag, updated, local_updated, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                 title = excluded.title,
+                 etag = excluded.etag,
+                 updated = excluded.updated,
+                 local_updated = excluded.local_updated,
+                 dirty = 0",
+            params![
+                list.id.0,
+                list.title,
+                list.etag,
+                list.updated.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a single List from the cache along with its Tasks (mirrors a
+    /// delete-through; a deleted List takes its Tasks with it on Google).
+    pub fn delete_list(&self, list: &ListId) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM lists WHERE id = ?1", params![list.0])?;
+        tx.execute("DELETE FROM tasks WHERE list_id = ?1", params![list.0])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All cached Lists, in their stored (insertion) order.
     pub fn lists(&self) -> Result<Vec<List>> {
         let mut stmt = self

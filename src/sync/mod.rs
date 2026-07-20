@@ -152,6 +152,43 @@ pub async fn write_due(
     Ok(updated)
 }
 
+/// Insert a List on Google and mirror it into the cache. Returns the server
+/// List (with its real id).
+pub async fn insert_list(api: &dyn TasksApi, cache: &Cache, title: &str) -> Result<List> {
+    let list = api.insert_list(title).await?;
+    cache.upsert_list(&list)?;
+    Ok(list)
+}
+
+/// Patch a List's title on Google and return the updated List (no cache write —
+/// see [`patch_completed`] for the split rationale).
+pub async fn patch_list_title(
+    api: &dyn TasksApi,
+    list: &ListId,
+    title: &str,
+) -> std::result::Result<List, ApiError> {
+    api.patch_list(list, title).await
+}
+
+/// Write-through a List rename: patch on Google, mirror into the cache.
+pub async fn write_list_title(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    title: &str,
+) -> Result<List> {
+    let updated = patch_list_title(api, list, title).await?;
+    cache.upsert_list(&updated)?;
+    Ok(updated)
+}
+
+/// Delete a List on Google and mirror the removal into the cache.
+pub async fn delete_list(api: &dyn TasksApi, cache: &Cache, list: &ListId) -> Result<()> {
+    api.delete_list(list).await?;
+    cache.delete_list(list)?;
+    Ok(())
+}
+
 /// Delete a Task on Google and mirror the removal into the cache.
 pub async fn delete_task(
     api: &dyn TasksApi,

@@ -21,6 +21,12 @@ pub enum Action {
     EditDue,
     DeleteTask,
     CycleSort,
+    // Sidebar List management. Bound to capitals so they never clash with the
+    // task-pane verbs (`a`/`e`/`x`); the reducer additionally gates them on the
+    // sidebar being focused.
+    AddList,
+    RenameList,
+    DeleteList,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -102,6 +108,21 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('s'),
             action: Action::CycleSort,
             help: "cycle sort (manual/due/title)",
+        },
+        Binding {
+            key: KeyCode::Char('A'),
+            action: Action::AddList,
+            help: "add list",
+        },
+        Binding {
+            key: KeyCode::Char('R'),
+            action: Action::RenameList,
+            help: "rename list",
+        },
+        Binding {
+            key: KeyCode::Char('X'),
+            action: Action::DeleteList,
+            help: "delete list",
         },
     ];
     BINDINGS

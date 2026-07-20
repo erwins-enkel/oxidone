@@ -3,6 +3,10 @@
 //! sidebar + task pane, a one-line status bar, and an always-visible hotkey
 //! legend below it. Both the `?` overlay and the legend are drawn straight from
 //! the keymap table — the legend as a curated, priority-ordered subset.
+//!
+//! The smallest supported terminal is 80x24; the `?` cheatsheet is required to
+//! fit there in full, which `help_layout` guarantees by sizing against the frame
+//! rather than the row count.
 
 pub mod theme;
 pub mod widgets;
@@ -398,26 +402,219 @@ fn render_legend(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
+/// Columns between adjacent cheatsheet cells. One quantity, three readers:
+/// `HelpLayout::total`, the gap span in `draw_help`, and the offset delta the
+/// render tests assert.
+const HELP_COL_GAP: usize = 1;
+
+/// A cheatsheet row: the key label(s) and the help text they trigger.
+type HelpRow = (String, &'static str);
+
+/// The widest label and help in one cheatsheet column.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ColumnWidths {
+    label: usize,
+    help: usize,
+}
+
+impl ColumnWidths {
+    /// The cell this column draws: `" {label} {help}"`.
+    fn cell(&self) -> usize {
+        1 + self.label + 1 + self.help
+    }
+}
+
+/// How the `?` cheatsheet is laid out in a given frame.
+///
+/// Sized against the frame, never against the row count — that inversion is the
+/// whole point of the type. `hidden` and `truncated` report what did not fit on
+/// each axis, so overflow is announced rather than silently clipped.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HelpLayout {
+    /// One entry per column; `cols.len()` *is* the column count.
+    cols: Vec<ColumnWidths>,
+    rows_per_col: usize,
+    /// The drawn size, already clamped to the frame.
+    width: u16,
+    height: u16,
+    /// Rows that did not fit vertically.
+    hidden: usize,
+    /// Whether the columns are wider than the frame allows.
+    truncated: bool,
+}
+
+impl HelpLayout {
+    /// The rows drawn in column `c` — the single definition of the partition.
+    ///
+    /// Bounded at both ends: never spills past `rows_per_col`, never past the
+    /// slice. `help_layout` derives `cols` through this, and `draw_help` draws
+    /// through it, so the widths and the grid cannot disagree.
+    fn column_rows<'a>(&self, c: usize, rows: &'a [HelpRow]) -> &'a [HelpRow] {
+        let start = (c * self.rows_per_col).min(rows.len());
+        let end = start.saturating_add(self.rows_per_col).min(rows.len());
+        &rows[start..end]
+    }
+
+    /// Total drawn width of the columns, gaps included, borders excluded.
+    fn total(&self) -> usize {
+        let cells: usize = self.cols.iter().map(ColumnWidths::cell).sum();
+        cells + self.cols.len().saturating_sub(1) * HELP_COL_GAP
+    }
+}
+
+/// A candidate layout for `n` columns: the partition and the widths it implies.
+///
+/// `column_rows` is `&self` and the layout does not exist yet, but it reads only
+/// `rows_per_col` — so the provisional value below is enough to derive `cols`
+/// through the same accessor the renderer uses. Slicing inline here instead
+/// would be a second definition of the partition, free to drift from the first.
+fn candidate(n: usize, rows: &[HelpRow], inner_h: usize) -> HelpLayout {
+    let mut layout = HelpLayout {
+        rows_per_col: rows.len().div_ceil(n).min(inner_h),
+        ..HelpLayout::default()
+    };
+    layout.cols = (0..n)
+        .map(|c| {
+            let slice = layout.column_rows(c, rows);
+            ColumnWidths {
+                label: slice
+                    .iter()
+                    .map(|(label, _)| label.chars().count())
+                    .max()
+                    .unwrap_or(0),
+                help: slice
+                    .iter()
+                    .map(|(_, help)| help.chars().count())
+                    .max()
+                    .unwrap_or(0),
+            }
+        })
+        .collect();
+    layout
+}
+
+/// Lay the cheatsheet out for `area`, in as many columns as the frame allows.
+///
+/// Picks the fewest columns that fit the rows vertically, then narrows until
+/// they fit horizontally. Whatever still does not fit is reported — `hidden`
+/// rows and `truncated` text — never quietly dropped.
+fn help_layout(area: Rect, rows: &[HelpRow]) -> HelpLayout {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+
+    // Nothing to draw, or nowhere to draw it. Either way the popup shrinks to
+    // its borders — clamped, so a frame too small for even those still fits —
+    // and reports whatever it could not show.
+    if inner_w == 0 || inner_h == 0 || rows.is_empty() {
+        return HelpLayout {
+            hidden: rows.len(),
+            truncated: !rows.is_empty(),
+            width: 2.min(area.width),
+            height: 2.min(area.height),
+            ..HelpLayout::default()
+        };
+    }
+
+    let cols_by_height = rows.len().div_ceil(inner_h);
+    let mut layout = (1..=cols_by_height)
+        .rev()
+        .map(|n| candidate(n, rows, inner_h))
+        .find(|c| c.total() <= inner_w)
+        .unwrap_or_else(|| candidate(1, rows, inner_h));
+
+    let shown = rows.len().min(layout.cols.len() * layout.rows_per_col);
+    layout.hidden = rows.len() - shown;
+    layout.truncated = layout.total() > inner_w;
+    // The clamp is load-bearing: when truncated, `total()` exceeds the frame by
+    // construction, and handing `centered` an oversized rect is precisely the
+    // silent clip this layout exists to remove.
+    layout.width = (layout.total() + 2).min(area.width as usize) as u16;
+    layout.height = (layout.rows_per_col + 2).min(area.height as usize) as u16;
+    layout
+}
+
+/// What the popup could not show, as a line for its bottom border.
+///
+/// Deliberately terse: at 30 columns there are 28 cells to say it in, so a
+/// fuller sentence would itself be truncated by the popup it is warning about.
+fn overflow_notice(layout: &HelpLayout) -> Option<String> {
+    match (layout.hidden, layout.truncated) {
+        (0, false) => None,
+        (0, true) => Some("clipped".to_string()),
+        (n, false) => Some(format!("+{n} more")),
+        (n, true) => Some(format!("+{n} more, clipped")),
+    }
+}
+
+/// The two spans of one cheatsheet cell: accented keys, then the help text.
+///
+/// Both are padded to the column's width — the label so the help columns line
+/// up, the help so the *next* column starts at a fixed x. Two spans rather than
+/// one formatted string because the accent is per-span; collapsing them would
+/// lose it silently.
+fn help_cell_spans(
+    row: &HelpRow,
+    widths: &ColumnWidths,
+    last_col: bool,
+    theme: &Theme,
+) -> [Span<'static>; 2] {
+    let (label, help) = row;
+    [
+        Span::styled(
+            format!(" {label:<width$} ", width = widths.label),
+            Style::new().fg(theme.accent),
+        ),
+        Span::styled(
+            if last_col {
+                // Padding the final column would only add trailing blanks.
+                (*help).to_string()
+            } else {
+                format!("{help:<width$}", width = widths.help)
+            },
+            Style::new().fg(theme.text),
+        ),
+    ]
+}
+
 fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let rows: Vec<Line> = keymap::bindings()
-        .iter()
-        .map(|b| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:<5} ", keymap::key_label(b.key)),
-                    Style::new().fg(theme.accent),
-                ),
-                Span::styled(b.help, Style::new().fg(theme.text)),
-            ])
+    draw_help(frame, area, &keymap::cheatsheet_rows(), theme);
+}
+
+/// Draw the cheatsheet popup over `area`.
+///
+/// Split out from `render_help` so tests can supply their own rows: the column
+/// partition only goes ragged when the row count is not a multiple of the column
+/// count, which the real table need not exhibit today.
+fn draw_help(frame: &mut Frame, area: Rect, rows: &[HelpRow], theme: &Theme) {
+    let layout = help_layout(area, rows);
+    let last_col = layout.cols.len().saturating_sub(1);
+
+    // Row-major over the columns, so column-major reading order comes out of a
+    // row-wise draw. `get` rather than `zip`: only the last column can be short,
+    // and a `zip` would stop at it and silently drop the final row.
+    let lines: Vec<Line> = (0..layout.rows_per_col)
+        .map(|r| {
+            let mut spans: Vec<Span> = Vec::new();
+            for (c, widths) in layout.cols.iter().enumerate() {
+                if let Some(row) = layout.column_rows(c, rows).get(r) {
+                    if !spans.is_empty() {
+                        spans.push(Span::raw(" ".repeat(HELP_COL_GAP)));
+                    }
+                    spans.extend(help_cell_spans(row, widths, c == last_col, theme));
+                }
+            }
+            Line::from(spans)
         })
         .collect();
 
-    let popup = centered(area, 44, rows.len() as u16 + 2);
+    let mut block = panel("Help", true, theme);
+    if let Some(notice) = overflow_notice(&layout) {
+        block = block.title_bottom(notice);
+    }
+
+    let popup = centered(area, layout.width, layout.height);
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(rows).block(panel("Help", true, theme)),
-        popup,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// A rounded-border panel titled `title`, its border accented when `focused`.
@@ -445,6 +642,390 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::domain::{ListId, TaskId};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// The smallest terminal oxidone supports; the cheatsheet must fit it whole.
+    ///
+    /// A test fixture rather than a `const` in the module above: nothing on the
+    /// production path reads it — `help_layout` takes whatever frame it is given
+    /// — so up there it would be dead code. The contract itself is stated in the
+    /// module doc and the README.
+    const MIN_TERM: (u16, u16) = (80, 24);
+
+    fn frame_of(size: (u16, u16)) -> Rect {
+        Rect::new(0, 0, size.0, size.1)
+    }
+
+    fn help_rows() -> Vec<HelpRow> {
+        keymap::cheatsheet_rows()
+    }
+
+    /// `n` synthetic rows, wide enough to behave like the real ones.
+    fn synthetic_rows(n: usize) -> Vec<HelpRow> {
+        (0..n)
+            .map(|i| (format!("k{i}"), "some help text"))
+            .collect()
+    }
+
+    // --- The `?` cheatsheet layout ---------------------------------------
+
+    #[test]
+    fn the_whole_cheatsheet_fits_the_smallest_supported_terminal() {
+        // The gate. When the binding table outgrows the popup, this fails
+        // rather than the surplus rows quietly vanishing off the bottom.
+        let rows = help_rows();
+        let layout = help_layout(frame_of(MIN_TERM), &rows);
+
+        assert_eq!(layout.hidden, 0, "rows dropped at {MIN_TERM:?}");
+        assert!(!layout.truncated, "help text clipped at {MIN_TERM:?}");
+    }
+
+    #[test]
+    fn a_tall_frame_collapses_to_a_single_column() {
+        let rows = help_rows();
+        let layout = help_layout(Rect::new(0, 0, 80, 40), &rows);
+
+        assert_eq!(layout.cols.len(), 1);
+        assert_eq!(layout.rows_per_col, rows.len());
+        assert_eq!(layout.hidden, 0);
+    }
+
+    #[test]
+    fn a_wide_short_frame_reaches_for_a_third_column() {
+        // The branch that separates an uncapped search from a fixed cap of two.
+        // Reachable on a real terminal, so it is exercised on the real table.
+        let rows = help_rows();
+        let layout = help_layout(Rect::new(0, 0, 120, 14), &rows);
+
+        assert_eq!(layout.cols.len(), 3);
+        assert_eq!(layout.hidden, 0);
+        assert!(!layout.truncated);
+
+        // Column lengths derived, never restated: the last is the short one.
+        let lengths: Vec<usize> = (0..layout.cols.len())
+            .map(|c| layout.column_rows(c, &rows).len())
+            .collect();
+        assert_eq!(lengths.iter().sum::<usize>(), rows.len());
+        assert!(lengths[lengths.len() - 1] <= layout.rows_per_col);
+    }
+
+    #[test]
+    fn a_narrow_frame_reports_both_overflows() {
+        // Below the single-column minimum: the help text cannot fit the width,
+        // and the rows cannot fit the height either.
+        let rows = help_rows();
+        let layout = help_layout(Rect::new(0, 0, 30, 24), &rows);
+
+        assert_eq!(layout.cols.len(), 1);
+        assert!(layout.truncated);
+        assert_eq!(layout.hidden, rows.len() - layout.rows_per_col);
+        assert!(
+            layout.width <= 30 && layout.height <= 24,
+            "popup exceeds frame"
+        );
+    }
+
+    #[test]
+    fn degenerate_frames_produce_a_layout_rather_than_a_panic() {
+        let rows = help_rows();
+
+        // 1x1: no room for even the borders — the early return.
+        let tiny = help_layout(Rect::new(0, 0, 1, 1), &rows);
+        assert!(tiny.cols.is_empty());
+        assert_eq!(tiny.rows_per_col, 0);
+        assert_eq!(tiny.hidden, rows.len());
+        assert!(tiny.truncated);
+
+        // An empty table is not the same as no room: the popup collapses to
+        // its borders rather than spreading over the whole frame.
+        let empty = help_layout(frame_of(MIN_TERM), &[]);
+        assert_eq!((empty.width, empty.height), (2, 2));
+        assert_eq!(empty.hidden, 0);
+        assert!(!empty.truncated);
+
+        // 4x3: one row of two cells to draw into, so nothing fits but the
+        // layout still describes a single column.
+        let small = help_layout(Rect::new(0, 0, 4, 3), &rows);
+        assert_eq!(small.cols.len(), 1);
+        assert_eq!(small.rows_per_col, 1);
+        assert_eq!(small.hidden, rows.len() - 1);
+        assert!(small.truncated);
+    }
+
+    #[test]
+    fn the_partition_covers_every_row_without_overlapping() {
+        // `column_rows` is the only definition of the split, so its bounds are
+        // worth pinning directly — including when the row count is not a
+        // multiple of the column count and the last column comes up short.
+        for n in [7usize, 25, 26, 27] {
+            let rows = synthetic_rows(n);
+            let layout = help_layout(frame_of(MIN_TERM), &rows);
+
+            let mut seen = 0;
+            for c in 0..layout.cols.len() {
+                let slice = layout.column_rows(c, &rows);
+                assert!(slice.len() <= layout.rows_per_col);
+                seen += slice.len();
+            }
+            assert_eq!(seen + layout.hidden, n, "{n} rows: partition lost some");
+        }
+    }
+
+    // --- The `?` cheatsheet, as actually drawn ---------------------------
+    //
+    // The layout above can be right while the draw is wrong: a dropped span, a
+    // missing pad, a partition recomputed differently. These go through a real
+    // backend and read the buffer back.
+
+    /// Draw `rows` into a `size` frame and return the buffer, line by line,
+    /// alongside the layout that produced it.
+    fn drawn(size: (u16, u16), rows: &[HelpRow]) -> (Vec<String>, HelpLayout) {
+        let (width, height) = size;
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend terminal");
+        let theme = Theme::from_flavor("mocha");
+        terminal
+            .draw(|frame| draw_help(frame, frame_of(size), rows, &theme))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer().clone();
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        (lines, help_layout(frame_of(size), rows))
+    }
+
+    /// The cell text column `c` draws for `row`, padding included.
+    fn cell_text(row: &HelpRow, layout: &HelpLayout, c: usize) -> String {
+        let widths = &layout.cols[c];
+        let (label, help) = row;
+        let last = c + 1 == layout.cols.len();
+        let help = if last {
+            help.to_string()
+        } else {
+            format!("{help:<width$}", width = widths.help)
+        };
+        format!(" {label:<width$} {help}", width = widths.label)
+    }
+
+    /// Where each column's cells start, discovered from the buffer rather than
+    /// recomputed from `centered`'s arithmetic — a test that recomputed the
+    /// origin would agree with a renderer that placed the popup wrongly.
+    fn column_offsets(lines: &[String], layout: &HelpLayout, rows: &[HelpRow]) -> Vec<usize> {
+        (0..layout.cols.len())
+            .map(|c| {
+                let first = &layout.column_rows(c, rows)[0];
+                let needle = cell_text(first, layout, c);
+                lines
+                    .iter()
+                    .find_map(|line| line.find(&needle))
+                    .unwrap_or_else(|| panic!("column {c} not found in the buffer"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_row_is_drawn_padded_and_column_aligned() {
+        let rows = help_rows();
+        let (lines, layout) = drawn(MIN_TERM, &rows);
+        assert_eq!(layout.hidden, 0, "fixture should show every row");
+
+        // Content: every row present, with its padding, on a single line. A
+        // whole-buffer join would let a needle straddle the column boundary.
+        for c in 0..layout.cols.len() {
+            for row in layout.column_rows(c, &rows) {
+                let needle = cell_text(row, &layout, c);
+                assert!(
+                    lines.iter().any(|line| line.contains(&needle)),
+                    "missing cell {needle:?}"
+                );
+            }
+        }
+
+        // Alignment: each column starts at one x, and the gap between them is
+        // the width that was budgeted — not a ragged edge that happens to fit.
+        let offsets = column_offsets(&lines, &layout, &rows);
+        for (c, offset) in offsets.iter().enumerate() {
+            for row in layout.column_rows(c, &rows) {
+                let needle = cell_text(row, &layout, c);
+                let found = lines
+                    .iter()
+                    .find_map(|line| line.find(&needle))
+                    .expect("cell present");
+                assert_eq!(found, *offset, "column {c} is ragged at {needle:?}");
+            }
+        }
+        for c in 1..layout.cols.len() {
+            assert_eq!(
+                offsets[c] - offsets[c - 1],
+                layout.cols[c - 1].cell() + HELP_COL_GAP,
+                "gap between columns {} and {c} is not the budgeted width",
+                c - 1
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_keep_their_accent() {
+        // Buffer text alone cannot tell two spans from one: collapsing the cell
+        // into a single format string renders identically and loses the accent.
+        let rows = help_rows();
+        let (lines, layout) = drawn(MIN_TERM, &rows);
+        let theme = Theme::from_flavor("mocha");
+
+        let offsets = column_offsets(&lines, &layout, &rows);
+        let first = &layout.column_rows(0, &rows)[0];
+        let needle = cell_text(first, &layout, 0);
+        let y = lines
+            .iter()
+            .position(|line| line.contains(&needle))
+            .expect("first cell present");
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(MIN_TERM.0, MIN_TERM.1)).expect("TestBackend terminal");
+        terminal
+            .draw(|frame| draw_help(frame, frame_of(MIN_TERM), &rows, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // The label sits one cell past the leading space; the help follows the
+        // label's field and its separating space.
+        let label_x = offsets[0] + 1;
+        let help_x = offsets[0] + 1 + layout.cols[0].label + 1;
+        assert_eq!(
+            buffer[(label_x as u16, y as u16)].fg,
+            theme.accent,
+            "key label lost its accent"
+        );
+        assert_eq!(
+            buffer[(help_x as u16, y as u16)].fg,
+            theme.text,
+            "help text is not the body colour"
+        );
+    }
+
+    #[test]
+    fn a_short_frame_draws_what_fits_and_says_what_it_dropped() {
+        // Two columns with a hidden tail — the one regime where the layout's
+        // partition and the renderer's could disagree without either looking
+        // wrong on its own.
+        let rows = help_rows();
+        let size = (80, 12);
+        let (lines, layout) = drawn(size, &rows);
+
+        assert_eq!(layout.cols.len(), 2);
+        assert!(layout.hidden > 0, "fixture should overflow vertically");
+
+        // Each column draws exactly its share, one row per line, no more. The
+        // popup's own height bounds it: borders plus `rows_per_col`, so a
+        // renderer that sliced further would have nowhere to put the surplus.
+        assert_eq!(layout.height as usize, layout.rows_per_col + 2);
+        for c in 0..layout.cols.len() {
+            let expected = layout.column_rows(c, &rows);
+            let drawn_here = lines
+                .iter()
+                .filter(|line| {
+                    expected
+                        .iter()
+                        .any(|row| line.contains(&cell_text(row, &layout, c)))
+                })
+                .count();
+            assert_eq!(
+                drawn_here,
+                expected.len(),
+                "column {c} drew the wrong number of rows"
+            );
+        }
+
+        // The tail is absent, and the popup says so.
+        let shown = layout.cols.len() * layout.rows_per_col;
+        for (label, help) in &rows[shown..] {
+            assert!(
+                !lines.iter().any(|line| line.contains(help.trim())),
+                "hidden row {label:?} was drawn anyway"
+            );
+        }
+        let notice = overflow_notice(&layout).expect("overflow at 80x12");
+        assert!(
+            lines.iter().any(|line| line.contains(&notice)),
+            "notice {notice:?} never reached the buffer"
+        );
+    }
+
+    #[test]
+    fn a_narrow_frame_announces_the_clip_in_the_buffer() {
+        let rows = help_rows();
+        let size = (30, 24);
+        let (lines, layout) = drawn(size, &rows);
+
+        let notice = overflow_notice(&layout).expect("overflow at 30x24");
+        assert!(
+            lines.iter().any(|line| line.contains(&notice)),
+            "notice {notice:?} never reached the buffer"
+        );
+    }
+
+    #[test]
+    fn a_ragged_last_column_still_draws_its_final_row() {
+        // 27 rows over two columns gives 14 and 13. A `zip`-based assembly would
+        // stop at the shorter column and drop row 27 — present in the layout,
+        // absent from the screen, with the gate still green.
+        let rows = synthetic_rows(27);
+        let (lines, layout) = drawn(MIN_TERM, &rows);
+
+        assert_eq!(layout.hidden, 0);
+        assert!(
+            layout.column_rows(layout.cols.len() - 1, &rows).len() < layout.rows_per_col,
+            "fixture should leave the last column short"
+        );
+
+        let last = rows.last().expect("rows are not empty");
+        let needle = cell_text(last, &layout, layout.cols.len() - 1);
+        assert!(
+            lines.iter().any(|line| line.contains(&needle)),
+            "final row {needle:?} was dropped"
+        );
+    }
+
+    #[test]
+    fn degenerate_frames_draw_without_panicking() {
+        // The layout tests cover the arithmetic; the panic risk is in the draw,
+        // where an empty partition must not be indexed.
+        let rows = help_rows();
+        for size in [(1, 1), (4, 3)] {
+            let _ = drawn(size, &rows);
+        }
+    }
+
+    #[test]
+    fn the_overflow_notice_names_the_axis_that_overflowed() {
+        let fits = HelpLayout::default();
+        assert_eq!(overflow_notice(&fits), None);
+
+        let clipped = HelpLayout {
+            truncated: true,
+            ..HelpLayout::default()
+        };
+        assert_eq!(overflow_notice(&clipped).as_deref(), Some("clipped"));
+
+        let dropped = HelpLayout {
+            hidden: 6,
+            ..HelpLayout::default()
+        };
+        assert_eq!(overflow_notice(&dropped).as_deref(), Some("+6 more"));
+
+        let both = HelpLayout {
+            hidden: 4,
+            truncated: true,
+            ..HelpLayout::default()
+        };
+        assert_eq!(overflow_notice(&both).as_deref(), Some("+4 more, clipped"));
+    }
 
     fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()

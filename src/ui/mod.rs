@@ -13,12 +13,19 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 
 use crate::app::{Focus, Model, Overlay};
-use crate::domain::Status;
+use crate::domain::{Status, Task};
 use crate::keymap;
 use theme::Theme;
+use widgets::{dueload, meter};
 
-/// Render the whole frame. Never mutates state.
-pub fn view(model: &Model, theme: &Theme, frame: &mut Frame) {
+/// Days of "workload ahead" bucketed into the due-load strip (today + 6).
+const DUE_LOAD_DAYS: usize = 7;
+/// Braille/ASCII cells the header completion meter occupies.
+const HEADER_METER_WIDTH: u16 = 10;
+
+/// Render the whole frame. Never mutates state. `ascii` reflects
+/// `config.ascii_fallback`: braille data widgets degrade to ASCII when set.
+pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::new().bg(theme.base)), area);
 
@@ -31,7 +38,7 @@ pub fn view(model: &Model, theme: &Theme, frame: &mut Frame) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(content);
     render_sidebar(frame, panes[0], model, theme);
-    render_task_pane(frame, panes[1], model, theme);
+    render_task_pane(frame, panes[1], model, ascii, theme);
     render_status(frame, status, model, theme);
 
     if model.show_help {
@@ -77,7 +84,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
 /// Width of the leading due-date column: `YYYY-MM-DD`.
 const DUE_WIDTH: usize = 10;
 
-fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
+fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
     // The current sort is a read-only lens over `tasks`: the display order comes
     // from `sorted_tasks()`, while `tasks` (Manual order) stays untouched.
@@ -120,11 +127,76 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme)
         .and_then(|i| model.tasks.get(i))
         .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
 
-    let title = match model.sort.label() {
+    let base = match model.sort.label() {
         Some(label) => format!("Tasks — {label}"),
         None => "Tasks".to_string(),
     };
+    // Inline btop-style data widgets in the header: a completion meter for the
+    // active List and a due-load strip. Both drop out (never the text) when the
+    // pane is too narrow — braille degrades before the title (ADR-0006).
+    let inner_width = area.width.saturating_sub(2); // rounded borders
+    let title = header_title(&base, model, inner_width, ascii);
     render_selectable(frame, area, &title, items, selected, focused, theme);
+}
+
+/// Compose the task-pane header: the base title, then — only while they fit — a
+/// completion meter (`done/total` of the active List) and a due-load strip.
+/// Widgets are added greedily and dropped before the text on a narrow pane.
+fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> String {
+    let inner = inner_width as usize;
+    let mut title = base.to_string();
+
+    // Completion meter for the active List (done / total of the loaded Tasks).
+    let total = model.tasks.len();
+    if total > 0 {
+        let done = model
+            .tasks
+            .iter()
+            .filter(|t| t.status == Status::Completed)
+            .count();
+        let bar = meter::render(done, total, HEADER_METER_WIDTH, ascii);
+        let segment = format!("  {bar} {done}/{total}");
+        if title.chars().count() + segment.chars().count() <= inner {
+            title.push_str(&segment);
+        }
+    }
+
+    // Due-load strip: workload ahead over the next `DUE_LOAD_DAYS` days.
+    let counts = due_load_counts(&model.tasks, model.now, DUE_LOAD_DAYS);
+    if counts.iter().any(|&c| c > 0) {
+        let strip = dueload::render(&counts, ascii);
+        let segment = format!("  {strip}");
+        if title.chars().count() + segment.chars().count() <= inner {
+            title.push_str(&segment);
+        }
+    }
+
+    title
+}
+
+/// Bucket incomplete Tasks by due date into `days` daily buckets of "workload
+/// ahead": `[0]` = due today (and anything overdue, folded forward), `[1]` =
+/// tomorrow, ... Completed Tasks and Tasks with no due date are excluded.
+fn due_load_counts(
+    tasks: &[Task],
+    now: chrono::DateTime<chrono::Local>,
+    days: usize,
+) -> Vec<usize> {
+    let today = now.date_naive();
+    let mut counts = vec![0usize; days];
+    for task in tasks {
+        if task.status == Status::Completed {
+            continue;
+        }
+        let Some(due) = task.due else { continue };
+        let delta = (due - today).num_days();
+        // Overdue folds into today's load; beyond the window is ignored.
+        let bucket = delta.max(0) as usize;
+        if bucket < days {
+            counts[bucket] += 1;
+        }
+    }
+    counts
 }
 
 /// A rounded, focus-aware panel wrapping a selectable list. The selection is

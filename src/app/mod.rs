@@ -685,6 +685,11 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::ToggleHelp => model.show_help = !model.show_help,
         Action::CloseOverlay => model.show_help = false,
         Action::SwitchPane => model.focus = model.focus.toggled(),
+        // Directional, unlike `SwitchPane`: they name a pane rather than flip to
+        // the other one, so they are idempotent at the layout's edges. The panes
+        // are laid out sidebar-left, tasks-right (see `ui::view`).
+        Action::FocusLeft => model.focus = Focus::Sidebar,
+        Action::FocusRight => model.focus = Focus::Tasks,
         Action::SelectNext => return move_selection(model, 1),
         Action::SelectPrev => return move_selection(model, -1),
         Action::ToggleComplete => return toggle_complete(model),

@@ -224,6 +224,33 @@ fn a_double_width_url_is_truncated_by_cells_not_characters() {
 }
 
 #[test]
+fn a_long_picker_never_covers_the_status_line_or_its_own_legend() {
+    // 30 URLs is more rows than the frame has. The popup must stop above the
+    // bottom chrome — the legend down there is what tells you `Enter` opens.
+    let many: String = (0..30)
+        .map(|i| format!("https://a.dev/{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut model = model_with(vec![task("1", "alpha", Some(&many))]);
+    model.status_line = Some("Synced 5 tasks".to_string());
+    ui_update(&mut model, Message::Key(press('u')));
+
+    let drawn = rows(&model);
+    assert_eq!(
+        drawn.last().expect("a bottom row").trim_end(),
+        "j/k move  Enter open  Esc cancel",
+        "the picker covered its own legend:\n{}",
+        drawn.join("\n")
+    );
+    assert_eq!(
+        drawn[drawn.len() - 2].trim_end(),
+        "Synced 5 tasks",
+        "the picker covered the status line:\n{}",
+        drawn.join("\n")
+    );
+}
+
+#[test]
 fn the_link_cell_is_absent_at_eighty_columns_and_present_when_it_fits() {
     // The accepted cost, pinned: at the default width `u` is only in `?`.
     let model = model_with(vec![task("1", "alpha", None)]);

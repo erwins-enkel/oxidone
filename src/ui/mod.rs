@@ -68,6 +68,10 @@ const OVERLAY_WIDTH: u16 = 50;
 /// side, so two off the height *and* two off the usable text width. Used for
 /// both deliberately — a `Block::bordered` costs the same in each direction.
 const OVERLAY_BORDERS: u16 = 2;
+/// Rows `view` reserves at the bottom of the frame for the status line and the
+/// legend. The picker is the one overlay tall enough to reach them, and it must
+/// not — the legend down there is what advertises its own keys.
+const BOTTOM_CHROME_ROWS: u16 = 2;
 
 fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
     // Every overlay but the picker is a single line of text in a fixed popup.
@@ -108,7 +112,15 @@ fn render_link_picker(
     selected: usize,
     theme: &Theme,
 ) {
-    let popup = centered(area, OVERLAY_WIDTH, picker_height(urls.len(), area.height));
+    // Centre within the content rows only. A Task with enough URLs would
+    // otherwise grow a popup over the status line and over the legend spelling
+    // out `j/k move  Enter open  Esc cancel` — hiding the instructions for the
+    // very thing on screen.
+    let body = Rect {
+        height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
+        ..area
+    };
+    let popup = centered(body, OVERLAY_WIDTH, picker_height(urls.len(), body.height));
     // By characters, not bytes: a URL in free-text notes may be multibyte, and
     // slicing one mid-codepoint would panic. The gutter comes off the budget
     // too — `render_selectable` spends it on every row.

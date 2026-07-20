@@ -33,13 +33,19 @@ impl OpenableUrl {
         if rest.is_empty() {
             return None;
         }
-        let openable = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
-        openable.then(|| Self(raw.to_string()))
+        is_openable_scheme(scheme).then(|| Self(raw.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The only schemes oxidone will hand to a browser. Shared by
+/// [`OpenableUrl::parse`] and the scanner's scheme-boundary search so the two
+/// can never disagree about what "openable" means.
+fn is_openable_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
 }
 
 /// Trailing characters stripped from a token. Prose wraps URLs in punctuation
@@ -124,29 +130,46 @@ impl<'a> Iterator for UrlTokens<'a> {
 /// Byte index where the scheme preceding `sep` starts, if there is a valid one.
 ///
 /// Walks back over RFC 3986 scheme characters — `ALPHA *( ALPHA / DIGIT / "+" /
-/// "-" / "." )` — then forward to the first letter, because a scheme must begin
-/// with one and the backward walk cannot know where the URL stops and the prose
-/// in front of it starts. `1.https://a.dev` (a numbered list) and
-/// `-https://a.dev` (a bullet) both sweep punctuation into the run; rejecting
-/// the whole token there would lose the URL entirely rather than trim it.
+/// "-" / "." )` — which cannot know where prose stops and the URL begins: all of
+/// `1.`, `-`, `a.` and `e.g.` are swept into the run by a text that simply
+/// abuts a URL.
+///
+/// So the run is searched **right to left** for a position that could legally
+/// open a scheme (the run's own start, or any letter following `.`/`-`/`+`), and
+/// the first one whose scheme is openable wins. Prose butted against a URL is
+/// far more common than a custom dotted scheme, so `e.g.https://x.dev` should
+/// yield `https://x.dev` rather than the unopenable `e.g.https://x.dev`.
+///
+/// With nothing openable it falls back to the **leftmost** candidate, which
+/// keeps a genuine custom scheme whole: `myapp.custom://x` stays one refused
+/// link rather than being trimmed down to something it never was.
 ///
 /// Byte-wise backtracking is safe because every character it accepts is ASCII,
 /// so a UTF-8 continuation byte can never be mistaken for one.
 fn scheme_start(text: &str, sep: usize) -> Option<usize> {
     let bytes = text.as_bytes();
-    let mut start = sep;
-    while start > 0 {
-        let b = bytes[start - 1];
+    let mut run = sep;
+    while run > 0 {
+        let b = bytes[run - 1];
         if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
-            start -= 1;
+            run -= 1;
         } else {
             break;
         }
     }
-    // Everything from here to `sep` is already a legal scheme body, so the first
-    // letter in the run is the first byte that can legally open a scheme.
-    while start < sep && !bytes[start].is_ascii_alphabetic() {
-        start += 1;
+    // Right to left, so the first openable hit is the rightmost one. No
+    // allocation: `has_openable_url` runs per visible row, per frame.
+    let mut leftmost = None;
+    let mut i = sep;
+    while i > run {
+        i -= 1;
+        let opens_a_scheme = i == run || matches!(bytes[i - 1], b'.' | b'-' | b'+');
+        if opens_a_scheme && bytes[i].is_ascii_alphabetic() {
+            if is_openable_scheme(&text[i..sep]) {
+                return Some(i);
+            }
+            leftmost = Some(i);
+        }
     }
-    (start < sep).then_some(start)
+    leftmost
 }

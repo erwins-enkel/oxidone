@@ -88,12 +88,31 @@ fn a_run_with_no_letter_at_all_is_not_a_scheme() {
 }
 
 #[test]
-fn a_letter_led_run_keeps_its_whole_scheme() {
-    // Not the same case: `x1https` legally *is* a scheme, just not an openable
-    // one, so it must be counted and refused rather than trimmed into `https`.
-    let notes = "x1https://a.dev";
-    assert_eq!(scan_urls(notes).len(), 1);
-    assert!(openable_urls(notes).is_empty());
+fn a_word_abutting_a_url_is_not_absorbed_into_the_scheme() {
+    // The backward walk cannot tell prose from scheme, so the run is searched
+    // right-to-left for an openable scheme. Without that, `e.g.https://x.dev`
+    // reads as one unopenable link and an ordinary URL never opens.
+    let cases = [
+        ("a.https://x.dev", "https://x.dev"),
+        ("e.g.https://x.dev", "https://x.dev"),
+        ("cf.http://x.dev/y", "http://x.dev/y"),
+        ("see e.g.https://x.dev/a for more", "https://x.dev/a"),
+    ];
+    for (notes, expected) in cases {
+        assert_eq!(scan_urls(notes), vec![expected], "notes: {notes:?}");
+        assert!(has_openable_url(notes), "marker missing for {notes:?}");
+    }
+}
+
+#[test]
+fn a_custom_dotted_scheme_is_kept_whole_rather_than_trimmed() {
+    // The fallback when nothing in the run is openable: leftmost, so a real
+    // scheme stays one refused link instead of being cut down to something the
+    // user never wrote.
+    for notes in ["myapp.custom://x", "x1https://a.dev", "foo.bar://baz"] {
+        assert_eq!(scan_urls(notes), vec![notes], "notes: {notes:?}");
+        assert!(openable_urls(notes).is_empty(), "notes: {notes:?}");
+    }
 }
 
 #[test]
@@ -189,6 +208,9 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
         "-https://a.dev",
         "123://nope",
         "x1https://a.dev",
+        "a.https://x.dev",
+        "e.g.https://x.dev",
+        "myapp.custom://x",
     ];
     for notes in fixtures {
         assert_eq!(

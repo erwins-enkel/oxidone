@@ -699,12 +699,14 @@ pub enum Command {
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
     /// Insert a new Task into a List; `temp` echoes back so the placeholder can
-    /// be reconciled with the server Task. `parent` is `Some` for a Subtask.
+    /// be reconciled with the server Task. `parent` is `Some` for a Subtask;
+    /// `due` is `Some` when a trailing date was parsed off the captured title.
     AddTask {
         list: ListId,
         temp: TaskId,
         title: String,
         parent: Option<TaskId>,
+        due: Option<NaiveDate>,
     },
     /// Reposition / reparent a Task (indent, outdent, or reorder). `parent` sets
     /// the new parent (`None` = top-level); `previous` is the sibling to place it
@@ -1348,20 +1350,37 @@ fn open_add_task(model: &mut Model) {
 
 /// Optimistically insert a placeholder Task at the top of **stored** order
 /// (Google adds new Tasks to the top of a List) and request the insert. Where it
-/// *renders* is up to the active lens: the placeholder carries no due date, so
-/// under `Due` it appears in the undated tail rather than the first row. The
-/// cursor follows it either way. The placeholder carries a `temp-N` id; the
-/// server Task replaces it via `TaskInserted`. Exact position reconciles on the
-/// next refresh.
-fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
-    let title = buffer.trim().to_string();
+/// *renders* is up to the active lens: a placeholder with a due date sorts into
+/// its dated position under `Due`, an undated one into the tail. The cursor
+/// follows it either way. The placeholder carries a `temp-N` id; the server Task
+/// replaces it via `TaskInserted`. Exact position reconciles on the next refresh.
+///
+/// `literal` skips the natural-language split (the `Tab` submit): the whole
+/// buffer is the title and no due date is parsed off it.
+fn finish_add_task(model: &mut Model, buffer: String, literal: bool) -> Vec<Command> {
+    let (title, due) = capture_title_and_due(model, &buffer, literal);
     if title.is_empty() {
         return Vec::new();
     }
     let Some(list) = model.selected_list_id().cloned() else {
         return Vec::new();
     };
-    add_task_placeholder(model, list, title, None, 0)
+    add_task_placeholder(model, list, title, None, 0, due)
+}
+
+/// Resolve a capture buffer into `(title, due)`. `literal` keeps the raw trimmed
+/// buffer as the title with no due date; otherwise a trailing natural-language
+/// date is peeled off ([`dateparse::split_title_and_due`], against `model.now`).
+fn capture_title_and_due(
+    model: &Model,
+    buffer: &str,
+    literal: bool,
+) -> (String, Option<NaiveDate>) {
+    if literal {
+        (buffer.trim().to_string(), None)
+    } else {
+        dateparse::split_title_and_due(buffer, model.now)
+    }
 }
 
 /// Open the capture overlay for a new Subtask under the selected Task. A Subtask
@@ -1389,12 +1408,17 @@ fn open_add_subtask(model: &mut Model) {
 /// Optimistically insert a placeholder Subtask directly after `parent` in
 /// **stored** order (its first child, matching Google's top-of-list insert) and
 /// request the insert. Where it *renders* is up to the active lens, exactly as
-/// for [`finish_add_task`]: the placeholder carries no due date, so under `Due`
-/// it appears in the group's undated tail rather than as its first child — at
-/// the head of that tail, since the sort is stable and it is the first child in
-/// stored order. The cursor follows it either way.
-fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<Command> {
-    let title = buffer.trim().to_string();
+/// for [`finish_add_task`]: a dated placeholder sorts into its due position under
+/// `Due`, an undated one into the group's tail — at the head of that tail, since
+/// the sort is stable and it is the first child in stored order. The cursor
+/// follows it either way. `literal` skips the natural-language date split.
+fn finish_add_subtask(
+    model: &mut Model,
+    parent: TaskId,
+    buffer: String,
+    literal: bool,
+) -> Vec<Command> {
+    let (title, due) = capture_title_and_due(model, &buffer, literal);
     if title.is_empty() {
         return Vec::new();
     }
@@ -1411,17 +1435,20 @@ fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<
         model.status_line = Some("subtasks can't have subtasks (one level max)".to_string());
         return Vec::new();
     }
-    add_task_placeholder(model, list, title, Some(parent), pidx + 1)
+    add_task_placeholder(model, list, title, Some(parent), pidx + 1, due)
 }
 
 /// Insert an optimistic placeholder Task at `index`, move the cursor onto it, and
-/// emit its `AddTask`. Shared by the top-level and Subtask add paths.
+/// emit its `AddTask`. Shared by the top-level and Subtask add paths. `due`
+/// carries any date parsed off the captured title, so the placeholder mirrors
+/// what the insert will store.
 fn add_task_placeholder(
     model: &mut Model,
     list: ListId,
     title: String,
     parent: Option<TaskId>,
     index: usize,
+    due: Option<NaiveDate>,
 ) -> Vec<Command> {
     let temp = TaskId(format!("temp-{}", model.next_temp));
     model.next_temp += 1;
@@ -1434,7 +1461,7 @@ fn add_task_placeholder(
             title: title.clone(),
             notes: None,
             status: Status::NeedsAction,
-            due: None,
+            due,
             completed_at: None,
             // A brand-new Task has no `links[]` (output-only; Google attaches
             // them only on the surface it was created from).
@@ -1450,6 +1477,7 @@ fn add_task_placeholder(
         temp,
         title,
         parent,
+        due,
     }]
 }
 
@@ -1918,6 +1946,18 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         }
         _ => {}
     }
+    // `Tab` is the literal submit on the two add overlays: it skips the
+    // natural-language date split so a title that ends in a date-word is kept
+    // verbatim. It is modifier-free on purpose — in this app's legacy keyboard
+    // mode an Alt/Ctrl chord on Enter is unreliable (often ESC-prefixed, which
+    // would read as the cancel key). Elsewhere `Tab` has no meaning and is
+    // swallowed like any other unhandled key.
+    if key.code == KeyCode::Tab {
+        return match model.overlay {
+            Some(Overlay::AddTask { .. } | Overlay::AddSubtask { .. }) => submit_input(model, true),
+            _ => Vec::new(),
+        };
+    }
     let Some(buffer) = model.overlay.as_mut().and_then(Overlay::input_buffer) else {
         return Vec::new();
     };
@@ -1926,7 +1966,7 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         KeyCode::Backspace => {
             buffer.pop();
         }
-        KeyCode::Enter => return submit_input(model),
+        KeyCode::Enter => return submit_input(model, false),
         KeyCode::Esc => model.overlay = None,
         _ => {}
     }
@@ -1958,12 +1998,16 @@ fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
     Vec::new()
 }
 
-/// Submit whichever text-input overlay is active.
-fn submit_input(model: &mut Model) -> Vec<Command> {
+/// Submit whichever text-input overlay is active. `literal` only reaches the two
+/// add overlays (the `Tab` submit), where it keeps the captured buffer verbatim
+/// as the title instead of peeling a trailing date off it.
+fn submit_input(model: &mut Model, literal: bool) -> Vec<Command> {
     match model.overlay.take() {
         Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
-        Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
-        Some(Overlay::AddSubtask { parent, buffer }) => finish_add_subtask(model, parent, buffer),
+        Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer, literal),
+        Some(Overlay::AddSubtask { parent, buffer }) => {
+            finish_add_subtask(model, parent, buffer, literal)
+        }
         Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
         Some(Overlay::EditNotes { task, buffer }) => finish_edit_notes(model, task, Some(buffer)),
         Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),

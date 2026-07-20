@@ -51,6 +51,101 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
         .map_err(|_| DueParseError(input.to_string()))
 }
 
+/// Split a capture buffer into a display title and an optional due date by
+/// peeling a trailing natural-language date phrase off the end (`Launch website
+/// 3d` → `("Launch website", Some(today + 3))`). The date is resolved against
+/// `now`, exactly as [`parse_due_relative_to`] — same test seam, same timezone
+/// rules.
+///
+/// It peels the **longest trailing word-suffix** that both looks like a date
+/// ([`looks_like_date_phrase`]) and parses, while leaving at least one word in
+/// the title. `interim` rejects a candidate that opens with a non-date word
+/// (`Bob tomorrow`, `report May`), so scanning longest-first cannot swallow
+/// title words. When nothing peels — including when the whole buffer is a date,
+/// since the first word must stay — the trimmed buffer is the title and there is
+/// no due date.
+pub fn split_title_and_due<Tz: TimeZone>(
+    input: &str,
+    now: DateTime<Tz>,
+) -> (String, Option<NaiveDate>) {
+    let trimmed = input.trim();
+    // Byte offset where each word begins. Word 0 is never a candidate start, so
+    // the title keeps at least one word.
+    let word_starts = word_start_offsets(trimmed);
+    for &offset in word_starts.iter().skip(1) {
+        let candidate = &trimmed[offset..];
+        if looks_like_date_phrase(candidate) {
+            if let Ok(date) = parse_due_relative_to(candidate, now.clone()) {
+                let title = trimmed[..offset].trim_end().to_string();
+                return (title, Some(date));
+            }
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
+/// Byte offsets where each whitespace-separated word begins, in order.
+fn word_start_offsets(s: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut prev_ws = true;
+    for (i, c) in s.char_indices() {
+        if !c.is_whitespace() && prev_ws {
+            starts.push(i);
+        }
+        prev_ws = c.is_whitespace();
+    }
+    starts
+}
+
+/// The false-positive gate for [`split_title_and_due`]: is this trailing
+/// candidate specific enough to *mean* a date? `interim` will happily read a
+/// bare month name as the first of that month and a bare number as a (year)
+/// date, which would silently eat ordinary title words (`Prep for May`, `Buy
+/// milk 2`). So a **single** token that is a bare month name or all digits is
+/// rejected; every other single token (`3d`, `friday`, `tomorrow`, an ISO date)
+/// and every multi-token candidate is left for the parser to accept or reject.
+fn looks_like_date_phrase(candidate: &str) -> bool {
+    let mut tokens = candidate.split_whitespace();
+    let (Some(first), None) = (tokens.next(), tokens.next()) else {
+        // Multi-token (or empty): let the parser be the judge.
+        return true;
+    };
+    let bare_number = !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit());
+    !(bare_number || is_month_name(first))
+}
+
+/// Whether `token` is an English month name or its common three-letter
+/// abbreviation, case-insensitively — the words `interim` reads as a bare month.
+fn is_month_name(token: &str) -> bool {
+    const MONTHS: [&str; 23] = [
+        "jan",
+        "january",
+        "feb",
+        "february",
+        "mar",
+        "march",
+        "apr",
+        "april",
+        "may",
+        "jun",
+        "june",
+        "jul",
+        "july",
+        "aug",
+        "august",
+        "sep",
+        "september",
+        "oct",
+        "october",
+        "nov",
+        "november",
+        "dec",
+        "december",
+    ];
+    let lower = token.to_ascii_lowercase();
+    MONTHS.contains(&lower.as_str())
+}
+
 /// How far either side of `today` a due date still reads as a day count. Beyond
 /// this an offset stops being legible ("in 43d" says less than a date), so the
 /// absolute ISO date takes over.
@@ -196,6 +291,84 @@ mod tests {
         assert_eq!(
             format_due_relative(ymd(2026, 8, 2), ymd(2026, 7, 31)),
             "in 2d"
+        );
+    }
+
+    #[test]
+    fn splits_a_trailing_date_off_the_title() {
+        let cases = [
+            (
+                "Launch website 3d",
+                "Launch website",
+                Some(ymd(2026, 7, 23)),
+            ),
+            ("Call Bob tomorrow", "Call Bob", Some(ymd(2026, 7, 21))),
+            // 2026-07-20 is a Monday; the next Tuesday is the 21st.
+            (
+                "Decide marketing campaign Tuesday",
+                "Decide marketing campaign",
+                Some(ymd(2026, 7, 21)),
+            ),
+            (
+                "Book flight next friday",
+                "Book flight",
+                Some(ymd(2026, 7, 31)),
+            ),
+            ("Pay rent 2026-08-01", "Pay rent", Some(ymd(2026, 8, 1))),
+            // Month + day is specific enough to peel; the day number stays with it.
+            ("Party May 3", "Party", Some(ymd(2026, 5, 3))),
+            // `N days` (number + unit) is a date just like the `3d` short form.
+            ("Ship it 3 days", "Ship it", Some(ymd(2026, 7, 23))),
+        ];
+        for (input, title, due) in cases {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (title.to_string(), due),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_month_or_number_stays_in_the_title() {
+        // interim would read these as the 1st of a month / a year; the gate keeps
+        // them as ordinary words instead of silently dating the Task.
+        for input in ["Prep for May", "Buy milk 2", "Sprint 17", "Plan june"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_buffer_that_is_a_date_stays_the_title() {
+        // The first word must remain, so there is nothing to peel a date from.
+        for input in ["tomorrow", "friday", "3d"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_date_trailing_word_stays_in_the_title() {
+        // No trailing suffix parses as a date, so nothing is peeled.
+        assert_eq!(
+            split_title_and_due("Build the widget", now()),
+            ("Build the widget".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn split_preserves_internal_title_whitespace_and_trims_edges() {
+        // Only the trailing date is removed; the title's own spacing is intact.
+        assert_eq!(
+            split_title_and_due("  Two   spaces tomorrow  ", now()),
+            ("Two   spaces".to_string(), Some(ymd(2026, 7, 21)))
         );
     }
 

@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 
 use crate::app::{Focus, Model, Overlay};
+use crate::dateparse::format_due_relative;
 use crate::domain::{Status, Task};
 use crate::keymap;
 use theme::Theme;
@@ -81,7 +82,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
-/// Width of the leading due-date column: `YYYY-MM-DD`.
+/// Width of the leading due-date column, set by the widest form a due date
+/// renders as: the `YYYY-MM-DD` fallback past the relative horizon. Every
+/// relative form (`today`, `tomorrow`, `yesterday`, `in 7d`, `7d ago`) is
+/// shorter and pads out to it.
 const DUE_WIDTH: usize = 10;
 
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
@@ -106,12 +110,16 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             };
             let mut spans = Vec::new();
             if due_gutter {
+                // Relative to the model's clock stamp, so the view reads no
+                // clock of its own. Left-aligned in the column: the relative
+                // forms are all shorter than the ISO fallback, so they pad
+                // rather than truncate and the titles stay aligned.
                 let due = match t.due {
-                    Some(d) => d.format("%Y-%m-%d").to_string(),
-                    None => " ".repeat(DUE_WIDTH),
+                    Some(d) => format_due_relative(d, model.now.date_naive()),
+                    None => String::new(),
                 };
                 spans.push(Span::styled(
-                    format!("{due}  "),
+                    format!("{due:<DUE_WIDTH$}  "),
                     Style::new().fg(theme.subtext),
                 ));
             }

@@ -366,17 +366,26 @@ fn the_cheatsheet_keeps_binding_table_order() {
     // Load-bearing: `ui` splits these rows into columns positionally, so the
     // order decides each column's width. A HashMap group-by would reshuffle the
     // popup between runs.
-    let mut expected: Vec<(Action, &str)> = Vec::new();
+    //
+    // Rows are identified by their leading key, not by help text alone: two
+    // distinct verbs are free to share the same help string, and comparing only
+    // that column would let such a pair swap places undetected. A key appears in
+    // `bindings` once, so the first label of each row names it uniquely.
+    let mut seen: Vec<(Action, &str)> = Vec::new();
+    let mut expected: Vec<(String, &str)> = Vec::new();
     for b in keymap::bindings() {
-        if !expected.contains(&(b.action, b.help)) {
-            expected.push((b.action, b.help));
+        if !seen.contains(&(b.action, b.help)) {
+            seen.push((b.action, b.help));
+            expected.push((keymap::key_label(b.key), b.help));
         }
     }
 
-    let actual: Vec<&str> = keymap::cheatsheet_rows()
+    let actual: Vec<(String, &str)> = keymap::cheatsheet_rows()
         .iter()
-        .map(|(_, help)| *help)
+        .map(|(label, help)| {
+            let first = label.split('/').next().expect("split yields one part");
+            (first.to_string(), *help)
+        })
         .collect();
-    let expected: Vec<&str> = expected.into_iter().map(|(_, help)| help).collect();
     assert_eq!(actual, expected);
 }

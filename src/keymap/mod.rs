@@ -94,6 +94,14 @@ pub fn bindings() -> &'static [Binding] {
             action: Action::EditTitle,
             help: "edit title",
         },
+        // `Enter` is the natural "open this row" affordance; for now it is an
+        // alias of `e`. Overlay keys are routed before the keymap, so this never
+        // shadows Enter-to-submit inside an overlay.
+        Binding {
+            key: KeyCode::Enter,
+            action: Action::EditTitle,
+            help: "edit title",
+        },
         Binding {
             key: KeyCode::Char('d'),
             action: Action::EditDue,

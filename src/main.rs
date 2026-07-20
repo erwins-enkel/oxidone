@@ -179,10 +179,30 @@ async fn run(
     let mut model = Model::new();
     model.editor_available = editor.is_some();
     model.api_available = api.is_some();
+    // Sidebar meters for every cached List, *before* the seed `ListsLoaded`:
+    // `set_lists`'s lazy fan-out reads `list_counts` to decide which Lists still
+    // need fetching, so an empty map here would make it treat every List as
+    // uncovered. `recount` is independent of `model.lists`, so seeding it first is
+    // safe.
+    recount(&cache, &mut model);
+    // Enforce that ordering. The pure-reducer tests seed coverage via
+    // `CountsLoaded` and so cannot observe this main-loop sequencing; this fires
+    // only on the genuine regression — the cache holds Tasks but `recount` did not
+    // fill the meters before `set_lists`. A cold cache leaves both empty and
+    // passes. The debug-only re-read treats a cache error as "empty" so it never
+    // panics on a read fault.
+    debug_assert!(
+        model.has_seeded_meters()
+            || cache
+                .lock()
+                .unwrap()
+                .list_counts()
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+        "recount must populate list_counts before the seed ListsLoaded"
+    );
     let seed = update(&mut model, Message::ListsLoaded(initial_lists));
     seed_tasks_from_cache(&mut model, seed, &cache);
-    // Sidebar meters for every cached List, before anything touches the network.
-    recount(&cache, &mut model);
     if let Some(reason) = load_error {
         update(&mut model, Message::LoadFailed(reason));
     }
@@ -258,7 +278,10 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                         Ok(tasks) => Message::TasksLoaded(list, tasks),
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to read cached tasks");
-                            Message::LoadFailed(format!("failed to read tasks: {e}"))
+                            Message::TasksLoadFailed {
+                                list,
+                                reason: format!("failed to read tasks: {e}"),
+                            }
                         }
                     };
                     let _ = tx.send(message);
@@ -837,9 +860,15 @@ fn spawn_load_tasks(
         let message = match sync::fetch_active_tasks(api.as_ref(), &list).await {
             Ok(tasks) => match sync::mirror_tasks(&cache.lock().unwrap(), &list, &tasks) {
                 Ok(cached) => Message::TasksLoaded(list, cached),
-                Err(e) => Message::LoadFailed(format!("failed to cache tasks: {e}")),
+                Err(e) => Message::TasksLoadFailed {
+                    list,
+                    reason: format!("failed to cache tasks: {e}"),
+                },
             },
-            Err(e) => Message::LoadFailed(format!("failed to load tasks: {e}")),
+            Err(e) => Message::TasksLoadFailed {
+                list,
+                reason: format!("failed to load tasks: {e}"),
+            },
         };
         let _ = tx.send(message);
     });

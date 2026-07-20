@@ -5,7 +5,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Message, Model};
-use oxidone::domain::{List, Task};
+use oxidone::domain::{List, ListId, Task};
+use std::collections::HashMap;
 
 fn press(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -33,8 +34,12 @@ async fn list_with_tasks(titles: &[&str]) -> (List, Vec<Task>) {
     (l, tasks)
 }
 
+/// The startup cascade is a **lazy** fan-out: with an empty aggregate (nothing
+/// mirrored yet) every List is uncovered, so `set_lists` requests Tasks for all of
+/// them — the active List first (via `request_selected_tasks`), then the rest — so
+/// a List never opened on this machine still gets a sidebar meter.
 #[tokio::test]
-async fn loading_lists_requests_tasks_for_the_selected_list() {
+async fn loading_lists_fans_out_to_uncovered_lists_active_first() {
     let api = FakeTasksApi::new();
     api.insert_list("Work").await.unwrap();
     api.insert_list("Home").await.unwrap();
@@ -42,7 +47,167 @@ async fn loading_lists_requests_tasks_for_the_selected_list() {
 
     let mut m = Model::new();
     let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
-    assert_eq!(cmds, vec![Command::LoadTasks(lists[0].id.clone())]);
+    assert_eq!(
+        cmds,
+        vec![
+            Command::LoadTasks(lists[0].id.clone()),
+            Command::LoadTasks(lists[1].id.clone()),
+        ]
+    );
+}
+
+/// A List the cache aggregate already covers is left alone at startup — its meter
+/// is already drawable, and re-fetching it would be the network churn the lazy
+/// policy exists to avoid.
+#[tokio::test]
+async fn startup_fan_out_skips_lists_the_aggregate_covers() {
+    let api = FakeTasksApi::new();
+    api.insert_list("Work").await.unwrap();
+    api.insert_list("Home").await.unwrap();
+    let lists = api.list_lists().await.unwrap();
+    let (work, home) = (lists[0].id.clone(), lists[1].id.clone());
+
+    let mut m = Model::new();
+    // Recount runs before the seed; stand in for it by covering Home.
+    let mut counts = HashMap::new();
+    counts.insert(home, (1usize, 2usize));
+    update(&mut m, Message::CountsLoaded(counts));
+
+    let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
+    // Work (active) is emitted; Home is covered, so it is not re-fetched.
+    assert_eq!(cmds, vec![Command::LoadTasks(work)]);
+}
+
+/// A manual Refresh is a **full** fan-out: every List's Tasks, even ones the
+/// aggregate already covers, because `r` promises the latest from Google for
+/// *all* meters. Active List first, then the rest in List order.
+#[tokio::test]
+async fn a_full_refresh_fans_out_to_every_list_active_first() {
+    let api = FakeTasksApi::new();
+    api.insert_list("Work").await.unwrap();
+    api.insert_list("Home").await.unwrap();
+    api.insert_list("Play").await.unwrap();
+    let lists = api.list_lists().await.unwrap();
+    let (work, home, play) = (
+        lists[0].id.clone(),
+        lists[1].id.clone(),
+        lists[2].id.clone(),
+    );
+
+    let mut m = Model::new();
+    m.api_available = true;
+    update(&mut m, Message::ListsLoaded(lists.clone()));
+    // Work is active. Cover every List, so only a *full* refresh re-fetches them.
+    let mut counts = HashMap::new();
+    counts.insert(work.clone(), (0usize, 1usize));
+    counts.insert(home.clone(), (0usize, 1usize));
+    counts.insert(play.clone(), (0usize, 1usize));
+    update(&mut m, Message::CountsLoaded(counts));
+
+    update(&mut m, press('r'));
+    let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
+    assert_eq!(
+        cmds,
+        vec![
+            Command::LoadTasks(work),
+            Command::LoadTasks(home),
+            Command::LoadTasks(play),
+        ]
+    );
+}
+
+/// The full-fan-out flag is consumed by the one cascade it triggers: a second
+/// `ListsLoaded` with no fresh `r` is lazy again, so covered Lists stay untouched.
+#[tokio::test]
+async fn the_full_refresh_flag_is_consumed_after_one_cascade() {
+    let api = FakeTasksApi::new();
+    api.insert_list("Work").await.unwrap();
+    api.insert_list("Home").await.unwrap();
+    let lists = api.list_lists().await.unwrap();
+    let (work, home) = (lists[0].id.clone(), lists[1].id.clone());
+
+    let mut m = Model::new();
+    m.api_available = true;
+    update(&mut m, Message::ListsLoaded(lists.clone())); // Work active
+    let mut counts = HashMap::new();
+    counts.insert(work.clone(), (0usize, 1usize));
+    counts.insert(home, (0usize, 1usize));
+    update(&mut m, Message::CountsLoaded(counts));
+
+    update(&mut m, press('r'));
+    update(&mut m, Message::ListsLoaded(lists.clone()));
+    // That full cascade consumed the flag. With no new `r` this one is lazy, and
+    // every List is covered, so only the active List is (re-)requested.
+    let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
+    assert_eq!(cmds, vec![Command::LoadTasks(work)]);
+}
+
+/// An offline `r` returns before setting the flag, so it never latches a `full`
+/// into the next (lazy) cascade.
+#[tokio::test]
+async fn an_offline_refresh_does_not_latch_the_full_flag() {
+    let api = FakeTasksApi::new();
+    api.insert_list("Work").await.unwrap();
+    api.insert_list("Home").await.unwrap();
+    let lists = api.list_lists().await.unwrap();
+    let (work, home) = (lists[0].id.clone(), lists[1].id.clone());
+
+    let mut m = Model::new();
+    m.api_available = false;
+    let mut counts = HashMap::new();
+    counts.insert(work.clone(), (0usize, 1usize));
+    counts.insert(home, (0usize, 1usize));
+    update(&mut m, Message::CountsLoaded(counts));
+    update(&mut m, Message::ListsLoaded(lists.clone())); // Work active
+
+    assert!(
+        update(&mut m, press('r')).is_empty(),
+        "offline r emits nothing"
+    );
+    // The flag never set: the next cascade stays lazy (all covered → active only).
+    let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
+    assert_eq!(cmds, vec![Command::LoadTasks(work)]);
+}
+
+/// A background List's load failure is dropped: no `TasksLoaded` means no counts,
+/// means no meter on that row — the fail-closed state — and it must not overwrite
+/// the active pane's status line.
+#[tokio::test]
+async fn a_background_lists_load_failure_is_dropped() {
+    let (l, tasks) = list_with_tasks(&["a"]).await;
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
+
+    update(
+        &mut m,
+        Message::TasksLoadFailed {
+            list: ListId("other".to_string()),
+            reason: "boom".to_string(),
+        },
+    );
+    assert_eq!(
+        m.status_line, None,
+        "a background List's failure must not touch the status line"
+    );
+}
+
+/// The active List's load failure does reach the status line.
+#[tokio::test]
+async fn the_active_lists_load_failure_reaches_the_status_line() {
+    let (l, tasks) = list_with_tasks(&["a"]).await;
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
+
+    update(
+        &mut m,
+        Message::TasksLoadFailed {
+            list: l.id.clone(),
+            reason: "boom".to_string(),
+        },
+    );
+    assert_eq!(m.status_line.as_deref(), Some("boom"));
 }
 
 #[tokio::test]

@@ -643,6 +643,7 @@ mod tests {
     use super::*;
     use crate::domain::{ListId, TaskId};
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
     /// The smallest terminal oxidone supports; the cheatsheet must fit it whole.
@@ -780,7 +781,7 @@ mod tests {
 
     /// Draw `rows` into a `size` frame and return the buffer, line by line,
     /// alongside the layout that produced it.
-    fn drawn(size: (u16, u16), rows: &[HelpRow]) -> (Vec<String>, HelpLayout) {
+    fn drawn(size: (u16, u16), rows: &[HelpRow]) -> (Vec<String>, Buffer, HelpLayout) {
         let (width, height) = size;
         let mut terminal =
             Terminal::new(TestBackend::new(width, height)).expect("TestBackend terminal");
@@ -797,7 +798,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        (lines, help_layout(frame_of(size), rows))
+        (lines, buffer, help_layout(frame_of(size), rows))
     }
 
     /// The cell text column `c` draws for `row`, padding included.
@@ -813,6 +814,15 @@ mod tests {
         format!(" {label:<width$} {help}", width = widths.label)
     }
 
+    /// Where `needle` starts in `line`, counted in cells rather than bytes.
+    ///
+    /// `str::find` answers in bytes, and the popup's border glyphs are three
+    /// bytes each — so a byte offset indexes the wrong buffer cell as soon as
+    /// anything non-ASCII precedes the match.
+    fn cell_offset(line: &str, needle: &str) -> Option<usize> {
+        line.find(needle).map(|byte| line[..byte].chars().count())
+    }
+
     /// Where each column's cells start, discovered from the buffer rather than
     /// recomputed from `centered`'s arithmetic — a test that recomputed the
     /// origin would agree with a renderer that placed the popup wrongly.
@@ -823,7 +833,7 @@ mod tests {
                 let needle = cell_text(first, layout, c);
                 lines
                     .iter()
-                    .find_map(|line| line.find(&needle))
+                    .find_map(|line| cell_offset(line, &needle))
                     .unwrap_or_else(|| panic!("column {c} not found in the buffer"))
             })
             .collect()
@@ -832,7 +842,7 @@ mod tests {
     #[test]
     fn every_row_is_drawn_padded_and_column_aligned() {
         let rows = help_rows();
-        let (lines, layout) = drawn(MIN_TERM, &rows);
+        let (lines, _, layout) = drawn(MIN_TERM, &rows);
         assert_eq!(layout.hidden, 0, "fixture should show every row");
 
         // Content: every row present, with its padding, on a single line. A
@@ -855,7 +865,7 @@ mod tests {
                 let needle = cell_text(row, &layout, c);
                 let found = lines
                     .iter()
-                    .find_map(|line| line.find(&needle))
+                    .find_map(|line| cell_offset(line, &needle))
                     .expect("cell present");
                 assert_eq!(found, *offset, "column {c} is ragged at {needle:?}");
             }
@@ -874,39 +884,39 @@ mod tests {
     fn the_keys_keep_their_accent() {
         // Buffer text alone cannot tell two spans from one: collapsing the cell
         // into a single format string renders identically and loses the accent.
+        //
+        // Every column, every row — the last column takes the other branch of
+        // `help_cell_spans` (its help is unpadded), so checking only the first
+        // would leave that branch's styling unasserted.
         let rows = help_rows();
-        let (lines, layout) = drawn(MIN_TERM, &rows);
+        let (lines, buffer, layout) = drawn(MIN_TERM, &rows);
         let theme = Theme::from_flavor("mocha");
 
         let offsets = column_offsets(&lines, &layout, &rows);
-        let first = &layout.column_rows(0, &rows)[0];
-        let needle = cell_text(first, &layout, 0);
-        let y = lines
-            .iter()
-            .position(|line| line.contains(&needle))
-            .expect("first cell present");
+        for (c, offset) in offsets.iter().enumerate() {
+            for row in layout.column_rows(c, &rows) {
+                let needle = cell_text(row, &layout, c);
+                let y = lines
+                    .iter()
+                    .position(|line| line.contains(&needle))
+                    .expect("cell present") as u16;
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(MIN_TERM.0, MIN_TERM.1)).expect("TestBackend terminal");
-        terminal
-            .draw(|frame| draw_help(frame, frame_of(MIN_TERM), &rows, &theme))
-            .expect("draw");
-        let buffer = terminal.backend().buffer().clone();
-
-        // The label sits one cell past the leading space; the help follows the
-        // label's field and its separating space.
-        let label_x = offsets[0] + 1;
-        let help_x = offsets[0] + 1 + layout.cols[0].label + 1;
-        assert_eq!(
-            buffer[(label_x as u16, y as u16)].fg,
-            theme.accent,
-            "key label lost its accent"
-        );
-        assert_eq!(
-            buffer[(help_x as u16, y as u16)].fg,
-            theme.text,
-            "help text is not the body colour"
-        );
+                // The label sits one cell past the leading space; the help
+                // follows the label's field and its separating space.
+                let label_x = (offset + 1) as u16;
+                let help_x = (offset + 1 + layout.cols[c].label + 1) as u16;
+                assert_eq!(
+                    buffer[(label_x, y)].fg,
+                    theme.accent,
+                    "column {c}: key label lost its accent at {needle:?}"
+                );
+                assert_eq!(
+                    buffer[(help_x, y)].fg,
+                    theme.text,
+                    "column {c}: help text is not the body colour at {needle:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -916,7 +926,7 @@ mod tests {
         // wrong on its own.
         let rows = help_rows();
         let size = (80, 12);
-        let (lines, layout) = drawn(size, &rows);
+        let (lines, _, layout) = drawn(size, &rows);
 
         assert_eq!(layout.cols.len(), 2);
         assert!(layout.hidden > 0, "fixture should overflow vertically");
@@ -942,13 +952,21 @@ mod tests {
             );
         }
 
-        // The tail is absent, and the popup says so.
+        // The tail is absent, and the popup says so. Matched as a rendered
+        // cell rather than a bare help string: help text is not unique enough
+        // to search for on its own, so one row's help becoming a substring of
+        // another's would fail this spuriously. A hidden row belongs to no
+        // column, so it is checked against every column's padding — whichever
+        // one a regression drew it in.
         let shown = layout.cols.len() * layout.rows_per_col;
-        for (label, help) in &rows[shown..] {
-            assert!(
-                !lines.iter().any(|line| line.contains(help.trim())),
-                "hidden row {label:?} was drawn anyway"
-            );
+        for row in &rows[shown..] {
+            for c in 0..layout.cols.len() {
+                let needle = cell_text(row, &layout, c);
+                assert!(
+                    !lines.iter().any(|line| line.contains(&needle)),
+                    "hidden row {needle:?} was drawn in column {c}"
+                );
+            }
         }
         let notice = overflow_notice(&layout).expect("overflow at 80x12");
         assert!(
@@ -961,7 +979,7 @@ mod tests {
     fn a_narrow_frame_announces_the_clip_in_the_buffer() {
         let rows = help_rows();
         let size = (30, 24);
-        let (lines, layout) = drawn(size, &rows);
+        let (lines, _, layout) = drawn(size, &rows);
 
         let notice = overflow_notice(&layout).expect("overflow at 30x24");
         assert!(
@@ -976,7 +994,7 @@ mod tests {
         // stop at the shorter column and drop row 27 — present in the layout,
         // absent from the screen, with the gate still green.
         let rows = synthetic_rows(27);
-        let (lines, layout) = drawn(MIN_TERM, &rows);
+        let (lines, _, layout) = drawn(MIN_TERM, &rows);
 
         assert_eq!(layout.hidden, 0);
         assert!(

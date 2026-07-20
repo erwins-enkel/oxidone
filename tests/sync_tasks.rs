@@ -119,3 +119,26 @@ async fn load_tasks_mirrors_deletions_per_list() {
     // The other List's cache is untouched.
     assert_eq!(cache.tasks(&home.id).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_typed_title_survives_the_round_trip_through_google_and_the_cache() {
+    // The type is derived from the title, so it only sticks if the raw string
+    // survives the write, the fetch, and the mirror unchanged. Pure `parse`
+    // tests cannot show that — this is the seam that can.
+    use oxidone::domain::EntryType;
+
+    let api = FakeTasksApi::new();
+    let cache = Cache::open_in_memory().unwrap();
+    let l = api.insert_list("Work").await.unwrap();
+    api.insert_task(&l.id, new_task("○ Standup")).await.unwrap();
+
+    let loaded = sync::load_tasks(&api, &cache, &l.id).await.unwrap();
+    assert_eq!(loaded[0].entry_type(), EntryType::Event);
+    assert_eq!(loaded[0].display_title(), "Standup");
+
+    // And again straight out of the cache, with no API in the path.
+    let cached = cache.tasks(&l.id).unwrap();
+    assert_eq!(cached[0].title, "○ Standup"); // raw, per ADR-0003
+    assert_eq!(cached[0].entry_type(), EntryType::Event);
+    assert_eq!(cached[0].display_title(), "Standup");
+}

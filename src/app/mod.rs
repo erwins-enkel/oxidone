@@ -273,11 +273,14 @@ impl Model {
                 }
                 groups.sort_by_cached_key(|g| due_key(group_due_key(g)));
             }
+            // Sorts on the *display* title: U+2014 sorts above every ASCII
+            // letter, so sorting raw would exile every typed entry to the tail
+            // and separate it from the Tasks it reads alongside.
             SortView::Title => {
                 for group in &mut groups {
-                    group[1..].sort_by_cached_key(|t| t.title.to_lowercase());
+                    group[1..].sort_by_cached_key(|t| t.display_title().to_lowercase());
                 }
-                groups.sort_by_cached_key(|g| g[0].title.to_lowercase());
+                groups.sort_by_cached_key(|g| g[0].display_title().to_lowercase());
             }
         }
         groups.into_iter().flatten().collect()
@@ -1042,11 +1045,13 @@ fn focused_task(model: &Model) -> Option<&Task> {
     model.selected_task.and_then(|i| model.tasks.get(i))
 }
 
+/// Open the title editor on the *display* title, so a typed entry's glyph never
+/// enters a buffer the user types into. `finish_edit_title` re-applies the type.
 fn open_edit_title(model: &mut Model) {
     if let Some(task) = focused_task(model) {
         model.overlay = Some(Overlay::EditTitle {
             task: task.id.clone(),
-            buffer: task.title.clone(),
+            buffer: task.display_title().to_string(),
         });
     }
 }
@@ -1551,7 +1556,8 @@ fn open_delete_confirm(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    let (id, title) = (task.id.clone(), task.title.clone());
+    // The display title: a destructive prompt is no place to leak the encoding.
+    let (id, title) = (task.id.clone(), task.display_title().to_string());
     let Some(list) = model.selected_list_id().cloned() else {
         return;
     };
@@ -1763,9 +1769,24 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
     }
 }
 
+/// Save an edited title, re-applying the entry's type.
+///
+/// Two orderings here are load-bearing.
+///
+/// **The empty-check runs before `apply`.** Applying first would turn a cleared
+/// Note title into a bare `"— "` — a title that is pure encoding with no content.
+///
+/// **The type is read now, not when the overlay opened.** A type change landing
+/// mid-edit (a refetch, a reconcile) is therefore preserved rather than reverted
+/// by a stale capture.
+///
+/// Uses [`EntryType::apply`], never `retype`: this path must not strip. Opening
+/// `e` on a title Google wrote as `"○Standup"` and pressing Enter unchanged has
+/// to write it back byte-identical — a keystroke meaning "save what is already
+/// there" must not silently delete a character.
 fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Command> {
-    let title = buffer.trim().to_string();
-    if title.is_empty() {
+    let display = buffer.trim();
+    if display.is_empty() {
         return Vec::new(); // cancel silently on an empty title
     }
     // Single-flight: don't lose the edit silently if a write is already running.
@@ -1779,6 +1800,7 @@ fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Com
     let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
         return Vec::new();
     };
+    let title = model.tasks[index].entry_type().apply(display);
     model
         .pending_writes
         .insert(task.clone(), model.tasks[index].clone());

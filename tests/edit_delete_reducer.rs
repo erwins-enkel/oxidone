@@ -213,3 +213,144 @@ async fn a_confirmed_delete_is_final_and_cannot_be_rolled_back() {
     );
     assert_eq!(m.tasks.len(), 1);
 }
+
+// --- Entry types and the edit path -----------------------------------------
+//
+// The type lives in the title, so `e` has to strip it on open and re-apply it on
+// save. Critically it re-applies with `EntryType::apply`, which never strips —
+// only `t`/`T` repair a title, and only because they are rebuilding a prefix.
+
+/// One task with `title` exactly as Google would return it, cursor on it.
+async fn model_with_raw_title(title: &str) -> (Model, List, Vec<Task>) {
+    let api = FakeTasksApi::new();
+    let l = api.insert_list("L").await.unwrap();
+    api.insert_task(
+        &l.id,
+        NewTask {
+            title: title.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let tasks = api.list_tasks(&l.id, true, false, None).await.unwrap();
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
+    update(&mut m, key(KeyCode::Tab));
+    (m, l, tasks)
+}
+
+#[tokio::test]
+async fn e_opens_a_typed_entry_on_its_display_title_without_the_glyph() {
+    let (mut m, _l, _t) = model_with_raw_title("○ Standup").await;
+    update(&mut m, ch('e'));
+    match &m.overlay {
+        Some(Overlay::EditTitle { buffer, .. }) => assert_eq!(buffer, "Standup"),
+        other => panic!("expected EditTitle overlay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn editing_a_notes_title_preserves_its_type() {
+    let (mut m, _l, _t) = model_with_raw_title("— idea").await;
+    update(&mut m, ch('e'));
+    for _ in 0.."idea".len() {
+        update(&mut m, key(KeyCode::Backspace));
+    }
+    typed(&mut m, "better idea");
+    update(&mut m, key(KeyCode::Enter));
+    assert_eq!(m.tasks[0].title, "— better idea");
+}
+
+#[tokio::test]
+async fn editing_an_untyped_title_does_not_acquire_a_type() {
+    let (mut m, _l, _t) = model_with_raw_title("alpha").await;
+    update(&mut m, ch('e'));
+    typed(&mut m, "!");
+    update(&mut m, key(KeyCode::Enter));
+    assert_eq!(m.tasks[0].title, "alpha!");
+}
+
+#[tokio::test]
+async fn saving_a_foreign_glyph_title_unchanged_writes_it_back_byte_identical() {
+    // "○Standup" — no space — is glyph-prefixed but not canonical, so it parses
+    // as an untyped Task whose display title still leads with the glyph. Pressing
+    // Enter without editing means "save what is already there"; a stripping
+    // re-apply here would silently write "Standup" instead.
+    let (mut m, _l, _t) = model_with_raw_title("○Standup").await;
+    update(&mut m, ch('e'));
+    let cmds = update(&mut m, key(KeyCode::Enter));
+
+    assert_eq!(m.tasks[0].title, "○Standup");
+    match cmds.as_slice() {
+        [Command::SetTitle { title, .. }] => assert_eq!(title, "○Standup"),
+        other => panic!("expected one SetTitle, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn clearing_a_notes_title_writes_nothing_rather_than_a_bare_glyph() {
+    // The empty-check must run before the type is re-applied, or this writes
+    // "— " — pure encoding with no content.
+    let (mut m, _l, _t) = model_with_raw_title("— idea").await;
+    update(&mut m, ch('e'));
+    for _ in 0.."idea".len() {
+        update(&mut m, key(KeyCode::Backspace));
+    }
+    let cmds = update(&mut m, key(KeyCode::Enter));
+
+    assert!(cmds.is_empty());
+    assert_eq!(m.tasks[0].title, "— idea"); // untouched
+}
+
+#[tokio::test]
+async fn a_bare_glyph_is_a_legitimate_title_and_is_saved() {
+    // A Task may be titled "—" today, so a Note must be able to be too. The
+    // result round-trips: raw "— —" parses back to a Note titled "—".
+    let (mut m, _l, _t) = model_with_raw_title("— idea").await;
+    update(&mut m, ch('e'));
+    for _ in 0.."idea".len() {
+        update(&mut m, key(KeyCode::Backspace));
+    }
+    typed(&mut m, "—");
+    update(&mut m, key(KeyCode::Enter));
+
+    assert_eq!(m.tasks[0].title, "— —");
+    assert_eq!(m.tasks[0].entry_type(), oxidone::domain::EntryType::Note);
+    assert_eq!(m.tasks[0].display_title(), "—");
+}
+
+#[tokio::test]
+async fn a_type_change_landing_mid_edit_is_preserved_not_reverted() {
+    // The type is read at save time, not captured when the overlay opened — so a
+    // refetch that retypes the entry underneath the editor is not clobbered.
+    let (mut m, _l, tasks) = model_with_raw_title("alpha").await;
+    update(&mut m, ch('e'));
+    typed(&mut m, "!");
+
+    // A reconcile arrives while the editor is open: the entry is now an Event.
+    update(
+        &mut m,
+        Message::TaskUpdated(Task {
+            title: "○ alpha".to_string(),
+            ..tasks[0].clone()
+        }),
+    );
+    update(&mut m, key(KeyCode::Enter));
+
+    assert_eq!(m.tasks[0].title, "○ alpha!");
+}
+
+#[tokio::test]
+async fn the_delete_prompt_shows_the_display_title_not_the_glyph() {
+    let (mut m, _l, _t) = model_with_raw_title("○ Standup").await;
+    update(&mut m, ch('x'));
+    match &m.overlay {
+        Some(Overlay::Confirm(c)) => {
+            assert!(c.prompt.contains("Standup"), "{:?}", c.prompt);
+            assert!(!c.prompt.contains('○'), "glyph leaked: {:?}", c.prompt);
+        }
+        other => panic!("expected a Confirm overlay, got {other:?}"),
+    }
+}

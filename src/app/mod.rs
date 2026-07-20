@@ -936,9 +936,11 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    let parent = match &task.parent {
-        Some(p) => p.clone(),
-        None => task.id.clone(),
+    // A Subtask adds a sibling under its own parent; anything the pane draws at
+    // top level — including an orphan whose parent is gone — parents it directly.
+    let parent = match task.parent.clone() {
+        Some(p) if model.top_level_ids().contains(&p) => p,
+        _ => task.id.clone(),
     };
     model.overlay = Some(Overlay::AddSubtask {
         parent,
@@ -957,9 +959,12 @@ fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<
         return Vec::new();
     };
     let Some(pidx) = model.tasks.iter().position(|t| t.id == parent) else {
-        return Vec::new(); // parent vanished (e.g. a refresh dropped it)
+        // The parent went while the overlay was open (a refresh dropped it, or a
+        // delete landed). Say so rather than swallowing the keystroke.
+        model.status_line = Some("that task is gone — refresh (r)".to_string());
+        return Vec::new();
     };
-    if model.tasks[pidx].parent.is_some() {
+    if renders_as_subtask(&model.top_level_ids(), &model.tasks[pidx]) {
         model.status_line = Some("subtasks can't have subtasks (one level max)".to_string());
         return Vec::new();
     }
@@ -1052,7 +1057,7 @@ fn indent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    if model.tasks[idx].parent.is_some() {
+    if renders_as_subtask(&model.top_level_ids(), &model.tasks[idx]) {
         model.status_line = Some("already a subtask (one level max)".to_string());
         return Vec::new();
     }
@@ -1094,10 +1099,16 @@ fn outdent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    let Some(parent_id) = model.tasks[idx].parent.clone() else {
+    // An orphan already draws at top level, so there is nothing to outdent — and
+    // emitting a Move would hand Google a `previous` id that no longer exists.
+    if !renders_as_subtask(&model.top_level_ids(), &model.tasks[idx]) {
         model.status_line = Some("not a subtask".to_string());
         return Vec::new();
-    };
+    }
+    let parent_id = model.tasks[idx]
+        .parent
+        .clone()
+        .expect("renders_as_subtask implies a present parent");
     let task_id = model.tasks[idx].id.clone();
     let snapshot = model.tasks.clone();
     model.tasks[idx].parent = None;

@@ -593,3 +593,52 @@ fn a_failed_move_leaves_the_cursor_on_the_moved_task() {
         "the cursor stays on the Task, not the index it was parked at",
     );
 }
+
+// ---- an orphan is top-level to the verbs, as it is on screen -----------------
+
+/// Deleting a parent leaves its children orphaned locally. Those rows draw
+/// flush-left and group as top-level, so the verbs must agree: anything else is
+/// the pane saying one thing and the keys doing another.
+#[test]
+fn add_subtask_on_an_orphan_nests_under_it() {
+    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
+    m.selected_task = Some(1);
+
+    update(&mut m, ch('o'));
+    typed(&mut m, "child");
+    let cmds = update(&mut m, key(KeyCode::Enter));
+
+    assert_eq!(cmds.len(), 1, "must not silently do nothing");
+    assert_eq!(
+        m.tasks[2].parent,
+        Some(tid("orphan")),
+        "nests under the orphan, which is what the pane shows as top-level",
+    );
+}
+
+#[test]
+fn indent_on_an_orphan_is_allowed() {
+    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
+    m.selected_task = Some(1);
+
+    let cmds = update(&mut m, ch('>'));
+
+    assert_eq!(cmds.len(), 1, "a row drawn at top level can be indented");
+    assert_eq!(m.tasks[1].parent, Some(tid("A")));
+}
+
+#[test]
+fn outdent_on_an_orphan_reports_it_is_already_top_level() {
+    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
+    m.selected_task = Some(1);
+
+    let cmds = update(&mut m, ch('<'));
+
+    assert!(cmds.is_empty());
+    assert_eq!(m.status_line.as_deref(), Some("not a subtask"));
+    assert_eq!(
+        m.tasks[1].parent,
+        Some(tid("gone")),
+        "no Move is emitted, so the dangling parent is left for the refresh",
+    );
+}

@@ -133,14 +133,42 @@ fn a_typed_entry_draws_its_signifier_before_the_title() {
 fn an_all_task_pane_draws_no_signifier_cell_at_all() {
     // Conditional like the due gutter: on the overwhelmingly common all-Task
     // pane, a column of blanks would spend width to say "ordinary".
-    let model = model_with(vec![task("1", "alpha"), task("2", "beta")]);
-    let drawn = rows(&model, false);
+    //
+    // Asserted as a *column delta* against a pane that does carry the cell.
+    // Substring checks cannot do this job: a wrongly-present cell renders the
+    // row as "    beta", which still contains "  beta" — the assertion would
+    // hold while the bug shipped.
+    let plain = rows(&model_with(vec![task("1", "alpha")]), false);
+    let mixed = rows(
+        &model_with(vec![task("1", "alpha"), task("2", "○ standup")]),
+        false,
+    );
 
-    let alpha = row_with(&drawn, "alpha");
-    let beta = row_with(&drawn, "beta");
-    // The cursor gutter is the only thing between the border and the title.
-    assert!(alpha.contains("› alpha"), "{alpha:?}");
-    assert!(beta.contains("  beta"), "{beta:?}");
+    let without = column_where(row_with(&plain, "alpha"), "alpha");
+    let with = column_where(row_with(&mixed, "alpha"), "alpha");
+
+    // Adding a typed sibling shifts every title right by exactly the cell's
+    // width, blank rows included — so the delta is the assertion that fails if
+    // the cell is drawn unconditionally.
+    let cell = signifier_width();
+    assert_eq!(
+        with - without,
+        cell,
+        "an all-Task pane should sit {cell} columns left of a mixed one:\n\
+         plain: {:?}\nmixed: {:?}",
+        row_with(&plain, "alpha"),
+        row_with(&mixed, "alpha"),
+    );
+    // And nothing at all sits between the cursor gutter and the title.
+    assert!(row_with(&plain, "alpha").contains("› alpha"));
+}
+
+/// The signifier cell's width, derived from a rendered pane rather than
+/// restated: the gap between a typed row's glyph and its title.
+fn signifier_width() -> usize {
+    let drawn = rows(&model_with(vec![task("1", "○ standup")]), false);
+    let row = row_with(&drawn, "standup");
+    column_where(row, "standup") - column_of(row, '○')
 }
 
 #[test]

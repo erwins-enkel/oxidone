@@ -5,7 +5,7 @@
 
 use chrono::{NaiveDate, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use oxidone::app::{update, Command, Message, Model, Overlay};
+use oxidone::app::{renders_as_subtask, update, Command, Message, Model, Overlay};
 use oxidone::domain::{List, ListId, SortView, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> Message {
@@ -594,51 +594,49 @@ fn a_failed_move_leaves_the_cursor_on_the_moved_task() {
     );
 }
 
-// ---- an orphan is top-level to the verbs, as it is on screen -----------------
+// ---- an orphan is drawn top-level but is never written to ---------------------
 
-/// Deleting a parent leaves its children orphaned locally. Those rows draw
-/// flush-left and group as top-level, so the verbs must agree: anything else is
-/// the pane saying one thing and the keys doing another.
+/// Deleting a parent orphans its children locally, and Google deletes Subtasks
+/// with their parent — so the row is probably already gone server-side. It draws
+/// flush-left (grouping treats it as its own row), but every verb that would
+/// write refuses with one reason, rather than nesting a child under a vanishing
+/// row or Moving against a `previous` id the server has dropped.
 #[test]
-fn add_subtask_on_an_orphan_nests_under_it() {
-    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
-    m.selected_task = Some(1);
+fn every_write_verb_refuses_on_an_orphan_with_the_same_reason() {
+    for verb in ['o', '>', '<', 'J', 'K'] {
+        let mut m = model_with(vec![
+            task("A", None),
+            task("orphan", Some("gone")),
+            task("B", None),
+        ]);
+        m.selected_task = Some(1);
+        let before: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
 
-    update(&mut m, ch('o'));
-    typed(&mut m, "child");
-    let cmds = update(&mut m, key(KeyCode::Enter));
+        let cmds = update(&mut m, ch(verb));
 
-    assert_eq!(cmds.len(), 1, "must not silently do nothing");
-    assert_eq!(
-        m.tasks[2].parent,
-        Some(tid("orphan")),
-        "nests under the orphan, which is what the pane shows as top-level",
-    );
+        assert!(cmds.is_empty(), "{verb} must not write to an orphan");
+        assert_eq!(
+            m.status_line.as_deref(),
+            Some("its parent was deleted — refresh (r)"),
+            "{verb} must say why",
+        );
+        let after: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
+        assert_eq!(after, before, "{verb} must not reparent anything");
+    }
 }
 
+/// The pane still shows it at top level — the refusal is about writing, not about
+/// pretending it is nested.
 #[test]
-fn indent_on_an_orphan_is_allowed() {
-    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
-    m.selected_task = Some(1);
-
-    let cmds = update(&mut m, ch('>'));
-
-    assert_eq!(cmds.len(), 1, "a row drawn at top level can be indented");
-    assert_eq!(m.tasks[1].parent, Some(tid("A")));
-}
-
-#[test]
-fn outdent_on_an_orphan_reports_it_is_already_top_level() {
-    let mut m = model_with(vec![task("A", None), task("orphan", Some("gone"))]);
-    m.selected_task = Some(1);
-
-    let cmds = update(&mut m, ch('<'));
-
-    assert!(cmds.is_empty());
-    assert_eq!(m.status_line.as_deref(), Some("not a subtask"));
-    assert_eq!(
-        m.tasks[1].parent,
-        Some(tid("gone")),
-        "no Move is emitted, so the dangling parent is left for the refresh",
-    );
+fn an_orphan_still_renders_at_top_level() {
+    let m = model_with(vec![
+        task("A", None),
+        task("orphan", Some("gone")),
+        task("B", None),
+    ]);
+    assert_eq!(titles(&m.visible_tasks()), vec!["A", "B", "orphan"]);
+    assert!(!renders_as_subtask(
+        &m.top_level_ids(),
+        m.tasks.iter().find(|t| t.id == tid("orphan")).unwrap(),
+    ));
 }

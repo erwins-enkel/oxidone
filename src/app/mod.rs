@@ -332,6 +332,24 @@ impl Model {
     }
 }
 
+/// Shown when a verb is refused because the selected row is orphaned.
+const ORPHANED: &str = "its parent was deleted — refresh (r)";
+
+/// Whether `task` is orphaned: its `parent` names a Task no longer in the set,
+/// because the parent was deleted locally and a Refresh has not caught up.
+///
+/// Such a row draws flush-left (see [`renders_as_subtask`]) and groups as its own
+/// row, but it is *not* an ordinary top-level Task and no verb may write to it:
+/// Google deletes Subtasks along with their parent, so the row is very likely
+/// already gone server-side and any Move or insert we emit would race that. The
+/// verbs refuse with [`ORPHANED`] rather than nest a child under a row that is
+/// about to vanish, or Move against a `previous` id the server has dropped.
+fn is_orphaned(model: &Model, task: &Task) -> bool {
+    task.parent
+        .as_ref()
+        .is_some_and(|p| !model.tasks.iter().any(|t| &t.id == p))
+}
+
 /// Whether `task` should render indented, given `top_level` from the same Model
 /// (see [`Model::top_level_ids`]). True only when its parent is a present,
 /// top-level Task — which is exactly what [`Model::groups`] nests it under, so a
@@ -936,11 +954,14 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    // A Subtask adds a sibling under its own parent; anything the pane draws at
-    // top level — including an orphan whose parent is gone — parents it directly.
-    let parent = match task.parent.clone() {
-        Some(p) if model.top_level_ids().contains(&p) => p,
-        _ => task.id.clone(),
+    if is_orphaned(model, task) {
+        model.status_line = Some(ORPHANED.to_string());
+        return;
+    }
+    // A Subtask adds a sibling under its own parent; a top-level Task parents it.
+    let parent = match &task.parent {
+        Some(p) => p.clone(),
+        None => task.id.clone(),
     };
     model.overlay = Some(Overlay::AddSubtask {
         parent,
@@ -964,7 +985,7 @@ fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<
         model.status_line = Some("that task is gone — refresh (r)".to_string());
         return Vec::new();
     };
-    if renders_as_subtask(&model.top_level_ids(), &model.tasks[pidx]) {
+    if model.tasks[pidx].parent.is_some() {
         model.status_line = Some("subtasks can't have subtasks (one level max)".to_string());
         return Vec::new();
     }
@@ -1057,7 +1078,11 @@ fn indent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    if renders_as_subtask(&model.top_level_ids(), &model.tasks[idx]) {
+    if is_orphaned(model, &model.tasks[idx]) {
+        model.status_line = Some(ORPHANED.to_string());
+        return Vec::new();
+    }
+    if model.tasks[idx].parent.is_some() {
         model.status_line = Some("already a subtask (one level max)".to_string());
         return Vec::new();
     }
@@ -1099,16 +1124,14 @@ fn outdent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    // An orphan already draws at top level, so there is nothing to outdent — and
-    // emitting a Move would hand Google a `previous` id that no longer exists.
-    if !renders_as_subtask(&model.top_level_ids(), &model.tasks[idx]) {
-        model.status_line = Some("not a subtask".to_string());
+    if is_orphaned(model, &model.tasks[idx]) {
+        model.status_line = Some(ORPHANED.to_string());
         return Vec::new();
     }
-    let parent_id = model.tasks[idx]
-        .parent
-        .clone()
-        .expect("renders_as_subtask implies a present parent");
+    let Some(parent_id) = model.tasks[idx].parent.clone() else {
+        model.status_line = Some("not a subtask".to_string());
+        return Vec::new();
+    };
     let task_id = model.tasks[idx].id.clone();
     let snapshot = model.tasks.clone();
     model.tasks[idx].parent = None;
@@ -1130,6 +1153,10 @@ fn reorder(model: &mut Model, dir: isize) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
+    if is_orphaned(model, &model.tasks[idx]) {
+        model.status_line = Some(ORPHANED.to_string());
+        return Vec::new();
+    }
     let parent = model.tasks[idx].parent.clone();
     let sibs: Vec<usize> = model
         .tasks

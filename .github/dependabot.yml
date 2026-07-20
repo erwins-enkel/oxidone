@@ -1,0 +1,28 @@
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      # The ratatui line is bumped as a unit — see the Cargo.toml note:
+      # tui-textarea and catppuccin track ratatui's version.
+      tui-stack:
+        patterns:
+          - "ratatui"
+          - "crossterm"
+          - "tui-textarea"
+          - "catppuccin"
+
+  # CI actions are pinned to commit SHAs; Dependabot is what keeps them current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

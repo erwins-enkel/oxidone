@@ -22,13 +22,17 @@ name = "oxidone"
 path = "src/main.rs"
 
 [dependencies]
-# TUI — held at the ratatui 0.29 line: tui-textarea 0.7 and catppuccin 2 target
-# it, and `app` uses ratatui's re-exported crossterm (0.28) types directly.
-# Bump the whole stack together (ratatui + crossterm + tui-textarea + catppuccin)
-# once the companions ship 0.30-compatible releases.
+# TUI — held at the ratatui 0.29 line: catppuccin 2 targets it, and `app` uses
+# ratatui's re-exported crossterm (0.28) types directly.
+# Bump the whole stack together (ratatui + crossterm + catppuccin) once the
+# companions ship 0.30-compatible releases.
+#
+# NOTE: tui-textarea (the inline multiline fallback for when $EDITOR is unset)
+# was dropped here — it was declared but never used, and `cargo machete` fails
+# the gate on unused deps. Re-add it with `cargo add tui-textarea` in the same
+# change that actually wires up the editor fallback.
 ratatui = "0.29"
 crossterm = "0.28"
-tui-textarea = "0.7"      # inline multiline fallback when $EDITOR is unset
 catppuccin = { version = "2", features = ["ratatui"] }  # palette -> ratatui Color
 
 # Async runtime — scoped features only

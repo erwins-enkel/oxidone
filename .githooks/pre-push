@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Mirrors .github/workflows/ci.yml so a red tree is caught here, not in CI.
+# Enable once per clone: git config core.hooksPath .githooks
+# Emergency bypass: git push --no-verify
+set -euo pipefail
+
+# Git hooks run with a minimal PATH that often omits Cargo's bin dir, which
+# would make installed tools look missing.
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+
+echo "pre-push: cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "pre-push: cargo clippy --all-targets --all-features -- -D warnings"
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "pre-push: cargo test --all-features"
+cargo test --all-features
+
+# Unused-dependency audit. Optional locally (CI enforces it) so a missing
+# binary never blocks a push — but never silently: say what was skipped.
+if cargo machete --version >/dev/null 2>&1; then
+  echo "pre-push: cargo machete"
+  cargo machete
+else
+  echo "pre-push: SKIPPED cargo machete (not installed: cargo install cargo-machete)"
+fi
+
+echo "pre-push: ok"

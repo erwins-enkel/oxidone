@@ -21,6 +21,15 @@ pub struct Config {
     pub theme: String,
     /// Render ASCII block bars where braille glyphs are unavailable.
     pub ascii_fallback: bool,
+    /// Startup default for the "hide distant tasks" view filter: when on, entries
+    /// due more than `horizon_days` past today are hidden from the pane. A
+    /// keybinding (`w`) toggles it live; this only seeds the initial state.
+    pub hide_distant: bool,
+    /// The horizon for `hide_distant`, in days from today. Entries due strictly
+    /// more than this many days out are hidden while the filter is on. Undated
+    /// entries are never distant. Preserved across toggles (see the two-field
+    /// rationale in the design), so it holds even while `hide_distant` is off.
+    pub horizon_days: u16,
 }
 
 impl Default for Config {
@@ -29,6 +38,8 @@ impl Default for Config {
             client_secret_path: None,
             theme: "mocha".to_string(),
             ascii_fallback: false,
+            hide_distant: false,
+            horizon_days: 14,
         }
     }
 }

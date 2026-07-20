@@ -41,6 +41,8 @@ pub enum Action {
     DeleteTask,
     CycleSort,
     ToggleShowCompleted,
+    /// Hide/reveal entries due beyond the configured horizon (`hide_distant`).
+    ToggleHideDistant,
     /// Open a URL found in the selected Task's notes.
     OpenLink,
     ClearCompleted,
@@ -211,6 +213,16 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('c'),
             action: Action::ToggleShowCompleted,
             help: "show/hide completed",
+        },
+        // Beside `c`, the other silent view-toggle, and deliberately not at the
+        // tail: `help_layout` drops cheatsheet rows from the end, so a new verb
+        // appended after the sidebar capitals would be first to vanish on a
+        // short pane. No always-visible legend cell — the 80-column TASKS row is
+        // already full through `c completed` (see `legend`); this lives in `?`.
+        Binding {
+            key: KeyCode::Char('w'),
+            action: Action::ToggleHideDistant,
+            help: "show/hide distant tasks",
         },
         Binding {
             key: KeyCode::Char('C'),

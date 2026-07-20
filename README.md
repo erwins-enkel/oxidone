@@ -117,6 +117,11 @@ theme = "mocha"
 
 # Render ASCII block bars instead of braille (for terminals/fonts without braille glyphs)
 ascii_fallback = false
+
+# Hide entries due far out from the task pane (`w` toggles it live). Entries due
+# more than `horizon_days` days out are hidden; undated entries always stay.
+hide_distant = false
+horizon_days = 14
 ```
 
 The refresh token is stored `chmod 600` in the config dir. See

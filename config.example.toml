@@ -11,3 +11,12 @@ theme = "mocha"
 # Render ASCII block bars instead of braille, for terminals/fonts without
 # braille glyphs.
 ascii_fallback = false
+
+# Hide entries due far in the future from the task pane. `w` toggles this live;
+# this sets the state at startup. Entries due more than `horizon_days` days out
+# are hidden while it is on; undated entries always stay.
+hide_distant = false
+
+# Horizon for `hide_distant`, in days. Entries due strictly more than this many
+# days from today are the ones hidden.
+horizon_days = 14

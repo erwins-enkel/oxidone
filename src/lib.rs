@@ -12,5 +12,6 @@ pub mod config; // TOML config + platform paths
 pub mod dateparse; // pure natural-language + ISO due-date parser (local TZ)
 pub mod domain; // Task, List, Subtask, Status, DueDate — the ubiquitous language
 pub mod keymap; // keymap-as-data (context + key -> Action)
+pub mod links; // pure URL extraction from notes + the openable-scheme guard
 pub mod sync; // write-through, manual refresh, reconciliation
 pub mod ui; // ratatui view + theme + braille widgets

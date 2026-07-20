@@ -31,6 +31,8 @@ pub enum Action {
     DeleteTask,
     CycleSort,
     ToggleShowCompleted,
+    /// Open a URL found in the selected Task's notes.
+    OpenLink,
     ClearCompleted,
     // Manual Refresh: re-pull the List set (and, via the cascade, the active
     // List's Tasks) from Google. Modeless — it is not gated on a pane.
@@ -160,6 +162,11 @@ pub fn bindings() -> &'static [Binding] {
             help: "delete task",
         },
         Binding {
+            key: KeyCode::Char('u'),
+            action: Action::OpenLink,
+            help: "open link",
+        },
+        Binding {
             key: KeyCode::Char('s'),
             action: Action::CycleSort,
             help: "cycle sort (manual/due/title)",
@@ -255,6 +262,8 @@ pub enum LegendContext {
     TextInput,
     /// A Confirm overlay: only y/n/Esc fire.
     Confirm,
+    /// The link picker: j/k move, Enter opens, Esc cancels.
+    LinkPicker,
 }
 
 /// Where a legend cell's key text comes from.
@@ -378,6 +387,14 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             label: "edit",
         },
         SORT,
+        // Last: the `⧉` row marker is itself visible, so an unknown `u` is
+        // recoverable via `?` in a way that a silently hidden Completed Task is
+        // not. Promoting it far enough to show at 80 columns would drop
+        // `c completed`, which outranks it for exactly that reason.
+        LegendEntry {
+            keys: LegendKeys::Derived(&[Action::OpenLink]),
+            label: "link",
+        },
     ];
 
     const SIDEBAR: &[LegendEntry] = &[
@@ -426,10 +443,28 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // `Enter` opens rather than saves, and `j`/`k` move — neither of which the
+    // text-input legend would have said.
+    const LINK_PICKER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("j/k"),
+            label: "move",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "open",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
         LegendContext::TextInput => TEXT_INPUT,
         LegendContext::Confirm => CONFIRM,
+        LegendContext::LinkPicker => LINK_PICKER,
     }
 }

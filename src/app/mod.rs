@@ -10,6 +10,7 @@ use chrono::NaiveDate;
 use crate::dateparse;
 use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
+use crate::links::{self, OpenableUrl};
 
 /// Shown when an operation needs Google but no API client was configured: a
 /// write (ADR-0001: no offline editing in v1), or a Refresh, which has nothing
@@ -126,6 +127,12 @@ pub enum Overlay {
     RenameList { list: ListId, buffer: String },
     /// A reusable destructive-action confirmation (delete Task or List).
     Confirm(Confirm),
+    /// Pick which of a Task's URLs to open. Only raised for more than one — a
+    /// single URL opens without asking.
+    OpenLink {
+        urls: Vec<OpenableUrl>,
+        selected: usize,
+    },
 }
 
 impl Overlay {
@@ -139,7 +146,7 @@ impl Overlay {
             | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
             | Overlay::RenameList { buffer, .. } => Some(buffer),
-            Overlay::Confirm(_) => None,
+            Overlay::Confirm(_) | Overlay::OpenLink { .. } => None,
         }
     }
 }
@@ -367,6 +374,11 @@ pub enum Message {
     },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
+    /// Handing a URL to the browser failed. Nothing to roll back — opening a
+    /// link mutates no state — but the attempt must not fail silently.
+    LinkOpenFailed {
+        reason: String,
+    },
 }
 
 /// Side-effect requests emitted by `update` for workers to run.
@@ -398,6 +410,10 @@ pub enum Command {
         task: TaskId,
         notes: Option<String>,
     },
+    /// Hand a URL to the platform browser. Carries an [`OpenableUrl`], so the
+    /// scheme was checked before the value existed — the runtime opens it
+    /// without re-deciding.
+    OpenUrl(OpenableUrl),
     /// Suspend the TUI and open the Task's notes in the external editor. Handled
     /// synchronously by the runtime (it owns the terminal), which feeds the
     /// result back as `Message::NotesEdited`. Only emitted when an editor exists.
@@ -617,6 +633,10 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             Vec::new()
         }
         Message::NotesEdited { task, notes } => finish_edit_notes(model, task, notes),
+        Message::LinkOpenFailed { reason } => {
+            model.status_line = Some(format!("could not open link: {reason}"));
+            Vec::new()
+        }
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
             Vec::new()
@@ -717,6 +737,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
         Action::EditNotes => return edit_notes(model),
+        Action::OpenLink => return open_link(model),
         Action::DeleteTask => open_delete_confirm(model),
         Action::AddList => open_add_list(model),
         Action::RenameList => open_rename_list(model),
@@ -1044,6 +1065,46 @@ fn edit_notes(model: &mut Model) -> Vec<Command> {
     }
 }
 
+/// Open a URL from the selected Task's notes.
+///
+/// Reports on every path. Nothing found and nothing *openable* are different
+/// outcomes and say so differently: a notes blob full of `file:` URLs does have
+/// links, they just aren't ones a browser should be handed. Success reports too
+/// — the opener is detached and silent, so without a status line a working `u`
+/// is indistinguishable from an unbound key.
+fn open_link(model: &mut Model) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let notes = task.notes.as_deref().unwrap_or_default();
+    let found = links::scan_urls(notes).len();
+    let mut urls = links::openable_urls(notes);
+
+    match urls.len() {
+        0 => {
+            model.status_line = Some(if found == 0 {
+                "no links in these notes".to_string()
+            } else {
+                let plural = if found == 1 { "link" } else { "links" };
+                format!("{found} {plural} found, none openable (http/https only)")
+            });
+            Vec::new()
+        }
+        1 => vec![open_url(model, urls.remove(0))],
+        _ => {
+            model.overlay = Some(Overlay::OpenLink { urls, selected: 0 });
+            Vec::new()
+        }
+    }
+}
+
+/// Announce the URL on the status line and emit the open. Shared by the
+/// single-URL path and the picker so both report identically.
+fn open_url(model: &mut Model, url: OpenableUrl) -> Command {
+    model.status_line = Some(format!("opening {}", url.as_str()));
+    Command::OpenUrl(url)
+}
+
 /// Write-through a notes edit (from either the external editor or the inline
 /// fallback): optimistically set `notes`, snapshot for rollback, and emit the
 /// write — mirroring [`finish_edit_due`]. An empty/whitespace buffer clears the
@@ -1209,32 +1270,65 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
-/// Route a key to the active overlay: text editing for input overlays, yes/no
-/// for `Confirm`.
+/// Route a key to the active overlay: cursor keys for the link picker, yes/no
+/// for `Confirm`, text editing for the input overlays.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
-    let input = model.overlay.as_mut().and_then(Overlay::input_buffer);
-    if let Some(buffer) = input {
-        match key.code {
-            KeyCode::Char(c) => buffer.push(c),
-            KeyCode::Backspace => {
-                buffer.pop();
+    // Three-way on the overlay's kind. "Has a text buffer, else y/n" is not
+    // enough: the picker has no buffer either, and falling through to the
+    // confirm arm would let `y` silently dismiss it.
+    match model.overlay {
+        Some(Overlay::OpenLink { .. }) => return picker_key(model, key),
+        Some(Overlay::Confirm(_)) => {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    model.overlay = None;
+                    Vec::new()
+                }
+                _ => Vec::new(),
             }
-            KeyCode::Enter => return submit_input(model),
-            KeyCode::Esc => model.overlay = None,
-            _ => {}
         }
-        Vec::new()
-    } else {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                model.overlay = None;
-                Vec::new()
-            }
-            _ => Vec::new(),
-        }
+        _ => {}
     }
+    let Some(buffer) = model.overlay.as_mut().and_then(Overlay::input_buffer) else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Char(c) => buffer.push(c),
+        KeyCode::Backspace => {
+            buffer.pop();
+        }
+        KeyCode::Enter => return submit_input(model),
+        KeyCode::Esc => model.overlay = None,
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Keys for the link picker: move the cursor, open the selected URL, or cancel.
+fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    let Some(Overlay::OpenLink { urls, selected }) = model.overlay.as_mut() else {
+        return Vec::new();
+    };
+    match key.code {
+        // Clamped rather than wrapping, matching pane selection.
+        KeyCode::Char('j') | KeyCode::Down => {
+            *selected = (*selected + 1).min(urls.len().saturating_sub(1));
+        }
+        KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+        KeyCode::Enter => {
+            let url = urls[*selected].clone();
+            model.overlay = None;
+            return vec![open_url(model, url)];
+        }
+        KeyCode::Esc => model.overlay = None,
+        // Everything else is swallowed, as every other overlay already does —
+        // `q` must not quit with a modal up.
+        _ => {}
+    }
+    Vec::new()
 }
 
 /// Submit whichever text-input overlay is active.

@@ -111,7 +111,7 @@ async fn main_inner() -> Result<()> {
     let result = run(
         &mut terminal,
         &theme,
-        config.ascii_fallback,
+        &config,
         api,
         cache,
         initial_lists,
@@ -125,7 +125,7 @@ async fn main_inner() -> Result<()> {
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     theme: &Theme,
-    ascii: bool,
+    config: &Config,
     api: Api,
     cache: SharedCache,
     initial_lists: Vec<List>,
@@ -179,6 +179,9 @@ async fn run(
     let mut model = Model::new();
     model.editor_available = editor.is_some();
     model.api_available = api.is_some();
+    // Seed the distant-due view filter from config; `w` toggles it thereafter.
+    model.hide_distant = config.hide_distant;
+    model.horizon_days = config.horizon_days;
     // Sidebar meters for every cached List, *before* the seed `ListsLoaded`:
     // `set_lists`'s lazy fan-out reads `list_counts` to decide which Lists still
     // need fetching, so an empty map here would make it treat every List as
@@ -220,7 +223,7 @@ async fn run(
         // an idle session shows a stale "today" until something wakes it, which
         // would need a periodic tick to fix and is beyond this change.
         model.now = chrono::Local::now();
-        terminal.draw(|frame| ui::view(&model, theme, ascii, frame))?;
+        terminal.draw(|frame| ui::view(&model, theme, config.ascii_fallback, frame))?;
         match rx.recv().await {
             Some(msg) => {
                 // Re-stamp at the impure edge so the reducer stays pure yet can

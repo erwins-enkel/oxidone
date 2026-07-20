@@ -51,6 +51,14 @@ pub struct Model {
     /// hidden, the way the Google app does); a toggle reveals them. Purely a local
     /// view filter — it never re-fetches and never mutates `tasks`.
     pub show_completed: bool,
+    /// Whether entries due far out are hidden from the pane. Off by default; a
+    /// toggle flips it. Like `show_completed`, a purely local view filter that
+    /// never re-fetches and never mutates `tasks`. The cutoff is `horizon_days`.
+    pub hide_distant: bool,
+    /// Horizon for `hide_distant`, in days from today: an entry due strictly more
+    /// than this many days out is hidden while the filter is on. Held separately
+    /// from the flag so the cutoff survives toggling the filter off and on.
+    pub horizon_days: u16,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -205,6 +213,8 @@ impl Default for Model {
             tasks: Vec::new(),
             selected_task: None,
             sort: SortView::Due,
+            hide_distant: false,
+            horizon_days: 14,
             show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
@@ -453,10 +463,34 @@ impl Model {
             .collect()
     }
 
-    /// Whether a Task is currently shown: always, unless it is Completed and
-    /// completed Tasks are hidden.
+    /// Whether a Task is currently shown, combining the two view filters with
+    /// AND: it must pass both the Completed filter and the distant-due filter.
     fn is_visible(&self, task: &Task) -> bool {
+        self.completed_visible(task) && self.within_horizon(task)
+    }
+
+    /// The Completed filter: a Task shows unless it is Completed and Completed
+    /// Tasks are hidden.
+    fn completed_visible(&self, task: &Task) -> bool {
         self.show_completed || task.status != Status::Completed
+    }
+
+    /// The distant-due filter: with `hide_distant` on, an entry is hidden only if
+    /// it has a due date strictly more than `horizon_days` past today. Undated
+    /// entries are never distant, so they always pass. Keys on the due date, not
+    /// the entry type, so a far-future Event is hidden the same as a Task.
+    fn within_horizon(&self, task: &Task) -> bool {
+        if !self.hide_distant {
+            return true;
+        }
+        match task.due {
+            None => true,
+            Some(due) => {
+                let cutoff =
+                    self.now.date_naive() + chrono::Duration::days(self.horizon_days.into());
+                due <= cutoff
+            }
+        }
     }
 }
 
@@ -1217,6 +1251,13 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         // Task out of view, so re-anchor the cursor onto a visible one.
         Action::ToggleShowCompleted => {
             model.show_completed = !model.show_completed;
+            reselect_visible(model);
+        }
+        // View-only: hide/reveal entries due beyond the horizon. Hiding may drop
+        // the selected Task out of view, so re-anchor the cursor onto a visible
+        // one, exactly as the Completed toggle does.
+        Action::ToggleHideDistant => {
+            model.hide_distant = !model.hide_distant;
             reselect_visible(model);
         }
         Action::ClearCompleted => open_clear_completed_confirm(model),

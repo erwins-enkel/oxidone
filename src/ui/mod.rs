@@ -82,11 +82,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
-/// Width of the leading due-date column, set by the widest form a due date
-/// renders as: the `YYYY-MM-DD` fallback past the relative horizon. Every
-/// relative form (`today`, `tomorrow`, `yesterday`, `in 7d`, `7d ago`) is
-/// shorter and pads out to it.
-const DUE_WIDTH: usize = 10;
+/// Width of the leading due-date column. Derived from the formatter's own
+/// contract rather than restated here, so the column can never be narrower than
+/// what `format_due_relative` may emit.
+const DUE_WIDTH: usize = crate::dateparse::MAX_RENDERED_WIDTH;
 
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;

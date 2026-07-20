@@ -56,6 +56,13 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
 /// absolute ISO date takes over.
 const RELATIVE_HORIZON_DAYS: i64 = 7;
 
+/// The widest string `format_due_relative` can return, in cells: the
+/// `YYYY-MM-DD` fallback. Every relative form is shorter. Exported because the
+/// task pane sizes its due column to it — this is the formatter's contract with
+/// any caller laying dates out in a fixed width, and
+/// `no_rendering_is_wider_than_the_iso_fallback` holds it to it.
+pub const MAX_RENDERED_WIDTH: usize = 10;
+
 /// Render `due` relative to `today`: `today`, `tomorrow`, `yesterday`, `in 3d`,
 /// `3d ago` — falling back to ISO `YYYY-MM-DD` past `RELATIVE_HORIZON_DAYS` in
 /// either direction. Pure, with `today` injected, so the view stays clock-free.
@@ -165,9 +172,10 @@ mod tests {
         assert_eq!(format_due_relative(ymd(2027, 1, 15), today), "2027-01-15");
     }
 
-    /// The task pane lays due dates out in a fixed-width column sized to the ISO
-    /// fallback (`ui::DUE_WIDTH`), so no relative form may render wider than one
-    /// — a longer string would push the titles out of alignment.
+    /// The task pane lays due dates out in a fixed-width column sized to
+    /// `MAX_RENDERED_WIDTH`, so nothing may render wider than that — a longer
+    /// string would push the titles out of alignment. Asserted against the
+    /// constant itself, so widening the column can't silently outrun the test.
     #[test]
     fn no_rendering_is_wider_than_the_iso_fallback() {
         let today = ymd(2026, 7, 20);
@@ -175,8 +183,9 @@ mod tests {
             let due = today + chrono::Duration::days(offset);
             let rendered = format_due_relative(due, today);
             assert!(
-                rendered.chars().count() <= 10,
-                "{rendered:?} (offset {offset}) exceeds the 10-cell due column"
+                rendered.chars().count() <= MAX_RENDERED_WIDTH,
+                "{rendered:?} (offset {offset}) exceeds the \
+                 {MAX_RENDERED_WIDTH}-cell due column"
             );
         }
     }

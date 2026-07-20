@@ -229,8 +229,7 @@ fn every_derived_legend_action_is_bound() {
             for action in actions {
                 assert!(
                     keymap::bindings().iter().any(|b| b.action == *action),
-                    "legend cell {:?} names unbound {action:?}",
-                    cell.label
+                    "legend cell {cell:?} names unbound {action:?}"
                 );
             }
         }

@@ -250,6 +250,7 @@ pub enum LegendContext {
 }
 
 /// Where a legend cell's key text comes from.
+#[derive(Debug)]
 pub enum LegendKeys {
     /// Looked up in `bindings()` — the first row matching each `Action`, joined
     /// with `/`. The slice's order *is* the rendered order.
@@ -263,6 +264,7 @@ pub enum LegendKeys {
 /// One cell of the always-visible legend: the keys it advertises and a terse
 /// label. Deliberately shorter than a `Binding`'s `help` — "move", not
 /// "select next" — because the legend pays for every column it occupies.
+#[derive(Debug)]
 pub struct LegendEntry {
     pub keys: LegendKeys,
     pub label: &'static str,

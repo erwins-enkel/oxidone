@@ -20,6 +20,7 @@ fn task(id: &str, status: Status, completed_at: Option<DateTime<Utc>>) -> Task {
         status,
         due: None,
         completed_at,
+        links: Vec::new(),
         position: "00000000000000000001".to_string(),
         etag: "etag".to_string(),
         updated: ts(0),

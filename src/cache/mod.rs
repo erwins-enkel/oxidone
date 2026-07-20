@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, Connection};
 
-use crate::domain::{List, ListId, Status, Task, TaskId};
+use crate::domain::{List, ListId, Status, Task, TaskId, TaskLink};
 
 /// Ordered migrations. Index + 1 is the resulting `user_version`.
 const MIGRATIONS: &[&str] = &[
@@ -55,6 +55,11 @@ const MIGRATIONS: &[&str] = &[
         completed_at TEXT NOT NULL,
         PRIMARY KEY (task_id, completed_at)
      );",
+    // 0004 — Google's output-only `links[]` (#55, ADR-0003 pure mirror), stored
+    // as a JSON array of `{url, description, kind}`. Append-only migration:
+    // existing rows keep NULL, which reads back as an empty vec until the next
+    // Refresh repopulates them from Google.
+    "ALTER TABLE tasks ADD COLUMN links TEXT;",
 ];
 
 pub struct Cache {
@@ -179,8 +184,8 @@ impl Cache {
             let mut stmt = tx.prepare(
                 "INSERT INTO tasks
                  (id, list_id, parent, title, notes, status, due, completed_at,
-                  position, etag, updated, local_updated, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+                  links, position, etag, updated, local_updated, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
             )?;
             for t in tasks {
                 stmt.execute(params![
@@ -192,6 +197,7 @@ impl Cache {
                     status_str(t.status),
                     t.due.map(|d| d.format("%Y-%m-%d").to_string()),
                     t.completed_at.map(|c| c.to_rfc3339()),
+                    links_json(&t.links)?,
                     t.position,
                     t.etag,
                     t.updated.to_rfc3339(),
@@ -232,8 +238,8 @@ impl Cache {
         self.conn.execute(
             "INSERT OR REPLACE INTO tasks
              (id, list_id, parent, title, notes, status, due, completed_at,
-              position, etag, updated, local_updated, dirty)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+              links, position, etag, updated, local_updated, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
             params![
                 task.id.0,
                 task.list.0,
@@ -243,6 +249,7 @@ impl Cache {
                 status_str(task.status),
                 task.due.map(|d| d.format("%Y-%m-%d").to_string()),
                 task.completed_at.map(|c| c.to_rfc3339()),
+                links_json(&task.links)?,
                 task.position,
                 task.etag,
                 task.updated.to_rfc3339(),
@@ -324,7 +331,7 @@ impl Cache {
     /// The cached Tasks of a List, in Manual order (`position`).
     pub fn tasks(&self, list: &ListId) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent, title, notes, status, due, completed_at, position, etag, updated
+            "SELECT id, parent, title, notes, status, due, completed_at, links, position, etag, updated
              FROM tasks WHERE list_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![list.0], |row| {
@@ -336,9 +343,10 @@ impl Cache {
                 status: row.get(4)?,
                 due: row.get(5)?,
                 completed_at: row.get(6)?,
-                position: row.get(7)?,
-                etag: row.get(8)?,
-                updated: row.get(9)?,
+                links: row.get(7)?,
+                position: row.get(8)?,
+                etag: row.get(9)?,
+                updated: row.get(10)?,
             })
         })?;
         let mut tasks = Vec::new();
@@ -402,6 +410,7 @@ struct TaskRow {
     status: String,
     due: Option<String>,
     completed_at: Option<String>,
+    links: Option<String>,
     position: String,
     etag: String,
     updated: String,
@@ -422,10 +431,28 @@ impl TaskRow {
                 .transpose()
                 .with_context(|| "parsing due date")?,
             completed_at: self.completed_at.as_deref().map(parse_ts).transpose()?,
+            links: parse_links(self.links.as_deref())?,
             position: self.position,
             etag: self.etag,
             updated: parse_ts(&self.updated)?,
         })
+    }
+}
+
+/// Encode a Task's `links[]` for the JSON `links` column. Always writes a JSON
+/// array — even `"[]"` for the common empty case — so a written row is never
+/// ambiguous with a legacy `NULL` (which predates migration 0004).
+fn links_json(links: &[TaskLink]) -> Result<String> {
+    serde_json::to_string(links).with_context(|| "encoding task links")
+}
+
+/// Decode the JSON `links` column. `NULL` (a legacy row) reads as an empty vec;
+/// anything else must parse — a corrupt value fails closed rather than dropping
+/// links silently (ADR-0003, and CLAUDE.md's fail-closed rule).
+fn parse_links(raw: Option<&str>) -> Result<Vec<TaskLink>> {
+    match raw {
+        None => Ok(Vec::new()),
+        Some(s) => serde_json::from_str(s).with_context(|| format!("parsing task links {s:?}")),
     }
 }
 
@@ -465,4 +492,41 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(s)
         .with_context(|| format!("parsing timestamp {s:?}"))?
         .with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(url: &str, kind: Option<&str>) -> TaskLink {
+        TaskLink {
+            url: url.to_string(),
+            description: None,
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_legacy_null_links_column_reads_as_empty() {
+        // Migration 0004 adds `links` with no default, so rows written before it
+        // hold NULL. That must read as "no links", never a parse error.
+        assert!(parse_links(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn links_json_and_parse_links_round_trip() {
+        let links = vec![link("https://a.dev/1", Some("email"))];
+        let encoded = links_json(&links).unwrap();
+        assert_eq!(parse_links(Some(&encoded)).unwrap(), links);
+        // Empty encodes to a JSON array, not NULL, and reads back empty.
+        assert_eq!(links_json(&[]).unwrap(), "[]");
+        assert!(parse_links(Some("[]")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_links_column_fails_closed() {
+        // Fail-closed (CLAUDE.md): a garbled value surfaces an error rather than
+        // silently dropping links and reporting "you have none".
+        assert!(parse_links(Some("{not json")).is_err());
+    }
 }

@@ -1,7 +1,19 @@
 //! The pure link layer: what counts as a URL in free-text notes, and what
 //! oxidone is willing to open.
 
-use oxidone::links::{has_openable_url, openable_urls, scan_urls, OpenableUrl};
+use oxidone::domain::TaskLink;
+use oxidone::links::{
+    has_openable_link, has_openable_url, openable_links, openable_urls, scan_urls, OpenableUrl,
+};
+
+/// A `links[]` entry, terse for the merge tests below.
+fn link(url: &str, description: Option<&str>) -> TaskLink {
+    TaskLink {
+        url: url.into(),
+        description: description.map(str::to_string),
+        kind: None,
+    }
+}
 
 #[test]
 fn a_plain_https_url_is_openable() {
@@ -317,6 +329,118 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
             has_openable_url(notes),
             !openable_urls(notes).is_empty(),
             "disagreement on {notes:?}"
+        );
+    }
+}
+
+// ---- merging Google's `links[]` with notes URLs (#55) ----
+
+#[test]
+fn links_come_before_notes_urls_in_the_merge() {
+    let links = [link("https://gmail.example/msg", Some("Re: subject"))];
+    let merged = openable_links(&links, "later https://a.dev/1");
+
+    let shown: Vec<String> = merged.openable.iter().map(|l| l.display()).collect();
+    assert_eq!(
+        shown,
+        vec![
+            "Re: subject — https://gmail.example/msg".to_string(),
+            "https://a.dev/1".to_string(),
+        ],
+    );
+    assert_eq!(merged.found, 2);
+}
+
+#[test]
+fn a_links_entry_and_the_same_url_in_notes_collapse_to_one_row() {
+    // Exact-string dedup across the two sources: a Gmail link the user also
+    // pasted into notes is one link, not two — and the `links[]` description
+    // wins because it comes first.
+    let links = [link("https://a.dev/1", Some("the ticket"))];
+    let merged = openable_links(&links, "see https://a.dev/1 again");
+
+    assert_eq!(merged.found, 1, "counted once");
+    let shown: Vec<String> = merged.openable.iter().map(|l| l.display()).collect();
+    assert_eq!(shown, vec!["the ticket — https://a.dev/1".to_string()]);
+}
+
+#[test]
+fn a_non_openable_links_entry_counts_as_found_but_never_opens() {
+    // Plausible for a `type=email` Gmail link: a `mailto:` is mirrored and
+    // counted, but the http/https allowlist refuses it, so nothing opens.
+    let links = [link("mailto:a@b.c", Some("email the reporter"))];
+    let merged = openable_links(&links, "");
+
+    assert_eq!(merged.found, 1, "the mailto: is a found link");
+    assert!(merged.openable.is_empty(), "but not an openable one");
+}
+
+#[test]
+fn openable_filtering_applies_to_links_the_same_as_notes() {
+    let links = [
+        link("file:///srv/dump", None),
+        link("https://a.dev/1", Some("keep")),
+    ];
+    let merged = openable_links(&links, "smb://n/v and https://b.dev/2");
+
+    assert_eq!(merged.found, 4, "all four distinct URLs are found");
+    let shown: Vec<String> = merged.openable.iter().map(|l| l.display()).collect();
+    assert_eq!(
+        shown,
+        vec![
+            "keep — https://a.dev/1".to_string(),
+            "https://b.dev/2".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn a_blank_description_renders_the_bare_url() {
+    // Google may hand back an empty description; a dangling `" — url"` would be
+    // worse than none.
+    let links = [link("https://a.dev/1", Some("   "))];
+    let merged = openable_links(&links, "");
+    assert_eq!(
+        merged
+            .openable
+            .iter()
+            .map(|l| l.display())
+            .collect::<Vec<_>>(),
+        vec!["https://a.dev/1".to_string()],
+    );
+}
+
+#[test]
+fn has_openable_link_sees_a_links_only_task_with_no_notes() {
+    // The marker's `links[]`-aware predicate: a Gmail-created Task with an
+    // openable link but empty notes must still be marked.
+    assert!(has_openable_link(&[link("https://a.dev/1", None)], ""));
+    // A non-openable link alone is not a marker.
+    assert!(!has_openable_link(&[link("mailto:a@b.c", None)], ""));
+    // Falls through to the notes scan when `links[]` has nothing openable.
+    assert!(has_openable_link(
+        &[link("mailto:a@b.c", None)],
+        "https://a.dev/1"
+    ));
+    assert!(!has_openable_link(&[], "no links here"));
+}
+
+#[test]
+fn has_openable_link_agrees_with_the_merge_on_whether_anything_opens() {
+    // The cheap predicate behind the marker and the collecting merge behind `u`
+    // must never disagree, or the `⧉` glyph lies about what the key will do.
+    let cases: [(&[TaskLink], &str); 5] = [
+        (&[], ""),
+        (&[], "https://a.dev/1"),
+        (&[link("https://a.dev/1", None)], ""),
+        (&[link("mailto:a@b.c", None)], ""),
+        (&[link("mailto:a@b.c", None)], "file:///x"),
+    ];
+    for (links, notes) in cases {
+        assert_eq!(
+            has_openable_link(links, notes),
+            !openable_links(links, notes).openable.is_empty(),
+            "disagreement on links={links:?} notes={notes:?}",
         );
     }
 }

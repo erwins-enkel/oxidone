@@ -10,7 +10,7 @@ use chrono::NaiveDate;
 use crate::dateparse;
 use crate::domain::{EntryType, List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
-use crate::links::{self, OpenableUrl};
+use crate::links::{self, Link, OpenableUrl};
 
 /// Shown when an operation needs Google but no API client was configured: a
 /// write (ADR-0001: no offline editing in v1), or a Refresh, which has nothing
@@ -160,12 +160,10 @@ pub enum Overlay {
     RenameList { list: ListId, buffer: String },
     /// A reusable destructive-action confirmation (delete Task or List).
     Confirm(Confirm),
-    /// Pick which of a Task's URLs to open. Only raised for more than one — a
-    /// single URL opens without asking.
-    OpenLink {
-        urls: Vec<OpenableUrl>,
-        selected: usize,
-    },
+    /// Pick which of a Task's links to open — merged from its `links[]` and its
+    /// notes URLs. Only raised for more than one; a single link opens without
+    /// asking.
+    OpenLink { links: Vec<Link>, selected: usize },
 }
 
 impl Overlay {
@@ -1379,6 +1377,9 @@ fn add_task_placeholder(
             status: Status::NeedsAction,
             due: None,
             completed_at: None,
+            // A brand-new Task has no `links[]` (output-only; Google attaches
+            // them only on the surface it was created from).
+            links: Vec::new(),
             position: String::new(),
             etag: String::new(),
             updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
@@ -1619,34 +1620,42 @@ fn edit_notes(model: &mut Model) -> Vec<Command> {
     }
 }
 
-/// Open a URL from the selected Task's notes.
+/// Open a link on the selected Task — merged from its `links[]` (Gmail/Chat/
+/// Keep/Docs origin) and the URLs in its notes, deduped (#55).
 ///
 /// Reports on every path. Nothing found and nothing *openable* are different
-/// outcomes and say so differently: a notes blob full of `file:` URLs does have
-/// links, they just aren't ones a browser should be handed. Success reports too
-/// — the opener is detached and silent, so without a status line a working `u`
-/// is indistinguishable from an unbound key.
+/// outcomes and say so differently: a `links[]` entry that is a `mailto:`, or a
+/// notes blob full of `file:` URLs, does have links — they just aren't ones a
+/// browser should be handed. Success reports too — the opener is detached and
+/// silent, so without a status line a working `u` is indistinguishable from an
+/// unbound key.
 fn open_link(model: &mut Model) -> Vec<Command> {
     let Some(task) = focused_task(model) else {
         return Vec::new();
     };
     let notes = task.notes.as_deref().unwrap_or_default();
-    let found = links::scan_urls(notes).len();
-    let mut urls = links::openable_urls(notes);
+    let merged = links::openable_links(&task.links, notes);
+    let mut openable = merged.openable;
 
-    match urls.len() {
+    match openable.len() {
         0 => {
-            model.status_line = Some(if found == 0 {
-                "no links in these notes".to_string()
+            model.status_line = Some(if merged.found == 0 {
+                "no links on this task".to_string()
             } else {
-                let plural = if found == 1 { "link" } else { "links" };
-                format!("{found} {plural} found, none openable (http/https only)")
+                let plural = if merged.found == 1 { "link" } else { "links" };
+                format!(
+                    "{} {plural} found, none openable (http/https only)",
+                    merged.found
+                )
             });
             Vec::new()
         }
-        1 => vec![open_url(model, urls.remove(0))],
+        1 => vec![open_url(model, openable.remove(0).url().clone())],
         _ => {
-            model.overlay = Some(Overlay::OpenLink { urls, selected: 0 });
+            model.overlay = Some(Overlay::OpenLink {
+                links: openable,
+                selected: 0,
+            });
             Vec::new()
         }
     }
@@ -1865,20 +1874,20 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     Vec::new()
 }
 
-/// Keys for the link picker: move the cursor, open the selected URL, or cancel.
+/// Keys for the link picker: move the cursor, open the selected link, or cancel.
 fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
-    let Some(Overlay::OpenLink { urls, selected }) = model.overlay.as_mut() else {
+    let Some(Overlay::OpenLink { links, selected }) = model.overlay.as_mut() else {
         return Vec::new();
     };
     match key.code {
         // Clamped rather than wrapping, matching pane selection.
         KeyCode::Char('j') | KeyCode::Down => {
-            *selected = (*selected + 1).min(urls.len().saturating_sub(1));
+            *selected = (*selected + 1).min(links.len().saturating_sub(1));
         }
         KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
         KeyCode::Enter => {
-            let url = urls[*selected].clone();
+            let url = links[*selected].url().clone();
             model.overlay = None;
             return vec![open_url(model, url)];
         }

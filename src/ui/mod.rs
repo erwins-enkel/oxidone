@@ -22,7 +22,7 @@ use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::format_due_relative;
 use crate::domain::{EntryType, Status, Task};
 use crate::keymap;
-use crate::links::{self, OpenableUrl};
+use crate::links::{self, Link};
 use theme::Theme;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use widgets::{dueload, meter};
@@ -101,8 +101,8 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
         Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
         // The one overlay that is a list, not a line — and the only one whose
         // height is not fixed.
-        Overlay::OpenLink { urls, selected } => {
-            return render_link_picker(frame, area, urls, *selected, theme)
+        Overlay::OpenLink { links, selected } => {
+            return render_link_picker(frame, area, links, *selected, theme)
         }
     };
     let popup = centered(area, OVERLAY_WIDTH, 1 + OVERLAY_BORDERS);
@@ -110,20 +110,20 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
     frame.render_widget(Paragraph::new(body).block(panel(title, true, theme)), popup);
 }
 
-/// Height of the link picker: one row per URL plus its borders, never taller
+/// Height of the link picker: one row per link plus its borders, never taller
 /// than the space available.
-fn picker_height(urls: usize, available: u16) -> u16 {
-    u16::try_from(urls)
+fn picker_height(links: usize, available: u16) -> u16 {
+    u16::try_from(links)
         .unwrap_or(u16::MAX)
         .saturating_add(OVERLAY_BORDERS)
         .min(available)
 }
 
-/// The link picker. Raised only for more than one URL, so it always has rows.
+/// The link picker. Raised only for more than one link, so it always has rows.
 fn render_link_picker(
     frame: &mut Frame,
     area: Rect,
-    urls: &[OpenableUrl],
+    links: &[Link],
     selected: usize,
     theme: &Theme,
 ) {
@@ -135,15 +135,15 @@ fn render_link_picker(
         height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
         ..area
     };
-    let popup = centered(body, OVERLAY_WIDTH, picker_height(urls.len(), body.height));
-    // By characters, not bytes: a URL in free-text notes may be multibyte, and
+    let popup = centered(body, OVERLAY_WIDTH, picker_height(links.len(), body.height));
+    // By characters, not bytes: a link's URL or description may be multibyte, and
     // slicing one mid-codepoint would panic. The gutter comes off the budget
     // too — `render_selectable` spends it on every row.
     let width =
         (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
-    let items: Vec<ListItem> = urls
+    let items: Vec<ListItem> = links
         .iter()
-        .map(|url| ListItem::new(truncate(url.as_str(), width)))
+        .map(|link| ListItem::new(truncate(&link.display(), width)))
         .collect();
     frame.render_widget(Clear, popup);
     render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
@@ -485,7 +485,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // aligned. Driven by the cheap predicate, not by collecting the
             // URLs: this runs for every visible row on every frame.
             let notes = t.notes.as_deref().unwrap_or_default();
-            let has_urls = links::has_openable_url(notes);
+            let has_urls = links::has_openable_link(&t.links, notes);
             let marker = link_marker(has_urls, ascii);
             if let Some(marker) = marker {
                 // Inherits the row's style, so on a Completed Task it reads dim
@@ -1466,6 +1466,7 @@ mod tests {
             status,
             due,
             completed_at: None,
+            links: Vec::new(),
             position: "0".into(),
             etag: String::new(),
             updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
@@ -1622,7 +1623,7 @@ mod tests {
         // The picker has no text buffer either; a catch-all arm would have sent
         // it to `TextInput` and advertised `Enter save`.
         model.overlay = Some(Overlay::OpenLink {
-            urls: Vec::new(),
+            links: Vec::new(),
             selected: 0,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::LinkPicker);

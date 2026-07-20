@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ApiError, NewTask, TaskPatch, TasksApi};
 use crate::auth::TokenProvider;
-use crate::domain::{List, ListId, Status, Task, TaskId};
+use crate::domain::{List, ListId, Status, Task, TaskId, TaskLink};
 
 /// Base URL for the Tasks API v1.
 pub const BASE: &str = "https://tasks.googleapis.com/tasks/v1";
@@ -199,6 +199,30 @@ struct WireTask {
     completed: Option<String>,
     #[serde(default)]
     position: String,
+    #[serde(default)]
+    links: Vec<WireLink>,
+}
+
+/// One entry of Google's output-only `links[]`. `type` is a Rust keyword, so it
+/// deserialises into `kind`; all three fields are optional in practice, so a
+/// partial object never fails the whole `list_tasks` page.
+#[derive(Deserialize)]
+struct WireLink {
+    #[serde(default)]
+    link: String,
+    description: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+impl WireLink {
+    fn into_domain(self) -> TaskLink {
+        TaskLink {
+            url: self.link,
+            description: self.description,
+            kind: self.kind,
+        }
+    }
 }
 
 impl WireTask {
@@ -217,6 +241,7 @@ impl WireTask {
             status,
             due: self.due.as_deref().and_then(parse_date),
             completed_at: parse_ts(self.completed.as_deref()),
+            links: self.links.into_iter().map(WireLink::into_domain).collect(),
             position: self.position,
             etag: self.etag,
             updated: updated_or_now(self.updated.as_deref()),

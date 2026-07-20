@@ -73,6 +73,7 @@ fn task(id: &str, title: &str) -> Task {
         status: Status::NeedsAction,
         due: None,
         completed_at: None,
+        links: Vec::new(),
         position: id.into(),
         etag: String::new(),
         updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),

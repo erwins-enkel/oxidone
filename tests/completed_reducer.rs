@@ -37,6 +37,7 @@ fn task(id: &str, status: Status) -> Task {
             Status::Completed => Some(Utc.timestamp_opt(1_700_000_100, 0).unwrap()),
             Status::NeedsAction => None,
         },
+        links: Vec::new(),
         position: format!("{id:0>20}"),
         etag: "e".to_string(),
         updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),

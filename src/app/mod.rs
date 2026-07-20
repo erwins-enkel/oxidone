@@ -262,26 +262,42 @@ impl Model {
     }
 
     /// Split `tasks` into groups in Vec order: each top-level Task followed by its
-    /// Subtasks, then each orphaned Subtask (parent absent, e.g. after the parent
-    /// was deleted) as a group of its own. Every Task lands in exactly one group,
-    /// so nothing ever vanishes and flattening always reproduces the whole set.
+    /// Subtasks, then each orphaned Subtask (no present top-level parent, e.g.
+    /// after the parent was deleted) as a group of its own. Every Task lands in
+    /// exactly one group, so nothing ever vanishes and flattening always
+    /// reproduces the whole set.
+    ///
+    /// Linear in the Task count: every lens routes through here, and `Due` is the
+    /// default, so this runs on each redraw (via `visible_tasks`) and on each
+    /// cursor re-anchor. Bucketing children up front keeps it off the quadratic
+    /// rescan the hierarchy used to cost when only `Manual` paid it.
     fn groups(&self) -> Vec<Vec<&Task>> {
-        let mut out: Vec<Vec<&Task>> = Vec::new();
+        let top_level = self.top_level_ids();
+        // One pass buckets every child under its parent, so building the groups
+        // below is a hash lookup each rather than a rescan of `tasks`.
+        let mut children: HashMap<&TaskId, Vec<&Task>> = HashMap::new();
+        for task in &self.tasks {
+            if let Some(parent) = task.parent.as_ref().filter(|p| top_level.contains(p)) {
+                children.entry(parent).or_default().push(task);
+            }
+        }
+
+        let mut out: Vec<Vec<&Task>> = Vec::with_capacity(top_level.len());
         for parent in self.tasks.iter().filter(|t| t.parent.is_none()) {
             let mut group = vec![parent];
-            group.extend(
-                self.tasks
-                    .iter()
-                    .filter(|c| c.parent.as_ref() == Some(&parent.id)),
-            );
+            if let Some(kids) = children.get(&parent.id) {
+                group.extend(kids.iter().copied());
+            }
             out.push(group);
         }
         // Orphans are appended after every parent group. Under `Manual` that
         // puts them last (what `hierarchical` did); under the sorted lenses they
         // are ordinary single-Task groups, so they sort on their own key and
-        // only fall back to this trailing position when that key ties.
+        // only fall back to this trailing position when that key ties. A parent
+        // that is itself a Subtask counts as absent — `groups` nests only under
+        // top-level Tasks, which is the rule `renders_as_subtask` draws.
         for task in &self.tasks {
-            if !out.iter().flatten().any(|t| t.id == task.id) {
+            if task.parent.as_ref().is_some_and(|p| !top_level.contains(p)) {
                 out.push(vec![task]);
             }
         }

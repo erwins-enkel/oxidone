@@ -152,13 +152,37 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     // change back with an explanation.
                     let _ = tx.send(Message::TaskWriteFailed {
                         task,
-                        reason: "not connected to Google".to_string(),
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::SetTitle { list, task, title } => match api {
+                Some(api) => {
+                    spawn_write_title(api.clone(), cache.clone(), tx.clone(), list, task, title)
+                }
+                None => {
+                    let _ = tx.send(Message::TaskWriteFailed {
+                        task,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::DeleteTask { list, task } => match api {
+                Some(api) => spawn_delete_task(api.clone(), cache.clone(), tx.clone(), list, task),
+                None => {
+                    let _ = tx.send(Message::TaskDeleteFailed {
+                        task,
+                        reason: OFFLINE.to_string(),
                     });
                 }
             },
         }
     }
 }
+
+/// Shown when a write is attempted with no live connection (ADR-0001: no offline
+/// editing in v1).
+const OFFLINE: &str = "not connected to Google";
 
 /// Write-through a completion toggle: patch on Google (retry-once), mirror into
 /// the cache, and report the server Task back (or a rollback on failure).
@@ -181,6 +205,59 @@ fn spawn_write_completed(
             Err(e) => Message::TaskWriteFailed {
                 task,
                 reason: format!("failed to update task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Write-through a title edit: patch on Google, mirror into the cache, report
+/// the server Task back (or a rollback on failure).
+fn spawn_write_title(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+    title: String,
+) {
+    tokio::spawn(async move {
+        let message = match sync::patch_title(api.as_ref(), &list, &task, &title).await {
+            Ok(updated) => {
+                if let Err(e) = cache.lock().unwrap().upsert_task(&updated) {
+                    tracing::warn!(error = %e, "failed to cache task write");
+                }
+                Message::TaskUpdated(updated)
+            }
+            Err(e) => Message::TaskWriteFailed {
+                task,
+                reason: format!("failed to update task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Delete a Task on Google, mirror the removal into the cache, and report back
+/// (or roll the optimistic delete back on failure).
+fn spawn_delete_task(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+) {
+    tokio::spawn(async move {
+        let message = match api.delete_task(&list, &task).await {
+            Ok(()) => {
+                if let Err(e) = cache.lock().unwrap().delete_task(&task) {
+                    tracing::warn!(error = %e, "failed to remove task from cache");
+                }
+                Message::TaskDeleted(task)
+            }
+            Err(e) => Message::TaskDeleteFailed {
+                task,
+                reason: format!("failed to delete task: {e}"),
             },
         };
         let _ = tx.send(message);

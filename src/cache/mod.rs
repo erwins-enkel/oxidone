@@ -182,6 +182,13 @@ impl Cache {
         Ok(())
     }
 
+    /// Remove a single Task from the cache (mirrors a delete-through).
+    pub fn delete_task(&self, task: &TaskId) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", params![task.0])?;
+        Ok(())
+    }
+
     /// The cached Tasks of a List, in Manual order (`position`).
     pub fn tasks(&self, list: &ListId) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(

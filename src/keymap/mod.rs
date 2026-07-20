@@ -16,6 +16,8 @@ pub enum Action {
     SelectNext,
     SelectPrev,
     ToggleComplete,
+    EditTitle,
+    DeleteTask,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -72,6 +74,16 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char(' '),
             action: Action::ToggleComplete,
             help: "toggle complete",
+        },
+        Binding {
+            key: KeyCode::Char('e'),
+            action: Action::EditTitle,
+            help: "edit title",
+        },
+        Binding {
+            key: KeyCode::Char('x'),
+            action: Action::DeleteTask,
+            help: "delete task",
         },
     ];
     BINDINGS

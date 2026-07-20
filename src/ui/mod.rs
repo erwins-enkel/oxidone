@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{Focus, Model};
+use crate::app::{Focus, Model, Overlay};
 use crate::domain::Status;
 use crate::keymap;
 use theme::Theme;
@@ -37,6 +37,19 @@ pub fn view(model: &Model, theme: &Theme, frame: &mut Frame) {
     if model.show_help {
         render_help(frame, area, theme);
     }
+    if let Some(overlay) = &model.overlay {
+        render_overlay(frame, area, overlay, theme);
+    }
+}
+
+fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+    let (title, body): (&str, String) = match overlay {
+        Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
+        Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
+    };
+    let popup = centered(area, 50, 3);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(body).block(panel(title, true, theme)), popup);
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {

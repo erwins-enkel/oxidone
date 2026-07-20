@@ -39,10 +39,39 @@ pub struct Model {
     pub should_quit: bool,
     /// Transient one-line message (load errors now; toasts later).
     pub status_line: Option<String>,
-    /// Tasks with a completion write in flight, mapped to their pre-write
-    /// snapshot for rollback. Acts as a single-flight guard: a Task already
-    /// mid-write ignores further toggles, so no two writes race the same Task.
+    /// The active modal overlay (text input or confirmation), if any. While set,
+    /// keys route to the overlay instead of the normal keymap.
+    pub overlay: Option<Overlay>,
+    /// Tasks with a field write in flight, mapped to their pre-write snapshot for
+    /// rollback. Acts as a single-flight guard: a Task already mid-write ignores
+    /// further edits, so no two writes race the same Task.
     pending_writes: HashMap<TaskId, Task>,
+    /// Optimistically-removed Tasks awaiting delete confirmation from the server,
+    /// mapped to their prior (index, Task) for rollback on failure.
+    pending_deletes: HashMap<TaskId, (usize, Task)>,
+}
+
+/// A modal overlay drawn over the panes.
+#[derive(Debug, Clone)]
+pub enum Overlay {
+    /// In-place title editor for a Task.
+    EditTitle { task: TaskId, buffer: String },
+    /// A reusable destructive-action confirmation (delete Task now; Clear and
+    /// List delete later).
+    Confirm(Confirm),
+}
+
+/// A yes/no confirmation of a destructive action.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub prompt: String,
+    pub action: ConfirmAction,
+}
+
+/// The action a [`Confirm`] performs on "yes". Grows as destructive ops land.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    DeleteTask { list: ListId, task: TaskId },
 }
 
 impl Default for Model {
@@ -56,7 +85,9 @@ impl Default for Model {
             show_help: false,
             should_quit: false,
             status_line: None,
+            overlay: None,
             pending_writes: HashMap::new(),
+            pending_deletes: HashMap::new(),
         }
     }
 }
@@ -84,8 +115,15 @@ pub enum Message {
     TasksLoaded(ListId, Vec<Task>),
     /// A write succeeded; reconcile the Model with the server's Task.
     TaskUpdated(Task),
-    /// A completion write failed; roll back to the pre-write snapshot.
+    /// A field write failed; roll back to the pre-write snapshot.
     TaskWriteFailed {
+        task: TaskId,
+        reason: String,
+    },
+    /// A delete succeeded; drop the optimistic-delete bookkeeping.
+    TaskDeleted(TaskId),
+    /// A delete failed; re-insert the Task at its prior position.
+    TaskDeleteFailed {
         task: TaskId,
         reason: String,
     },
@@ -104,16 +142,29 @@ pub enum Command {
         task: TaskId,
         completed: bool,
     },
+    /// Write-through a title edit for a Task.
+    SetTitle {
+        list: ListId,
+        task: TaskId,
+        title: String,
+    },
+    /// Delete a Task.
+    DeleteTask { list: ListId, task: TaskId },
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
 /// side-effect `Command`s for workers to run.
 pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
     match msg {
-        Message::Key(key) => match keymap::resolve(key) {
-            Some(action) => apply(model, action),
-            None => Vec::new(),
-        },
+        Message::Key(key) => {
+            if model.overlay.is_some() {
+                return overlay_key(model, key);
+            }
+            match keymap::resolve(key) {
+                Some(action) => apply(model, action),
+                None => Vec::new(),
+            }
+        }
         Message::ListsLoaded(lists) => set_lists(model, lists),
         Message::TasksLoaded(list, tasks) => {
             set_tasks(model, &list, tasks);
@@ -133,6 +184,24 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             if let Some(previous) = model.pending_writes.remove(&task) {
                 if let Some(slot) = model.tasks.iter_mut().find(|t| t.id == previous.id) {
                     *slot = previous; // exact pre-write state, incl. completed_at
+                }
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
+        Message::TaskDeleted(task) => {
+            // Confirmed gone; drop the rollback snapshot (Task already removed).
+            model.pending_deletes.remove(&task);
+            Vec::new()
+        }
+        Message::TaskDeleteFailed { task, reason } => {
+            if let Some((index, previous)) = model.pending_deletes.remove(&task) {
+                // Guard against a refresh having already re-added it: only
+                // re-insert when it's genuinely absent, so we can't duplicate.
+                if !model.tasks.iter().any(|t| t.id == previous.id) {
+                    let at = index.min(model.tasks.len());
+                    model.tasks.insert(at, previous);
+                    clamp_task_selection(model);
                 }
             }
             model.status_line = Some(reason);
@@ -227,8 +296,131 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::SelectNext => return move_selection(model, 1),
         Action::SelectPrev => return move_selection(model, -1),
         Action::ToggleComplete => return toggle_complete(model),
+        Action::EditTitle => open_edit_title(model),
+        Action::DeleteTask => open_delete_confirm(model),
     }
     Vec::new()
+}
+
+/// The selected Task, if the task pane is focused with a selection.
+fn focused_task(model: &Model) -> Option<&Task> {
+    if model.focus != Focus::Tasks {
+        return None;
+    }
+    model.selected_task.and_then(|i| model.tasks.get(i))
+}
+
+fn open_edit_title(model: &mut Model) {
+    if let Some(task) = focused_task(model) {
+        model.overlay = Some(Overlay::EditTitle {
+            task: task.id.clone(),
+            buffer: task.title.clone(),
+        });
+    }
+}
+
+fn open_delete_confirm(model: &mut Model) {
+    let Some(task) = focused_task(model) else {
+        return;
+    };
+    let (id, title) = (task.id.clone(), task.title.clone());
+    let Some(list) = model.selected_list_id().cloned() else {
+        return;
+    };
+    model.overlay = Some(Overlay::Confirm(Confirm {
+        prompt: format!("Delete \"{title}\"? (y/n)"),
+        action: ConfirmAction::DeleteTask { list, task: id },
+    }));
+}
+
+/// Route a key to the active overlay: text editing for `EditTitle`, yes/no for
+/// `Confirm`.
+fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    let is_input = matches!(model.overlay, Some(Overlay::EditTitle { .. }));
+    if is_input {
+        match key.code {
+            KeyCode::Char(c) => {
+                if let Some(Overlay::EditTitle { buffer, .. }) = &mut model.overlay {
+                    buffer.push(c);
+                }
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                if let Some(Overlay::EditTitle { buffer, .. }) = &mut model.overlay {
+                    buffer.pop();
+                }
+                Vec::new()
+            }
+            KeyCode::Enter => submit_edit_title(model),
+            KeyCode::Esc => {
+                model.overlay = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                model.overlay = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn submit_edit_title(model: &mut Model) -> Vec<Command> {
+    let Some(Overlay::EditTitle { task, buffer }) = model.overlay.take() else {
+        return Vec::new();
+    };
+    let title = buffer.trim().to_string();
+    if title.is_empty() {
+        return Vec::new(); // cancel silently on an empty title
+    }
+    // Single-flight: don't lose the edit silently if a write is already running.
+    if model.pending_writes.contains_key(&task) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
+        return Vec::new();
+    };
+    model
+        .pending_writes
+        .insert(task.clone(), model.tasks[index].clone());
+    model.tasks[index].title = title.clone();
+    vec![Command::SetTitle { list, task, title }]
+}
+
+fn execute_confirm(model: &mut Model) -> Vec<Command> {
+    let Some(Overlay::Confirm(confirm)) = model.overlay.take() else {
+        return Vec::new();
+    };
+    match confirm.action {
+        ConfirmAction::DeleteTask { list, task } => {
+            let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
+                return Vec::new();
+            };
+            let removed = model.tasks.remove(index); // optimistic delete
+            model.pending_deletes.insert(task.clone(), (index, removed));
+            clamp_task_selection(model);
+            vec![Command::DeleteTask { list, task }]
+        }
+    }
+}
+
+/// Keep `selected_task` in range after the Task set shrinks.
+fn clamp_task_selection(model: &mut Model) {
+    model.selected_task = if model.tasks.is_empty() {
+        None
+    } else {
+        Some(model.selected_task.unwrap_or(0).min(model.tasks.len() - 1))
+    };
 }
 
 /// Toggle the selected Task's completion optimistically and request the

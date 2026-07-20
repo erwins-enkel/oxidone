@@ -9,6 +9,7 @@
 //!    freshly scaffolded config never triggers the first-run auth path.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use oxidone::config::Config;
 
@@ -56,4 +57,74 @@ fn example_scaffolds_offline() {
     // secret path — otherwise a scaffolded config would try to authenticate.
     let config: Config = toml::from_str(EXAMPLE).unwrap();
     assert!(config.client_secret_path.is_none());
+}
+
+const HOME: &str = "/home/tester";
+
+/// Deserialize a config with the given `client_secret_path` literal, expand it
+/// against a fixed fake home, and return the resulting path.
+fn expanded_secret_path(literal: &str) -> Option<PathBuf> {
+    let src = format!("client_secret_path = {literal:?}");
+    let config: Config = toml::from_str(&src).unwrap();
+    config.expand_paths(Path::new(HOME)).client_secret_path
+}
+
+#[test]
+fn expand_paths_wires_client_secret_path() {
+    // Wiring test: a `~/...` value in the deserialized config must expand *that*
+    // field — catches "forgot to wire" / "wrong field" regressions.
+    assert_eq!(
+        expanded_secret_path("~/.config/oxidone/client_secret.json"),
+        Some(PathBuf::from(
+            "/home/tester/.config/oxidone/client_secret.json"
+        )),
+    );
+}
+
+#[test]
+fn expand_paths_bare_tilde() {
+    assert_eq!(expanded_secret_path("~"), Some(PathBuf::from(HOME)));
+}
+
+#[test]
+fn expand_paths_leaves_tilde_user_verbatim() {
+    assert_eq!(
+        expanded_secret_path("~alice/secret.json"),
+        Some(PathBuf::from("~alice/secret.json")),
+    );
+}
+
+#[test]
+fn expand_paths_leaves_absolute_verbatim() {
+    assert_eq!(
+        expanded_secret_path("/etc/oxidone/abs.json"),
+        Some(PathBuf::from("/etc/oxidone/abs.json")),
+    );
+}
+
+#[test]
+fn expand_paths_leaves_relative_verbatim() {
+    assert_eq!(
+        expanded_secret_path("relative/secret.json"),
+        Some(PathBuf::from("relative/secret.json")),
+    );
+}
+
+#[test]
+fn expand_paths_leaves_mid_path_tilde_verbatim() {
+    // `~` only expands as the first component.
+    assert_eq!(
+        expanded_secret_path("a/~/b.json"),
+        Some(PathBuf::from("a/~/b.json")),
+    );
+}
+
+#[test]
+fn expand_paths_leaves_none_none() {
+    let config = Config::default();
+    assert!(config.client_secret_path.is_none());
+    assert!(config
+        .expand_paths(Path::new(HOME))
+        .client_secret_path
+        .is_none());
 }

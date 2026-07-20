@@ -6,9 +6,9 @@
 //! the shell runs before the user has written any config (auth lands in a later
 //! slice).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,11 +37,15 @@ impl Config {
     /// Load config from the platform config dir, falling back to defaults if the
     /// file is absent. A present-but-unreadable/malformed file also falls back —
     /// but logs a warning rather than silently resetting every setting.
+    ///
+    /// Tilde expansion happens here and only here: any other
+    /// `toml::from_str::<Config>` call site receives paths verbatim and must not
+    /// assume they are pre-expanded.
     pub fn load() -> Self {
         let Some(path) = config_file() else {
             return Self::default();
         };
-        match std::fs::read_to_string(&path) {
+        let config = match std::fs::read_to_string(&path) {
             Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "malformed config; using defaults");
                 Self::default()
@@ -51,7 +55,34 @@ impl Config {
                 tracing::warn!(path = %path.display(), error = %e, "could not read config; using defaults");
                 Self::default()
             }
+        };
+        match BaseDirs::new() {
+            Some(dirs) => config.expand_paths(dirs.home_dir()),
+            // No home resolvable: leave paths verbatim so the later file read
+            // surfaces the real error rather than us inventing a path.
+            None => config,
         }
+    }
+
+    /// Expand a leading `~`/`~/` in every path field against `home`. Applied once
+    /// in [`Config::load`]; a future path field is one added `.map(...)` line.
+    pub fn expand_paths(mut self, home: &Path) -> Self {
+        self.client_secret_path = self.client_secret_path.map(|p| expand_tilde(p, home));
+        self
+    }
+}
+
+/// Expand a leading `~`/`~/` in `path` against `home`. `~user` and any non-tilde
+/// path (absolute, relative, or literal) are returned unchanged.
+///
+/// `strip_prefix("~")` treats `~` as an ordinary path component, so it matches
+/// only when the first component is exactly `~`: `~/x` → `home/x`, bare `~` →
+/// `home`, and `~user`/`/abs`/`rel` fall through unchanged. Operates on the OS
+/// string, so non-UTF-8 paths are handled without lossy conversion.
+fn expand_tilde(path: PathBuf, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path,
     }
 }
 

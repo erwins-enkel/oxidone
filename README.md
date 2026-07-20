@@ -38,7 +38,7 @@ recurrence and reminders (not exposed by the API).
 ### Prebuilt binaries
 
 Each [release](https://github.com/erwins-enkel/oxidone/releases) ships prebuilt
-binaries for Linux (x86-64), macOS (Intel + Apple Silicon), and Windows (x86-64).
+binaries for Linux (x86-64), macOS (Apple Silicon), and Windows (x86-64).
 Download the archive for your platform, extract, and put `oxidone` on your `PATH`:
 
 ```sh

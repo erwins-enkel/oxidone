@@ -31,6 +31,12 @@ pub enum Action {
     /// day. Not an exit: the Task stays `needsAction`, only its due date moves.
     /// `>` itself is `Indent`, so the binding is the verb's initial.
     Migrate,
+    /// Cycle the selected entry's Bullet Journal type forward:
+    /// Task → Event → Note → Task.
+    CycleType,
+    /// Cycle it backward: Task → Note → Event → Task. With three types that
+    /// puts every type one press from any other — see `EntryType::prev`.
+    CycleTypeBack,
     EditNotes,
     DeleteTask,
     CycleSort,
@@ -172,6 +178,19 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('n'),
             action: Action::EditNotes,
             help: "edit notes ($EDITOR)",
+        },
+        // After `n`: entry-attribute verbs, alongside title and notes. Mid-table
+        // for the same reason as `m` above — `help_layout` drops cheatsheet rows
+        // from the tail, and new verbs should not be first in line for that.
+        Binding {
+            key: KeyCode::Char('t'),
+            action: Action::CycleType,
+            help: "cycle entry type",
+        },
+        Binding {
+            key: KeyCode::Char('T'),
+            action: Action::CycleTypeBack,
+            help: "cycle entry type back",
         },
         Binding {
             key: KeyCode::Char('x'),
@@ -438,12 +457,12 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             keys: LegendKeys::Derived(&[Action::Migrate]),
             label: "migrate",
         },
-        // The last three announce themselves elsewhere, so they drop first on a
+        // The last four announce themselves elsewhere, so they drop first on a
         // narrow pane: `Enter` already aliases `e`, the pane title names the
-        // active Sort view, and a Task with links carries the `⧉` marker.
-        // Promoting `link` far enough to show at 80 columns would drop
-        // `c completed`, which outranks it because hiding Completed Tasks
-        // changes the screen with nothing on it to say so.
+        // active Sort view, a Task with links carries the `⧉` marker, and a
+        // typed entry carries its signifier. Promoting `link` far enough to show
+        // at 80 columns would drop `c completed`, which outranks it because
+        // hiding Completed Tasks changes the screen with nothing on it to say so.
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::EditTitle]),
             label: "edit",
@@ -452,6 +471,15 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::OpenLink]),
             label: "link",
+        },
+        // Last, and below `link` deliberately. The row drops from the right, so
+        // anything inserted above `link` evicts it at the width where it used to
+        // fit — and `type` has the weakest claim to displace it: the signifier
+        // column already announces an entry's type on every row that has one,
+        // which is the same reason `link` ranks low. Both keys share one cell.
+        LegendEntry {
+            keys: LegendKeys::Derived(&[Action::CycleType, Action::CycleTypeBack]),
+            label: "type",
         },
     ];
 

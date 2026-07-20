@@ -38,6 +38,21 @@ impl Task {
     pub fn is_subtask(&self) -> bool {
         self.parent.is_some()
     }
+
+    /// This entry's type, derived from `title` (ADR-0008). Never stored.
+    pub fn entry_type(&self) -> EntryType {
+        EntryType::parse(&self.title).0
+    }
+
+    /// The title without its type prefix — what the user reads and edits.
+    ///
+    /// Equal to `title` for a `Task`, and for any *foreign* glyph-prefixed title
+    /// that `parse` declines to classify. "Display title" means "prefix removed",
+    /// not "glyph-free": oxidone cannot tell a foreign encoding from a title
+    /// someone meant literally, so it shows what is stored until `t` normalises it.
+    pub fn display_title(&self) -> &str {
+        EntryType::parse(&self.title).1
+    }
 }
 
 /// The only two states a Task can be in.
@@ -86,8 +101,243 @@ impl SortView {
     }
 }
 
+/// A Bullet Journal entry type, derived from the Task's title rather than stored
+/// (ADR-0008). `Task` is the default and carries no prefix, so every Task that
+/// already exists — and everything created in Google's own clients — is
+/// correctly typed with no backfill.
+///
+/// The glyphs are always the Unicode ones. `config.ascii_fallback` degrades how
+/// they *render*, never what is written: an ASCII prefix on the wire would have
+/// to be parsed back too, and toggling the flag would otherwise silently revert
+/// every typed entry to `Task`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    /// The default. Actionable, and the only type the Completion meter counts.
+    Task,
+    /// Something that happens on a day. Occupies the Due-load, never the meter.
+    Event,
+    /// A jotting. Counted by neither.
+    ///
+    /// Distinct from `Task::notes`, which is Google's free-text field (see
+    /// CONTEXT.md): a Note is what an entry *is*, notes are what it *carries*.
+    Note,
+}
+
+impl EntryType {
+    /// The literal prefix this type writes, `""` for `Task`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            EntryType::Task => "",
+            EntryType::Event => "○ ",
+            EntryType::Note => "— ",
+        }
+    }
+
+    /// Classify a raw title into its type and display title.
+    ///
+    /// Total, and deliberately never rewrites: a title is typed only when it
+    /// begins with the exact glyph, then exactly one space, then a **non-empty**
+    /// remainder. Anything else is a `Task` whose display title is the raw title
+    /// verbatim — including a bare `"○ "`, which would otherwise classify as a
+    /// typed entry with no content.
+    ///
+    /// So `parse` is the exact inverse of [`EntryType::apply`] for *canonical*
+    /// titles. Raw titles do not all come from oxidone — Google's web and mobile
+    /// clients write them too — and repairing the rest is [`EntryType::retype`]'s
+    /// job, not this one.
+    pub fn parse(title: &str) -> (Self, &str) {
+        for ty in [EntryType::Event, EntryType::Note] {
+            if let Some(rest) = title.strip_prefix(ty.prefix()) {
+                if !rest.is_empty() {
+                    return (ty, rest);
+                }
+            }
+        }
+        (EntryType::Task, title)
+    }
+
+    /// Build a raw title from a display title, prefix only.
+    ///
+    /// **Never strips.** This is the ordinary write path's function — the one
+    /// behind an `e` edit — and an edit that changes nothing must write back
+    /// exactly what was there. Stripping here would silently rewrite titles
+    /// nobody touched.
+    ///
+    /// Callers must pass a non-empty `display`; the edit path's own empty-check
+    /// already guarantees it.
+    pub fn apply(self, display: &str) -> String {
+        format!("{}{display}", self.prefix())
+    }
+
+    /// Build a raw title for a *type change*, repairing a foreign prefix first.
+    ///
+    /// The only stripping function, and the only one [`EntryType::apply`] is not.
+    /// A raw title from Google may be glyph-prefixed without being canonical —
+    /// `"○Standup"`, `"○  Standup"`, a bare `"○"` — and each parses as an
+    /// untyped `Task` whose display title still leads with the glyph. Prefixing
+    /// that directly would stack (`"○ ○Standup"`), so the leading run of glyph
+    /// characters and whitespace is removed and the prefix *rebuilt*. Stacking is
+    /// therefore unreachable rather than guarded against, and `t` self-heals a
+    /// foreign title into a canonical one on first press.
+    ///
+    /// Returns `None` when nothing survives the strip (`"○"`, `"— "`, `"○ ○"`,
+    /// or an empty title — reachable, since Google may return a Task with no
+    /// title at all). A type is not something an unnameable entry can carry, and
+    /// `None` makes that unrepresentable rather than a documented precondition.
+    ///
+    /// Lossy by construction: `"—— dashes"` becomes `"○ dashes"` and cycling will
+    /// not bring the dash back. That is the price of making stacking impossible,
+    /// and it is confined to this function's single caller.
+    pub fn retype(self, display: &str) -> Option<String> {
+        let stripped =
+            display.trim_start_matches(|c: char| c == '○' || c == '—' || c.is_whitespace());
+        (!stripped.is_empty()).then(|| self.apply(stripped))
+    }
+
+    /// The next type in the forward cycle: Task → Event → Note → Task.
+    pub fn next(self) -> Self {
+        match self {
+            EntryType::Task => EntryType::Event,
+            EntryType::Event => EntryType::Note,
+            EntryType::Note => EntryType::Task,
+        }
+    }
+
+    /// The next type in the reverse cycle: Task → Note → Event → Task.
+    ///
+    /// Exists so every type is one keypress from any other. Cycling forward-only
+    /// would put Note two presses from Task, and because a type change rides the
+    /// title-write path, the second press inside the first's flight window is
+    /// refused — turning a flip into press, wait for the network, press again.
+    pub fn prev(self) -> Self {
+        match self {
+            EntryType::Task => EntryType::Note,
+            EntryType::Note => EntryType::Event,
+            EntryType::Event => EntryType::Task,
+        }
+    }
+}
+
 // Newtypes keep List and Task ids from being swapped by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaskId(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [EntryType; 3] = [EntryType::Task, EntryType::Event, EntryType::Note];
+
+    #[test]
+    fn a_canonical_title_round_trips_through_apply_and_parse() {
+        for ty in ALL {
+            let raw = ty.apply("Standup");
+            assert_eq!(EntryType::parse(&raw), (ty, "Standup"), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn an_untyped_title_is_a_task_verbatim() {
+        assert_eq!(EntryType::parse("Buy milk"), (EntryType::Task, "Buy milk"));
+        assert_eq!(EntryType::parse(""), (EntryType::Task, ""));
+    }
+
+    #[test]
+    fn a_glyph_with_an_empty_remainder_is_not_a_typed_entry() {
+        // Without the non-empty clause these would classify as typed entries
+        // with no content, and `apply` would then write a title that is pure
+        // encoding.
+        assert_eq!(EntryType::parse("○ "), (EntryType::Task, "○ "));
+        assert_eq!(EntryType::parse("— "), (EntryType::Task, "— "));
+    }
+
+    #[test]
+    fn a_title_that_genuinely_starts_with_a_glyph_reads_as_typed() {
+        // Accepted and documented: rare, visible, and one `t` press from
+        // correction. The strict single-space rule keeps the blast radius small.
+        assert_eq!(EntryType::parse("— dashes"), (EntryType::Note, "dashes"));
+    }
+
+    #[test]
+    fn apply_never_strips() {
+        // The edit path's function. An `e` that changes nothing must write back
+        // exactly what was there, foreign glyph and all.
+        assert_eq!(EntryType::Task.apply("○Standup"), "○Standup");
+        assert_eq!(EntryType::Task.apply("○ "), "○ ");
+        assert_eq!(EntryType::Note.apply("—"), "— —");
+    }
+
+    #[test]
+    fn retype_is_idempotent_in_the_glyph_prefix() {
+        // Stacking is unreachable because the prefix is rebuilt, not appended:
+        // retyping an already-typed title yields the same string as typing the
+        // bare one, however many times it is applied.
+        let bare = EntryType::Event.retype("Standup").unwrap();
+        for ty in ALL {
+            let once = ty.retype("Standup").unwrap();
+            let twice = ty.retype(&once).unwrap();
+            assert_eq!(once, twice, "{ty:?} stacked");
+        }
+        assert_eq!(bare, "○ Standup");
+    }
+
+    #[test]
+    fn retype_repairs_foreign_titles_on_the_first_press() {
+        // Each of these parses as an untyped Task whose display title still
+        // leads with the glyph, so a plain prefix would stack on press one.
+        for foreign in ["○Standup", "○  Standup", "○ ○ Standup", "  Standup"] {
+            let (_, display) = EntryType::parse(foreign);
+            assert_eq!(
+                EntryType::Event.retype(display).as_deref(),
+                Some("○ Standup"),
+                "{foreign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retype_declines_a_title_that_strips_to_nothing() {
+        // `""` is reachable: WireTask.title is `#[serde(default)]`, so Google
+        // may hand back a Task with no title at all.
+        for empty in ["", "○", "— ", "○ ○", "   "] {
+            let (_, display) = EntryType::parse(empty);
+            assert_eq!(EntryType::Event.retype(display), None, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn next_and_prev_are_inverses_and_walk_opposite_ways() {
+        for ty in ALL {
+            assert_eq!(ty.next().prev(), ty, "{ty:?}");
+            assert_eq!(ty.prev().next(), ty, "{ty:?}");
+        }
+        assert_eq!(EntryType::Task.next(), EntryType::Event);
+        assert_eq!(EntryType::Task.prev(), EntryType::Note); // Note in one press
+    }
+
+    #[test]
+    fn task_accessors_derive_from_the_raw_title() {
+        let mut t = Task {
+            id: TaskId("t".into()),
+            list: ListId("l".into()),
+            parent: None,
+            title: "○ Standup".into(),
+            notes: None,
+            status: Status::NeedsAction,
+            due: None,
+            completed_at: None,
+            position: "0".into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        };
+        assert_eq!(t.entry_type(), EntryType::Event);
+        assert_eq!(t.display_title(), "Standup");
+
+        // A foreign prefix stays visible until `t` normalises it.
+        t.title = "○Standup".into();
+        assert_eq!(t.entry_type(), EntryType::Task);
+        assert_eq!(t.display_title(), "○Standup");
+    }
+}

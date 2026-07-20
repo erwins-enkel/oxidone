@@ -123,14 +123,16 @@ fn migrate_is_below_the_eighty_column_cut_and_evicts_nothing() {
         legend.contains("c completed"),
         "completed evicted: {legend}"
     );
-    assert!(
-        !legend.contains("migrate"),
-        "migrate must not fit 80 columns, or it displaced a cell: {legend}"
-    );
+    for below in ["migrate", "type"] {
+        assert!(
+            !legend.contains(below),
+            "{below} must not fit 80 columns, or it displaced a cell: {legend}"
+        );
+    }
 }
 
 #[test]
-fn a_wide_pane_reveals_migrate_between_completed_and_edit() {
+fn a_wide_pane_reveals_migrate_above_edit_and_type_below_link() {
     let mut model = model_with_status();
     model.focus = Focus::Tasks;
 
@@ -144,7 +146,25 @@ fn a_wide_pane_reveals_migrate_between_completed_and_edit() {
     };
     assert!(at("c completed") < at("m migrate"), "{legend}");
     assert!(at("m migrate") < at("e edit"), "{legend}");
-    // `link` is last and must stay that way — the reason WIDE is 130, not 120.
+    // `type` sits below `link`: anything above it evicts `link` at 120, where
+    // `link_render.rs` pins it as present.
+    assert!(at("u link") < at("t/T type"), "{legend}");
     assert!(legend.ends_with("? help"), "{legend}");
-    assert!(at("s sort") < at("u link"), "{legend}");
+}
+
+#[test]
+fn the_new_cells_do_not_evict_link_at_the_width_where_it_fits() {
+    // Regression: `t/T type` first landed above `link`, which pushed `link` off
+    // at 120 — the width `link_render.rs` pins it as present. Adding a cell must
+    // never cost an existing verb the width it already had.
+    let mut model = model_with_status();
+    model.focus = Focus::Tasks;
+
+    let legend = rows_at(&model, 120)
+        .last()
+        .expect("a bottom row")
+        .trim_end()
+        .to_string();
+    assert!(legend.contains("u link"), "link evicted at 120: {legend}");
+    assert!(legend.contains("m migrate"), "{legend}");
 }

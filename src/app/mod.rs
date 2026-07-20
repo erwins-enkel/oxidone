@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 
 use crate::dateparse;
-use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
+use crate::domain::{EntryType, List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 use crate::links::{self, OpenableUrl};
 
@@ -1005,6 +1005,8 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
         Action::Migrate => return migrate(model),
+        Action::CycleType => return cycle_type(model, EntryType::next),
+        Action::CycleTypeBack => return cycle_type(model, EntryType::prev),
         Action::EditNotes => return edit_notes(model),
         Action::OpenLink => return open_link(model),
         Action::DeleteTask => open_delete_confirm(model),
@@ -1094,6 +1096,48 @@ fn migrate(model: &mut Model) -> Vec<Command> {
         list,
         task: id,
         due,
+    }]
+}
+
+/// Cycle the selected entry's Bullet Journal type, `step` choosing the direction
+/// ([`EntryType::next`] for `t`, [`EntryType::prev`] for `T`).
+///
+/// The type lives in the title (ADR-0008), so this is a title write and rides
+/// `SetTitle` — single-flight guarding and rollback come from that path.
+///
+/// Uses [`EntryType::retype`], never `apply`: retyping must repair a foreign
+/// prefix first, or a title Google handed back as `"○Standup"` would stack into
+/// `"○ ○Standup"` on the first press. `None` means the title strips to nothing,
+/// which is not something a type can be attached to.
+fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let id = task.id.clone();
+    let Some(title) = step(task.entry_type()).retype(task.display_title()) else {
+        model.status_line = Some("an entry needs a title before it can be typed".to_string());
+        return Vec::new();
+    };
+    // Single-flight: don't lose the type change silently if a write is running.
+    // `T` exists partly so this is rarely hit — every type is one press away.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
+        return Vec::new();
+    };
+    model
+        .pending_writes
+        .insert(id.clone(), model.tasks[index].clone());
+    model.tasks[index].title = title.clone();
+    vec![Command::SetTitle {
+        list,
+        task: id,
+        title,
     }]
 }
 

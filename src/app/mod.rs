@@ -40,6 +40,10 @@ pub struct Model {
     /// Local, read-only reordering of the task pane. Never mutates `tasks`
     /// (Manual order) and never writes `position` to Google.
     pub sort: SortView,
+    /// Whether Completed Tasks are revealed in the pane. Off by default (they are
+    /// hidden, the way the Google app does); a toggle reveals them. Purely a local
+    /// view filter — it never re-fetches and never mutates `tasks`.
+    pub show_completed: bool,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -63,6 +67,11 @@ pub struct Model {
     /// prior (index, List) for rollback on failure (e.g. Google's undeletable
     /// default List).
     pending_list_deletes: HashMap<ListId, (usize, List)>,
+    /// Lists with a Clear in flight, mapped to the optimistically-removed
+    /// Completed Tasks and their prior indices (ascending) for rollback. A
+    /// per-item snapshot — like `pending_deletes` — so a failed Clear re-inserts
+    /// only the swept Tasks, never clobbering a concurrent edit or a reload.
+    pending_clears: HashMap<ListId, Vec<(usize, Task)>>,
     /// Counter for minting placeholder ids for optimistically-added Tasks, before
     /// the server assigns the real id.
     next_temp: u64,
@@ -124,6 +133,7 @@ pub struct Confirm {
 pub enum ConfirmAction {
     DeleteTask { list: ListId, task: TaskId },
     DeleteList { list: ListId },
+    ClearCompleted { list: ListId },
 }
 
 impl Default for Model {
@@ -134,6 +144,7 @@ impl Default for Model {
             tasks: Vec::new(),
             selected_task: None,
             sort: SortView::Manual,
+            show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
             should_quit: false,
@@ -143,6 +154,7 @@ impl Default for Model {
             pending_deletes: HashMap::new(),
             pending_list_writes: HashMap::new(),
             pending_list_deletes: HashMap::new(),
+            pending_clears: HashMap::new(),
             next_temp: 0,
             // A fixed placeholder, deliberately not the real clock: `Default`
             // stays pure so tests construct a deterministic Model and set `now`
@@ -196,6 +208,22 @@ impl Model {
             SortView::Title => ordered.sort_by_cached_key(|t| t.title.to_lowercase()),
         }
         ordered
+    }
+
+    /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
+    /// with Completed Tasks filtered out unless `show_completed` reveals them.
+    /// The view renders this; the completion meter still counts over all `tasks`.
+    pub fn visible_tasks(&self) -> Vec<&Task> {
+        self.sorted_tasks()
+            .into_iter()
+            .filter(|t| self.is_visible(t))
+            .collect()
+    }
+
+    /// Whether a Task is currently shown: always, unless it is Completed and
+    /// completed Tasks are hidden.
+    fn is_visible(&self, task: &Task) -> bool {
+        self.show_completed || task.status != Status::Completed
     }
 }
 
@@ -252,6 +280,13 @@ pub enum Message {
     ListDeleted(ListId),
     /// A List delete failed; re-insert the List at its prior position.
     ListDeleteFailed {
+        list: ListId,
+        reason: String,
+    },
+    /// A Clear succeeded; drop the optimistic-Clear snapshot for the List.
+    ClearedCompleted(ListId),
+    /// A Clear failed; restore the List's pre-Clear Tasks.
+    ClearCompletedFailed {
         list: ListId,
         reason: String,
     },
@@ -315,6 +350,8 @@ pub enum Command {
     RenameList { list: ListId, title: String },
     /// Delete a List.
     DeleteList { list: ListId },
+    /// Sweep a List's Completed Tasks to hidden (`clear_completed`).
+    ClearCompleted { list: ListId },
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
@@ -453,6 +490,30 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             model.status_line = Some(reason);
             Vec::new()
         }
+        Message::ClearedCompleted(list) => {
+            // Confirmed swept; drop the rollback snapshot (Tasks already removed).
+            model.pending_clears.remove(&list);
+            Vec::new()
+        }
+        Message::ClearCompletedFailed { list, reason } => {
+            if let Some(removed) = model.pending_clears.remove(&list) {
+                // Re-insert the swept Tasks only if that List is still active — a
+                // List switch during the Clear left a different pane in place.
+                // Ascending by prior index restores original order; skip any a
+                // refresh already re-added so we can't duplicate (cf. delete).
+                if model.selected_list_id() == Some(&list) {
+                    for (index, task) in removed {
+                        if !model.tasks.iter().any(|t| t.id == task.id) {
+                            let at = index.min(model.tasks.len());
+                            model.tasks.insert(at, task);
+                        }
+                    }
+                    reselect_visible(model);
+                }
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
         Message::NotesEdited { task, notes } => finish_edit_notes(model, task, notes),
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
@@ -532,6 +593,8 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
             .and_then(|id| model.tasks.iter().position(|t| t.id == id))
             .or(Some(0))
     };
+    // Don't leave the cursor on a Task hidden by the completed filter.
+    reselect_visible(model);
 }
 
 fn apply(model: &mut Model, action: Action) -> Vec<Command> {
@@ -555,6 +618,13 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         // and `selected_task` keeps indexing it, so the cursor stays on the
         // same Task by id across the re-sort. Never emits a Command.
         Action::CycleSort => model.sort = model.sort.next(),
+        // View-only: reveal/hide Completed Tasks. Hiding may drop the selected
+        // Task out of view, so re-anchor the cursor onto a visible one.
+        Action::ToggleShowCompleted => {
+            model.show_completed = !model.show_completed;
+            reselect_visible(model);
+        }
+        Action::ClearCompleted => open_clear_completed_confirm(model),
     }
     Vec::new()
 }
@@ -697,6 +767,28 @@ fn open_delete_confirm(model: &mut Model) {
     model.overlay = Some(Overlay::Confirm(Confirm {
         prompt: format!("Delete \"{title}\"? (y/n)"),
         action: ConfirmAction::DeleteTask { list, task: id },
+    }));
+}
+
+/// Open the destructive-confirm for Clearing the active List's Completed Tasks.
+/// A no-op with no active List or nothing to Clear (don't prompt for zero).
+fn open_clear_completed_confirm(model: &mut Model) {
+    let Some(list) = model.selected_list_id().cloned() else {
+        return;
+    };
+    let done = model
+        .tasks
+        .iter()
+        .filter(|t| t.status == Status::Completed)
+        .count();
+    if done == 0 {
+        model.status_line = Some("no completed tasks to clear".to_string());
+        return;
+    }
+    let plural = if done == 1 { "task" } else { "tasks" };
+    model.overlay = Some(Overlay::Confirm(Confirm {
+        prompt: format!("Clear {done} completed {plural}? (y/n)"),
+        action: ConfirmAction::ClearCompleted { list },
     }));
 }
 
@@ -919,6 +1011,28 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             cmds.extend(request_selected_tasks(model, true));
             cmds
         }
+        ConfirmAction::ClearCompleted { list } => {
+            // Single-flight: one Clear per List at a time.
+            if model.pending_clears.contains_key(&list) {
+                model.status_line =
+                    Some("a clear is already in progress for this list".to_string());
+                return Vec::new();
+            }
+            // Snapshot the Completed Tasks with their indices (ascending), then
+            // optimistically drop them. If they were hidden the change is
+            // invisible, but Google is still swept and the log holds their history.
+            let removed: Vec<(usize, Task)> = model
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.status == Status::Completed)
+                .map(|(i, t)| (i, t.clone()))
+                .collect();
+            model.tasks.retain(|t| t.status != Status::Completed);
+            model.pending_clears.insert(list.clone(), removed);
+            reselect_visible(model);
+            vec![Command::ClearCompleted { list }]
+        }
     }
 }
 
@@ -961,6 +1075,11 @@ fn toggle_complete(model: &mut Model) -> Vec<Command> {
     let completed = model.tasks[index].status == Status::NeedsAction; // completing iff open
     set_completed(&mut model.tasks[index], completed);
     model.pending_writes.insert(id.clone(), snapshot);
+    // Completing a Task while completed are hidden drops it from view; move the
+    // cursor onto the next visible Task (the Google-app behaviour).
+    if completed && !model.show_completed {
+        reselect_visible(model);
+    }
     vec![Command::SetCompleted {
         list,
         task: id,
@@ -974,10 +1093,54 @@ fn move_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     match model.focus {
         Focus::Sidebar => move_list_selection(model, delta),
         Focus::Tasks => {
-            move_index(&mut model.selected_task, model.tasks.len(), delta);
+            move_task_cursor(model, delta);
             Vec::new()
         }
     }
+}
+
+/// Move the task cursor by `delta`, skipping Tasks hidden by the completed
+/// filter so it never lands on an invisible row. Clamps at the visible ends.
+fn move_task_cursor(model: &mut Model, delta: isize) {
+    let Some(current) = model.selected_task else {
+        return;
+    };
+    let step = if delta >= 0 { 1isize } else { -1 };
+    let n = model.tasks.len() as isize;
+    let mut i = current as isize;
+    loop {
+        let next = i + step;
+        if next < 0 || next >= n {
+            return; // no further visible Task in that direction; stay put
+        }
+        i = next;
+        if model.is_visible(&model.tasks[i as usize]) {
+            model.selected_task = Some(i as usize);
+            return;
+        }
+    }
+}
+
+/// Ensure `selected_task` points at a visible Task. Keeps the current selection
+/// when it is visible; otherwise moves to the nearest visible Task at or after
+/// it, then the nearest before it, then `None` when nothing is visible.
+fn reselect_visible(model: &mut Model) {
+    if model.tasks.is_empty() {
+        model.selected_task = None;
+        return;
+    }
+    if let Some(i) = model.selected_task {
+        if i < model.tasks.len() && model.is_visible(&model.tasks[i]) {
+            return;
+        }
+    }
+    let start = model.selected_task.unwrap_or(0).min(model.tasks.len() - 1);
+    let forward = (start..model.tasks.len()).find(|&i| model.is_visible(&model.tasks[i]));
+    model.selected_task = forward.or_else(|| {
+        (0..start)
+            .rev()
+            .find(|&i| model.is_visible(&model.tasks[i]))
+    });
 }
 
 fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {

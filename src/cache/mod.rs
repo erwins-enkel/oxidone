@@ -1,6 +1,7 @@
 //! SQLite persistence. The `lists`/`tasks` tables mirror Google's resources
 //! (ADR-0003) plus sync-metadata columns `dirty`, `etag`, `local_updated`
-//! (ADR-0001); a later `completion_log` (ADR-0007) is kept out of the mirror.
+//! (ADR-0001); the append-only `completion_log` (ADR-0007) is kept *out* of the
+//! mirror — it accumulates completion history Google discards on Clear.
 //!
 //! Migrations are an ordered, append-only list applied via SQLite's
 //! `user_version`, so later slices add tables by appending — never editing
@@ -42,6 +43,17 @@ const MIGRATIONS: &[&str] = &[
         dirty         INTEGER NOT NULL DEFAULT 0
      );
      CREATE INDEX tasks_by_list ON tasks (list_id, position);",
+    // 0003 — Completion log (ADR-0007), append-only and out of the mirror. The
+    // (task_id, completed_at) primary key makes re-observing a completion (on
+    // every refresh) idempotent; re-completing after un-completing yields a new
+    // `completed_at`, hence a new event.
+    "CREATE TABLE completion_log (
+        task_id      TEXT NOT NULL,
+        list_id      TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, completed_at)
+     );",
 ];
 
 pub struct Cache {
@@ -186,6 +198,20 @@ impl Cache {
                 ])?;
             }
         }
+        // Observe completions for the log in the same transaction (ADR-0007), so
+        // a refresh that first sees a Completed Task — including one completed on
+        // another surface — records it before Google can Clear it away.
+        {
+            let mut log = tx.prepare(
+                "INSERT OR IGNORE INTO completion_log (task_id, list_id, title, completed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for t in tasks {
+                if let (Status::Completed, Some(at)) = (t.status, t.completed_at) {
+                    log.execute(params![t.id.0, t.list.0, t.title, at.to_rfc3339()])?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -214,7 +240,58 @@ impl Cache {
                 Utc::now().to_rfc3339(),
             ],
         )?;
+        // Mirroring a Task is also where its completion is observed for the log
+        // (ADR-0007). A log failure must not fail the (authoritative) cache write
+        // — the log is non-authoritative and self-heals on the next full refresh
+        // via `replace_tasks` — so it is surfaced to the trace, not propagated.
+        if let Err(e) = self.log_completion(task) {
+            tracing::warn!(error = %e, task = %task.id.0, "failed to append completion to log");
+        }
         Ok(())
+    }
+
+    /// Append an observed completion to the append-only `completion_log`
+    /// (ADR-0007). A no-op unless the Task is Completed with a `completed_at`;
+    /// idempotent on `(task_id, completed_at)`. Deliberately separate from the
+    /// pure-mirror `tasks` table (ADR-0003).
+    pub fn log_completion(&self, task: &Task) -> Result<()> {
+        let (Status::Completed, Some(at)) = (task.status, task.completed_at) else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO completion_log (task_id, list_id, title, completed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task.id.0, task.list.0, task.title, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The logged completion events, oldest first. Feeds future activity views;
+    /// never treated as authoritative task state.
+    pub fn completions(&self) -> Result<Vec<Completion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, list_id, title, completed_at
+             FROM completion_log ORDER BY completed_at, task_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task, list, title, at) = row?;
+            out.push(Completion {
+                task: TaskId(task),
+                list: ListId(list),
+                title,
+                completed_at: parse_ts(&at)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Remove a single Task from the cache (mirrors a delete-through).
@@ -250,6 +327,15 @@ impl Cache {
         }
         Ok(tasks)
     }
+}
+
+/// A logged completion event (ADR-0007): local-only, non-authoritative history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub task: TaskId,
+    pub list: ListId,
+    pub title: String,
+    pub completed_at: DateTime<Utc>,
 }
 
 /// Raw Task columns, before parsing timestamps/enums into domain types.

@@ -22,6 +22,8 @@ pub enum Action {
     EditNotes,
     DeleteTask,
     CycleSort,
+    ToggleShowCompleted,
+    ClearCompleted,
     // Sidebar List management. Bound to capitals so they never clash with the
     // task-pane verbs (`a`/`e`/`x`); the reducer additionally gates them on the
     // sidebar being focused.
@@ -122,6 +124,16 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('s'),
             action: Action::CycleSort,
             help: "cycle sort (manual/due/title)",
+        },
+        Binding {
+            key: KeyCode::Char('c'),
+            action: Action::ToggleShowCompleted,
+            help: "show/hide completed",
+        },
+        Binding {
+            key: KeyCode::Char('C'),
+            action: Action::ClearCompleted,
+            help: "clear completed",
         },
         Binding {
             key: KeyCode::Char('A'),

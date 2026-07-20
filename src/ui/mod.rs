@@ -103,9 +103,10 @@ fn due_style(task: &Task, today: NaiveDate, theme: &Theme) -> Style {
 
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
-    // The current sort is a read-only lens over `tasks`: the display order comes
-    // from `sorted_tasks()`, while `tasks` (Manual order) stays untouched.
-    let ordered = model.sorted_tasks();
+    // The displayed rows are a read-only lens over `tasks`: the current sort's
+    // order with Completed Tasks filtered out unless revealed. `tasks` (Manual
+    // order) stays untouched, and the header meter still counts over all of it.
+    let ordered = model.visible_tasks();
     // Due dates lead the row in a fixed-width gutter so they scan vertically.
     // The gutter only exists when something in view has a due date — otherwise
     // every title would sit behind a column of blanks.

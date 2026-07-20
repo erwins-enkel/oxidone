@@ -182,6 +182,48 @@ fn an_over_long_url_is_truncated_rather_than_overflowing_the_popup() {
 }
 
 #[test]
+fn a_double_width_url_is_truncated_by_cells_not_characters() {
+    // 60 CJK characters are 60 chars but 120 display cells. Budgeting by chars
+    // would keep ~45 of them — ~90 cells — and overrun the 50-cell popup, which
+    // ratatui then clips with no ellipsis: a truncated URL reading as a whole one.
+    let wide = format!("https://例え.jp/{}", "テ".repeat(60));
+    let mut model = model_with(vec![task(
+        "1",
+        "alpha",
+        Some(&format!("{wide} https://b.dev/2")),
+    )]);
+    ui_update(&mut model, Message::Key(press('u')));
+
+    let drawn = rows(&model);
+    let truncated = drawn
+        .iter()
+        .find(|r| r.contains('…'))
+        .unwrap_or_else(|| panic!("expected a truncated row:\n{}", drawn.join("\n")));
+    let plain = drawn
+        .iter()
+        .find(|r| r.contains("https://b.dev/2"))
+        .expect("the short URL renders untruncated");
+
+    // Border *columns*, not byte offsets — the truncated row is full of
+    // multibyte characters. Identical layouts on both picker rows is precisely
+    // what "did not overrun the popup" means, and what a char-based budget breaks.
+    let borders = |row: &str| -> Vec<usize> {
+        row.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '│')
+            .map(|(i, _)| i)
+            .collect()
+    };
+    assert_eq!(
+        borders(truncated),
+        borders(plain),
+        "the wide row overran the popup:\n{}",
+        drawn.join("\n")
+    );
+    assert!(!drawn.join("\n").contains(&wide), "nothing may spill whole");
+}
+
+#[test]
 fn the_link_cell_is_absent_at_eighty_columns_and_present_when_it_fits() {
     // The accepted cost, pinned: at the default width `u` is only in `?`.
     let model = model_with(vec![task("1", "alpha", None)]);

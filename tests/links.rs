@@ -64,6 +64,39 @@ fn urls_across_lines_are_found() {
 }
 
 #[test]
+fn prose_punctuation_in_front_of_a_url_does_not_swallow_it() {
+    // The backward walk over scheme characters sweeps up a list marker or a
+    // bullet; a scheme must start with a letter, so it steps forward to one
+    // rather than discarding the token and reporting "no links".
+    let cases = [
+        ("1.https://a.dev", "https://a.dev"),
+        ("2.https://b.dev/x", "https://b.dev/x"),
+        ("-https://a.dev", "https://a.dev"),
+        ("+https://a.dev", "https://a.dev"),
+        ("see 3.https://c.dev/y please", "https://c.dev/y"),
+    ];
+    for (notes, expected) in cases {
+        assert_eq!(scan_urls(notes), vec![expected], "notes: {notes:?}");
+        assert!(has_openable_url(notes), "marker missing for {notes:?}");
+    }
+}
+
+#[test]
+fn a_run_with_no_letter_at_all_is_not_a_scheme() {
+    assert!(scan_urls("123://nope").is_empty());
+    assert!(scan_urls("...://nope").is_empty());
+}
+
+#[test]
+fn a_letter_led_run_keeps_its_whole_scheme() {
+    // Not the same case: `x1https` legally *is* a scheme, just not an openable
+    // one, so it must be counted and refused rather than trimmed into `https`.
+    let notes = "x1https://a.dev";
+    assert_eq!(scan_urls(notes).len(), 1);
+    assert!(openable_urls(notes).is_empty());
+}
+
+#[test]
 fn a_schemeless_host_is_not_a_url() {
     assert!(scan_urls("see www.example.com for details").is_empty());
 }
@@ -152,6 +185,10 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
         ":// stray",
         "https://a.dev/1 https://a.dev/1",
         "Größe https://a.dev/größe",
+        "1.https://a.dev",
+        "-https://a.dev",
+        "123://nope",
+        "x1https://a.dev",
     ];
     for notes in fixtures {
         assert_eq!(

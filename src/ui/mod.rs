@@ -20,6 +20,7 @@ use crate::domain::{Status, Task};
 use crate::keymap;
 use crate::links::{self, OpenableUrl};
 use theme::Theme;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use widgets::{dueload, meter};
 
 /// Days of "workload ahead" bucketed into the due-load strip (today + 6).
@@ -63,7 +64,9 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
 /// Width shared by every overlay, so the picker lines up with the text popups
 /// rather than introducing a second modal size.
 const OVERLAY_WIDTH: u16 = 50;
-/// Rows an overlay spends on its own border.
+/// Cells a bordered overlay spends on its own frame, on either axis: one per
+/// side, so two off the height *and* two off the usable text width. Used for
+/// both deliberately — a `Block::bordered` costs the same in each direction.
 const OVERLAY_BORDERS: u16 = 2;
 
 fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
@@ -109,8 +112,8 @@ fn render_link_picker(
     // By characters, not bytes: a URL in free-text notes may be multibyte, and
     // slicing one mid-codepoint would panic. The gutter comes off the budget
     // too — `render_selectable` spends it on every row.
-    let width = (popup.width.saturating_sub(OVERLAY_BORDERS) as usize)
-        .saturating_sub(LIST_CURSOR.chars().count());
+    let width =
+        (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
     let items: Vec<ListItem> = urls
         .iter()
         .map(|url| ListItem::new(truncate(url.as_str(), width)))
@@ -119,14 +122,31 @@ fn render_link_picker(
     render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
 }
 
-/// `text` cut to `width` characters, with the last cell spent on an ellipsis so
+/// `text` cut to `width` *display cells*, with the last spent on an ellipsis so
 /// a truncated URL never reads as a complete one.
+///
+/// Cells, not chars: a URL pasted from an IRI can carry double-width characters
+/// (`https://例え.jp/…`), and budgeting by `chars().count()` would under-measure
+/// them — ratatui lays out by cell, so the row would overflow and be clipped
+/// with no ellipsis to show for it, which is the very thing this prevents.
 fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if text.width() <= width {
         return text.to_string();
     }
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
+    // `…` is itself one cell.
+    let budget = width.saturating_sub(1);
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cell = c.width().unwrap_or(0);
+        if used + cell > budget {
+            break;
+        }
+        kept.push(c);
+        used += cell;
+    }
+    kept.push('…');
+    kept
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
@@ -728,10 +748,7 @@ mod tests {
     fn the_cursor_gutter_is_the_same_width_either_way() {
         // The picker's truncation budget subtracts `LIST_CURSOR`; if the blank
         // drifted wider, focused and unfocused rows would wrap differently.
-        assert_eq!(
-            LIST_CURSOR.chars().count(),
-            LIST_CURSOR_BLANK.chars().count()
-        );
+        assert_eq!(LIST_CURSOR.width(), LIST_CURSOR_BLANK.width());
     }
 
     #[test]

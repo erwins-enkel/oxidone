@@ -124,9 +124,14 @@ impl<'a> Iterator for UrlTokens<'a> {
 /// Byte index where the scheme preceding `sep` starts, if there is a valid one.
 ///
 /// Walks back over RFC 3986 scheme characters — `ALPHA *( ALPHA / DIGIT / "+" /
-/// "-" / "." )` — and requires the run to begin with a letter. Byte-wise
-/// backtracking is safe because every character it accepts is ASCII, so a UTF-8
-/// continuation byte can never be mistaken for one.
+/// "-" / "." )` — then forward to the first letter, because a scheme must begin
+/// with one and the backward walk cannot know where the URL stops and the prose
+/// in front of it starts. `1.https://a.dev` (a numbered list) and
+/// `-https://a.dev` (a bullet) both sweep punctuation into the run; rejecting
+/// the whole token there would lose the URL entirely rather than trim it.
+///
+/// Byte-wise backtracking is safe because every character it accepts is ASCII,
+/// so a UTF-8 continuation byte can never be mistaken for one.
 fn scheme_start(text: &str, sep: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut start = sep;
@@ -138,5 +143,10 @@ fn scheme_start(text: &str, sep: usize) -> Option<usize> {
             break;
         }
     }
-    (start < sep && bytes[start].is_ascii_alphabetic()).then_some(start)
+    // Everything from here to `sep` is already a legal scheme body, so the first
+    // letter in the run is the first byte that can legally open a scheme.
+    while start < sep && !bytes[start].is_ascii_alphabetic() {
+        start += 1;
+    }
+    (start < sep).then_some(start)
 }

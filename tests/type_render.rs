@@ -313,3 +313,76 @@ fn a_dated_note_still_shows_its_date_in_the_due_gutter() {
         "a dated Note should still show its date in the gutter: {row:?}"
     );
 }
+
+#[test]
+fn a_subtask_meter_budgets_against_the_row_as_drawn() {
+    // The meter's width budget must count what the row *renders* — the signifier
+    // cell plus the display title — not the raw `Task.title`. On a pane where
+    // some entry is typed, an untyped parent still gets a blank signifier cell,
+    // so budgeting against the raw title hands the meter two columns the row
+    // does not have and ratatui clips it mid-token ("1/" instead of "1/2").
+    //
+    // The parent here is deliberately plain and shares the pane with a typed
+    // sibling: that is the combination where the two widths diverge.
+    for width in 28u16..=64 {
+        let parent = task("1", "parent");
+        let mut done_kid = task("2", "step one");
+        done_kid.parent = Some(TaskId("1".into()));
+        done_kid.status = Status::Completed;
+        let mut open_kid = task("3", "step two");
+        open_kid.parent = Some(TaskId("1".into()));
+
+        let model = model_with(vec![
+            parent,
+            done_kid,
+            open_kid,
+            task("9", &EntryType::Event.apply("standup")),
+        ]);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, HEIGHT)).expect("TestBackend terminal");
+        let theme = Theme::from_flavor("mocha");
+        terminal
+            .draw(|frame| ui::view(&model, &theme, true, frame))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let row = (0..HEIGHT)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|r| r.contains("parent"))
+            .unwrap_or_else(|| panic!("no parent row at width {width}"));
+
+        // The meter degrades bar-first and then vanishes; what it must never do
+        // is render a ratio the row cannot hold.
+        if row.contains('/') {
+            assert!(
+                row.contains("1/2"),
+                "meter clipped at width {width}: {:?}",
+                row.trim_end()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_subtask_meter_is_actually_drawn_somewhere_in_that_range() {
+    // Guards the loop above from passing because no meter ever renders.
+    let parent = task("1", "parent");
+    let mut kid = task("2", "step");
+    kid.parent = Some(TaskId("1".into()));
+
+    let model = model_with(vec![
+        parent,
+        kid,
+        task("9", &EntryType::Event.apply("standup")),
+    ]);
+    let drawn = rows(&model, true);
+    assert!(
+        row_with(&drawn, "parent").contains("0/1"),
+        "expected a Subtask meter: {:?}",
+        row_with(&drawn, "parent")
+    );
+}

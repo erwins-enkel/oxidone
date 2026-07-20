@@ -415,10 +415,18 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // share a column with its parent's and flatten the only cue telling
             // them apart. Inherits the row style, like the link marker — a
             // Completed Event reads as one settled line.
-            if signifiers {
-                spans.push(Span::styled(signifier(t.entry_type(), ascii), style));
+            let cell = signifiers.then(|| signifier(t.entry_type(), ascii));
+            if let Some(cell) = cell {
+                spans.push(Span::styled(cell, style));
             }
             spans.push(Span::styled(t.display_title().to_string(), style));
+            // What the row actually put on screen, not what the Task stores: the
+            // signifier cell plus the *display* title. The Subtask meter budgets
+            // against this, so it must be derived from the same two values that
+            // were just drawn — `t.title` is neither of them, and on a pane with
+            // signifiers an untyped row's raw title understates the drawn width
+            // by the cell, handing the meter room the row does not have.
+            let drawn_width = cell.map_or(0, |c| c.width()) + t.display_title().width();
             // Trails the title so the due gutter and Subtask indent stay
             // aligned. Driven by the cheap predicate, not by collecting the
             // URLs: this runs for every visible row on every frame.
@@ -437,7 +445,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 subtask_counts.get(&t.id).copied(),
                 area.width,
                 due_gutter,
-                t.title.width(),
+                drawn_width,
                 marker.map_or(0, |m| m.width()),
                 ascii,
             );

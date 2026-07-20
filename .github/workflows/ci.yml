@@ -36,3 +36,11 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+      # Unused-dependency audit. rust-cache caches ~/.cargo/bin, so the install
+      # is paid once per cache generation.
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: Unused dependencies
+        run: cargo machete

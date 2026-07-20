@@ -88,11 +88,21 @@ The refresh token is stored `chmod 600` in the config dir. See
 
 ## Development
 
+Once per clone, point Git at the committed hooks:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+That enables a `pre-push` hook mirroring CI (fmt · clippy · test · unused deps) and a
+`commit-msg` hook enforcing [Conventional Commits](https://www.conventionalcommits.org/).
+
 ```sh
 cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo machete                 # unused deps; cargo install cargo-machete
 ```
 
 The core (TEA reducer, `TasksApi` trait, cache, sync) is testable with no terminal and

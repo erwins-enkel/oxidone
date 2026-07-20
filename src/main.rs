@@ -38,8 +38,50 @@ type Api = Option<Arc<dyn TasksApi>>;
 /// The cache, shared between the reducer loop and background workers.
 type SharedCache = Arc<Mutex<Cache>>;
 
+/// Usage text for `--help` and the fail-closed unknown-argument path.
+const USAGE: &str = "\
+oxidone — a single-user TUI for Google Tasks
+
+Usage:
+  oxidone                    launch the TUI
+  oxidone --version          print the version and exit
+  oxidone --help             print this help and exit
+  oxidone --print-config-path print the config file path and exit";
+
+/// Argument dispatch runs BEFORE `main_inner` so query flags stay pure: they
+/// print and exit without `init_tracing` creating a log dir, and without
+/// spinning up the tokio runtime. An unrecognized argument fails closed
+/// (exit 2 with usage) rather than falling through to the TUI.
+fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") => {
+            println!("oxidone {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Some("--print-config-path") => match config::config_file() {
+            Some(path) => {
+                println!("{}", path.display());
+                Ok(())
+            }
+            None => {
+                eprintln!("oxidone: no config directory (is a home dir set?)");
+                std::process::exit(1);
+            }
+        },
+        Some(other) => {
+            eprintln!("oxidone: unrecognized argument '{other}'\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        None => main_inner(),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main_inner() -> Result<()> {
     init_tracing();
     let config = Config::load();
     let theme = Theme::from_flavor(&config.theme);

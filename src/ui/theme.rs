@@ -1,7 +1,7 @@
 //! Catppuccin palette, four flavors, selectable from config (default Mocha).
 //! btop supplies structure; Catppuccin supplies color — independent layers
 //! (ADR-0006). Only the roles the UI actually paints are surfaced here; more
-//! (overdue, done, warning…) join as data widgets land.
+//! (done, warning…) join as data widgets land.
 
 use ratatui::style::Color;
 
@@ -16,6 +16,8 @@ pub struct Theme {
     pub surface: Color,
     /// Focused panel border + highlights.
     pub accent: Color,
+    /// A due date that has passed.
+    pub overdue: Color,
 }
 
 impl Theme {
@@ -33,6 +35,7 @@ impl Theme {
             subtext: conv(&c.subtext0),
             surface: conv(&c.surface1),
             accent: conv(&c.mauve),
+            overdue: conv(&c.red),
         }
     }
 }

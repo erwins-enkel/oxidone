@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 
 use oxidone::api::{RestClient, TasksApi};
-use oxidone::app::{update, Command, Message, Model};
+use oxidone::app::{update, Command, Message, Model, OFFLINE};
 use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config};
@@ -135,6 +135,7 @@ async fn run(
     // Then a background refresh (if online) updates both from Google.
     let mut model = Model::new();
     model.editor_available = editor.is_some();
+    model.api_available = api.is_some();
     let seed = update(&mut model, Message::ListsLoaded(initial_lists));
     seed_tasks_from_cache(&mut model, seed, &cache);
     if let Some(reason) = load_error {
@@ -355,13 +356,20 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            // The reducer already gates this on `api_available`, so the `None`
+            // arm is unreachable in practice; it fails closed rather than
+            // silently dropping the Refresh (cf. `run_notes_editor`). Unlike
+            // the write commands above, a Refresh has no optimistic change to
+            // roll back, so it reports via the id-less `LoadFailed`.
+            Command::RefreshLists => match api {
+                Some(api) => spawn_refresh_lists(api.clone(), cache.clone(), tx.clone()),
+                None => {
+                    let _ = tx.send(Message::LoadFailed(OFFLINE.to_string()));
+                }
+            },
         }
     }
 }
-
-/// Shown when a write is attempted with no live connection (ADR-0001: no offline
-/// editing in v1).
-const OFFLINE: &str = "not connected to Google";
 
 /// Write-through a completion toggle: patch on Google (retry-once), mirror into
 /// the cache, and report the server Task back (or a rollback on failure).

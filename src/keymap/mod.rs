@@ -28,6 +28,9 @@ pub enum Action {
     CycleSort,
     ToggleShowCompleted,
     ClearCompleted,
+    // Manual Refresh: re-pull the List set (and, via the cascade, the active
+    // List's Tasks) from Google. Modeless — it is not gated on a pane.
+    Refresh,
     // Subtasks & reorder — all Move operations (task pane, Manual order).
     AddSubtask,
     Indent,
@@ -166,6 +169,11 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('C'),
             action: Action::ClearCompleted,
             help: "clear completed",
+        },
+        Binding {
+            key: KeyCode::Char('r'),
+            action: Action::Refresh,
+            help: "refresh from Google",
         },
         Binding {
             key: KeyCode::Char('o'),

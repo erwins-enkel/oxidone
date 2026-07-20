@@ -168,6 +168,10 @@ fn resolve_maps_keys_to_actions() {
         keymap::resolve(key_ev(KeyCode::Tab)),
         Some(Action::SwitchPane)
     );
+    assert_eq!(
+        keymap::resolve(key_ev(KeyCode::Char('r'))),
+        Some(Action::Refresh)
+    );
     assert_eq!(keymap::resolve(key_ev(KeyCode::Char('z'))), None);
 }
 
@@ -195,6 +199,9 @@ fn the_focus_keys_are_bound_and_documented() {
 fn help_overlay_is_generated_from_the_binding_table() {
     // Every binding contributes a help entry — the cheatsheet is the table.
     assert!(keymap::bindings().iter().any(|b| b.action == Action::Quit));
+    assert!(keymap::bindings()
+        .iter()
+        .any(|b| b.action == Action::Refresh));
     assert!(keymap::bindings().iter().all(|b| !b.help.is_empty()));
 }
 

@@ -11,6 +11,11 @@ use crate::dateparse;
 use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 
+/// Shown when an operation needs Google but no API client was configured: a
+/// write (ADR-0001: no offline editing in v1), or a Refresh, which has nothing
+/// to pull without one.
+pub const OFFLINE: &str = "not connected to Google";
+
 /// Which pane currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -92,6 +97,13 @@ pub struct Model {
     /// editor, `EditNotes` emits `SpawnEditor`; without, it opens the inline
     /// single-line fallback overlay.
     pub editor_available: bool,
+    /// Whether an API client was configured at startup, stamped by the runtime
+    /// like `editor_available`. Decides the Refresh path purely: with a client,
+    /// `Refresh` emits the Command; without, it reports [`OFFLINE`] and emits
+    /// nothing. Note this says credentials were constructed, *not* that Google
+    /// is reachable — with the network down it still reads `true` and the
+    /// Refresh fails at the worker, landing on the status line.
+    pub api_available: bool,
 }
 
 /// A modal overlay drawn over the panes.
@@ -177,6 +189,8 @@ impl Default for Model {
                 .with_timezone(&chrono::Local),
             // Defaults to the inline fallback; the runtime stamps the real value.
             editor_available: false,
+            // Defaults to offline; the runtime stamps the real value.
+            api_available: false,
         }
     }
 }
@@ -416,6 +430,12 @@ pub enum Command {
     DeleteList { list: ListId },
     /// Sweep a List's Completed Tasks to hidden (`clear_completed`).
     ClearCompleted { list: ListId },
+    /// Re-pull the List set from Google. Named for what it does: the active
+    /// List's Tasks are refreshed too, but as a *consequence* — the resulting
+    /// `ListsLoaded` flows through `set_lists`, which re-requests them. So one
+    /// Command refreshes both halves, at the cost of coupling their failures
+    /// (a failed `list_lists` emits `LoadFailed` and the cascade never starts).
+    RefreshLists,
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
@@ -712,6 +732,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             reselect_visible(model);
         }
         Action::ClearCompleted => open_clear_completed_confirm(model),
+        Action::Refresh => return refresh(model),
         Action::AddSubtask => open_add_subtask(model),
         Action::Indent => return indent(model),
         Action::Outdent => return outdent(model),
@@ -1084,6 +1105,23 @@ fn open_clear_completed_confirm(model: &mut Model) {
         prompt: format!("Clear {done} completed {plural}? (y/n)"),
         action: ConfirmAction::ClearCompleted { list },
     }));
+}
+
+/// Re-pull from Google on demand. Modeless: it is not gated on a pane, a
+/// selection, or any in-flight operation. Emits a single `RefreshLists`, whose
+/// `ListsLoaded` cascades through `set_lists` into the active List's Tasks.
+///
+/// The transient status is cleared by `set_lists` when the *Lists* half lands,
+/// so it does not span the cascaded Tasks fetch — spanning both would need
+/// in-flight state tracked across two Messages, which is more bookkeeping than
+/// a spinner is worth.
+fn refresh(model: &mut Model) -> Vec<Command> {
+    if !model.api_available {
+        model.status_line = Some(OFFLINE.to_string());
+        return Vec::new();
+    }
+    model.status_line = Some("refreshing...".to_string());
+    vec![Command::RefreshLists]
 }
 
 /// The active List, if the sidebar is focused with a selection. List management

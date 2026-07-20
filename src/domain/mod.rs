@@ -77,11 +77,11 @@ impl SortView {
     /// A short lower-case label for the pane title. Every view names itself, so
     /// the header always says which lens is active — with `Due` the home state,
     /// an unlabelled pane would make Manual the silent one.
-    pub fn label(self) -> Option<&'static str> {
+    pub fn label(self) -> &'static str {
         match self {
-            SortView::Manual => Some("my order"),
-            SortView::Due => Some("due"),
-            SortView::Title => Some("title"),
+            SortView::Manual => "my order",
+            SortView::Due => "due",
+            SortView::Title => "title",
         }
     }
 }

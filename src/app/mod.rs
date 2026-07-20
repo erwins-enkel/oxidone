@@ -240,22 +240,25 @@ impl Model {
         match self.sort {
             // Vec order already; `groups` built it.
             SortView::Manual => {}
-            // Two rules hold for both lenses below. `sort_by_key` is stable, so
-            // equal keys — including the key-less tail — keep the stored order
-            // they were collected in. And only `group[1..]` is sorted: the
+            // Two rules hold for both lenses below. `sort_by_cached_key` is
+            // stable, so equal keys — including the key-less tail — keep the
+            // stored order they were collected in; it also computes each key
+            // once rather than per comparison, which matters for the group key
+            // (a scan) and the lowercased title (an allocation). And only
+            // `group[1..]` is sorted: the
             // parent stays the head of its group, or a Subtask could render
             // above the row it belongs to.
             SortView::Due => {
                 for group in &mut groups {
-                    group[1..].sort_by_key(|t| due_key(t.due));
+                    group[1..].sort_by_cached_key(|t| due_key(t.due));
                 }
-                groups.sort_by_key(|g| due_key(group_due_key(g)));
+                groups.sort_by_cached_key(|g| due_key(group_due_key(g)));
             }
             SortView::Title => {
                 for group in &mut groups {
-                    group[1..].sort_by_key(|t| t.title.to_lowercase());
+                    group[1..].sort_by_cached_key(|t| t.title.to_lowercase());
                 }
-                groups.sort_by_key(|g| g[0].title.to_lowercase());
+                groups.sort_by_cached_key(|g| g[0].title.to_lowercase());
             }
         }
         groups.into_iter().flatten().collect()
@@ -276,8 +279,10 @@ impl Model {
             );
             out.push(group);
         }
-        // Orphans keep their Vec position among the groups, so a stable sort
-        // leaves them where Manual would put them when their key ties.
+        // Orphans are appended after every parent group. Under `Manual` that
+        // puts them last (what `hierarchical` did); under the sorted lenses they
+        // are ordinary single-Task groups, so they sort on their own key and
+        // only fall back to this trailing position when that key ties.
         for task in &self.tasks {
             if !out.iter().flatten().any(|t| t.id == task.id) {
                 out.push(vec![task]);
@@ -311,6 +316,14 @@ impl Model {
     fn is_visible(&self, task: &Task) -> bool {
         self.show_completed || task.status != Status::Completed
     }
+}
+
+/// The id of the Task under the cursor, if any.
+fn selected_id(model: &Model) -> Option<TaskId> {
+    model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .map(|t| t.id.clone())
 }
 
 /// The Task that should take the cursor when `task` leaves the view: the next
@@ -556,11 +569,14 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 // re-insert when it's genuinely absent, so we can't duplicate.
                 if !model.tasks.iter().any(|t| t.id == previous.id) {
                     let at = index.min(model.tasks.len());
-                    let restored = previous.id.clone();
+                    // The insert shifts every later index, so re-resolve the
+                    // cursor by id. It does *not* jump to the restored Task: the
+                    // rollback arrives asynchronously, and by then the user may
+                    // have moved on to an unrelated row.
+                    let selected = selected_id(model);
                     model.tasks.insert(at, previous);
-                    // A rolled-back delete should leave the user looking at what
-                    // came back, wherever the active lens puts it.
-                    model.selected_task = model.tasks.iter().position(|t| t.id == restored);
+                    model.selected_task =
+                        selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                     reselect_visible(model);
                 }
             }
@@ -579,12 +595,18 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             Vec::new()
         }
         Message::TaskAddFailed { temp, reason } => {
-            // Pick the successor before dropping the placeholder — afterwards it
-            // has no display position to anchor from.
-            let successor = display_successor(model, &temp);
+            // Only a cursor sitting on the placeholder needs a new home; one that
+            // has moved elsewhere is left where the user put it. Either way the
+            // `retain` shifts indices, so the anchor is resolved by id afterwards.
+            let anchor = if selected_id(model).as_ref() == Some(&temp) {
+                // Taken before the placeholder goes: afterwards it has no display
+                // position to anchor from.
+                display_successor(model, &temp)
+            } else {
+                selected_id(model)
+            };
             model.tasks.retain(|t| t.id != temp);
-            model.selected_task =
-                successor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
             reselect_visible(model);
             model.status_line = Some(reason);
             Vec::new()
@@ -974,7 +996,7 @@ fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
     }
     if model.sort != SortView::Manual {
         model.sort = SortView::Manual;
-        model.status_line = Some("switched to manual order — press again to move".to_string());
+        model.status_line = Some("switched to \"my order\" — press again to move".to_string());
         return None;
     }
     Some((list, idx))
@@ -1421,6 +1443,9 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
                 return Vec::new();
             };
+            // Unconditional, unlike the async failure paths: the delete verb acts
+            // on the selection and the confirm overlay swallows keys, so the
+            // cursor is provably on the row about to disappear.
             let successor = display_successor(model, &task);
             let removed = model.tasks.remove(index); // optimistic delete
             model.pending_deletes.insert(task.clone(), (index, removed));

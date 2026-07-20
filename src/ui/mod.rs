@@ -170,10 +170,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         .and_then(|i| model.tasks.get(i))
         .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
 
-    let base = match model.sort.label() {
-        Some(label) => format!("Tasks — {label}"),
-        None => "Tasks".to_string(),
-    };
+    let base = format!("Tasks — {}", model.sort.label());
     // Inline btop-style data widgets in the header: a completion meter for the
     // active List and a due-load strip. Both drop out (never the text) when the
     // pane is too narrow — braille degrades before the title (ADR-0006).

@@ -58,9 +58,9 @@ fn default_sort_is_due() {
 fn every_lens_names_itself_in_the_pane_title() {
     // The header reads "Tasks — {label}". With Due the home state, an unlabelled
     // view would make Manual the silent one, so all three name themselves.
-    assert_eq!(SortView::Due.label(), Some("due"));
-    assert_eq!(SortView::Title.label(), Some("title"));
-    assert_eq!(SortView::Manual.label(), Some("my order"));
+    assert_eq!(SortView::Due.label(), "due");
+    assert_eq!(SortView::Title.label(), "title");
+    assert_eq!(SortView::Manual.label(), "my order");
 }
 
 // --- Reducer: the sort key cycles the lens without writing ------------------
@@ -463,13 +463,20 @@ fn deleting_the_last_displayed_task_anchors_the_previous_one() {
     assert_eq!(selected_title(&m), Some("a".to_string()));
 }
 
+/// A rollback arrives asynchronously, so it must not yank the cursor off
+/// whatever the user has moved to meanwhile — but re-inserting shifts every
+/// later index, so the selection still has to be re-resolved by id.
 #[test]
-fn delete_rollback_puts_the_cursor_on_the_restored_task() {
+fn a_delete_rollback_restores_the_task_without_moving_the_cursor() {
     let mut m = pane(scrambled(), 0); // on "b"
     let deleted = m.tasks[m.selected_task.unwrap()].id.clone();
     update(&mut m, press('x'));
     update(&mut m, press('y'));
     assert_eq!(selected_title(&m), Some("a".to_string()));
+
+    // The user carries on and moves to another row before the failure lands.
+    update(&mut m, press('j'));
+    assert_eq!(selected_title(&m), Some("c".to_string()));
 
     update(
         &mut m,
@@ -479,10 +486,41 @@ fn delete_rollback_puts_the_cursor_on_the_restored_task() {
         },
     );
 
+    assert_eq!(titles(&m.visible_tasks()), vec!["b", "a", "c"], "restored");
     assert_eq!(
         selected_title(&m),
-        Some("b".to_string()),
-        "a rolled-back delete leaves you looking at what came back",
+        Some("c".to_string()),
+        "the cursor stays where the user left it",
+    );
+}
+
+/// An add failure only re-homes a cursor that is *on* the placeholder.
+#[test]
+fn add_failure_leaves_an_unrelated_cursor_alone() {
+    let mut m = pane(scrambled(), 0);
+    update(&mut m, press('a'));
+    for c in "zz".chars() {
+        update(&mut m, press(c));
+    }
+    update(&mut m, Message::Key(key(KeyCode::Enter)));
+    let temp = m.tasks[m.selected_task.unwrap()].id.clone();
+
+    // Move off the placeholder before the failure arrives.
+    let target = m.tasks.iter().position(|t| t.title == "a").unwrap();
+    m.selected_task = Some(target);
+
+    update(
+        &mut m,
+        Message::TaskAddFailed {
+            temp,
+            reason: "boom".to_string(),
+        },
+    );
+
+    assert_eq!(
+        selected_title(&m),
+        Some("a".to_string()),
+        "an unrelated cursor is left where the user put it, index shift and all",
     );
 }
 

@@ -24,7 +24,7 @@ build:      ## compile the binary (PROFILE=release by default)
 
 install: build  ## build, then install to PREFIX/bin (default ~/.local/bin)
 	install -d "$(PREFIX)/bin"
-	install -m755 $(BIN) "$(PREFIX)/bin/oxidone"
+	install -m755 "$(BIN)" "$(PREFIX)/bin/oxidone"
 	@echo "installed $(PREFIX)/bin/oxidone"
 
 uninstall:  ## remove the installed binary
@@ -41,7 +41,7 @@ gate:       ## fmt · clippy · test · unused deps (what CI runs)
 	cargo machete
 
 config: build  ## write a starter config.toml if none exists
-	@cfg="$$($(BIN) --print-config-path)"; \
+	@cfg="$$("$(BIN)" --print-config-path)"; \
 	[ -n "$$cfg" ] || { echo "no home dir; cannot locate config" >&2; exit 1; }; \
 	if [ -e "$$cfg" ]; then echo "config exists, leaving it alone: $$cfg"; \
 	else install -d "$$(dirname "$$cfg")"; \

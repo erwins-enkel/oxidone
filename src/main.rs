@@ -45,7 +45,7 @@ oxidone — a single-user TUI for Google Tasks
 Usage:
   oxidone                    launch the TUI
   oxidone --version          print the version and exit
-  oxidone --help             print this help and exit
+  oxidone --help, -h         print this help and exit
   oxidone --print-config-path print the config file path and exit";
 
 /// Argument dispatch runs BEFORE `main_inner` so query flags stay pure: they

@@ -116,6 +116,7 @@ impl<'a> Iterator for UrlTokens<'a> {
             let end = self.rest[after..]
                 .find(char::is_whitespace)
                 .map_or(self.rest.len(), |i| after + i);
+            let end = self.next_url_start(start, after, end).unwrap_or(end);
             let token = self.rest[start..end].trim_end_matches(TRAILING);
             self.rest = &self.rest[end..];
             // Reject a bare `https://` with no authority: it is a scheme, not a
@@ -124,6 +125,29 @@ impl<'a> Iterator for UrlTokens<'a> {
                 return Some(token);
             }
         }
+    }
+}
+
+impl UrlTokens<'_> {
+    /// Where a *second* URL begins inside `start..end`, if one does.
+    ///
+    /// Notes glue URLs together with prose punctuation — `https://a.dev,https://b.dev`
+    /// — and whitespace alone would swallow both into one token that `parse`
+    /// happily accepts, handing the browser a malformed address instead of
+    /// offering a choice of two.
+    ///
+    /// The split only happens across the punctuation that already ends a URL
+    /// ([`TRAILING`]). A comma is a legal sub-delimiter, so
+    /// `https://maps.example.com/@52.5,13.4` must stay whole, and so must a
+    /// nested `https://a.dev/x?u=https://b.dev`, where the `=` before the inner
+    /// scheme is URL structure rather than prose.
+    fn next_url_start(&self, start: usize, after: usize, end: usize) -> Option<usize> {
+        let bytes = self.rest.as_bytes();
+        let sep = after + self.rest[after..end].find("://")?;
+        let next = scheme_start(self.rest, sep)?;
+        let prose_separated =
+            next > start && TRAILING.contains(&char::from(*bytes.get(next.checked_sub(1)?)?));
+        prose_separated.then_some(next)
     }
 }
 

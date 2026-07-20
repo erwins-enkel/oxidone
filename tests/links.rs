@@ -116,6 +116,44 @@ fn a_custom_dotted_scheme_is_kept_whole_rather_than_trimmed() {
 }
 
 #[test]
+fn urls_glued_by_prose_punctuation_are_two_links_not_one() {
+    // Whitespace alone would swallow both into a single token that `parse`
+    // accepts — scheme `https`, non-empty rest — handing the browser a
+    // malformed address instead of offering the choice.
+    for notes in [
+        "https://a.dev,https://b.dev",
+        "https://a.dev;https://b.dev",
+        "https://a.dev),https://b.dev",
+    ] {
+        assert_eq!(
+            scan_urls(notes),
+            vec!["https://a.dev", "https://b.dev"],
+            "notes: {notes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_comma_inside_a_single_url_is_left_alone() {
+    // `,` is a legal sub-delimiter (RFC 3986). Splitting on every internal comma
+    // would corrupt ordinary map links, which is worse than the case it fixes.
+    let notes = "https://maps.example.com/@52.5,13.4,15z";
+    assert_eq!(scan_urls(notes), vec![notes]);
+}
+
+#[test]
+fn a_nested_url_in_a_query_string_stays_with_its_parent() {
+    // The `=`/`&` before the inner scheme is URL structure, not prose, so a
+    // redirect or share link keeps its payload.
+    for notes in [
+        "https://a.dev/login?next=https://b.dev/x",
+        "https://a.dev/x?a=1&u=https://b.dev",
+    ] {
+        assert_eq!(scan_urls(notes), vec![notes], "notes: {notes:?}");
+    }
+}
+
+#[test]
 fn a_schemeless_host_is_not_a_url() {
     assert!(scan_urls("see www.example.com for details").is_empty());
 }
@@ -211,6 +249,9 @@ fn has_openable_url_agrees_with_openable_urls_on_every_fixture() {
         "a.https://x.dev",
         "e.g.https://x.dev",
         "myapp.custom://x",
+        "https://a.dev,https://b.dev",
+        "https://maps.example.com/@52.5,13.4",
+        "https://a.dev/x?u=https://b.dev",
     ];
     for notes in fixtures {
         assert_eq!(

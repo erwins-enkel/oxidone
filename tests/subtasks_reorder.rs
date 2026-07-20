@@ -565,3 +565,31 @@ fn an_ordinary_manual_move_reports_nothing() {
     assert_eq!(cmds.len(), 1, "the Move happens");
     assert_eq!(m.status_line, None, "a Manual Move reports nothing");
 }
+
+/// The optimistic reorder parks the cursor on the moved Task's new index; the
+/// rollback restores the prior order, so that index now holds the *other*
+/// sibling. The cursor must follow the Task it was on, not the slot.
+#[test]
+fn a_failed_move_leaves_the_cursor_on_the_moved_task() {
+    let mut m = model_with(vec![task("a", None), task("b", None), task("c", None)]);
+    m.selected_task = Some(0); // on "a"
+    update(&mut m, ch('J')); // optimistic: b, a, c — cursor follows "a"
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.clone()),
+        Some(tid("a")),
+    );
+
+    update(
+        &mut m,
+        Message::MoveFailed {
+            list: lid(),
+            reason: "boom".to_string(),
+        },
+    );
+
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.clone()),
+        Some(tid("a")),
+        "the cursor stays on the Task, not the index it was parked at",
+    );
+}

@@ -328,12 +328,20 @@ fn selected_id(model: &Model) -> Option<TaskId> {
 /// `None`. Must be called *before* `task` is removed — afterwards it has no
 /// display position to anchor from.
 fn display_successor(model: &Model, task: &TaskId) -> Option<TaskId> {
+    display_neighbour(model, task, |t| model.is_visible(t))
+}
+
+/// The nearest Task to `task` in display order that satisfies `keep` — forwards
+/// first, then backwards. Callers pass a predicate describing which rows will
+/// still be there once the mutation lands, so a cursor whose own row is going
+/// moves one step rather than to the top of the pane.
+fn display_neighbour(model: &Model, task: &TaskId, keep: impl Fn(&Task) -> bool) -> Option<TaskId> {
     let ordered = model.sorted_tasks();
     let pos = ordered.iter().position(|t| &t.id == task)?;
     ordered[pos + 1..]
         .iter()
-        .find(|t| model.is_visible(t))
-        .or_else(|| ordered[..pos].iter().rev().find(|t| model.is_visible(t)))
+        .find(|t| keep(t))
+        .or_else(|| ordered[..pos].iter().rev().find(|t| keep(t)))
         .map(|t| t.id.clone())
 }
 
@@ -714,7 +722,13 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 // Restore only if that List is still active — a switch during the
                 // Move left a different pane in place.
                 if snap_list == list && model.selected_list_id() == Some(&list) {
+                    // The optimistic reorder parked the cursor on the moved
+                    // Task's new index; restoring the prior order puts a
+                    // different Task there, so re-resolve by id.
+                    let selected = selected_id(model);
                     model.tasks = snapshot;
+                    model.selected_task =
+                        selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                     reselect_visible(model);
                 }
             }
@@ -1491,14 +1505,24 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
                 .filter(|(_, t)| t.status == Status::Completed)
                 .map(|(i, t)| (i, t.clone()))
                 .collect();
-            // The sweep shifts every index after a cleared row, so hold the
-            // cursor by id; `reselect_visible` then re-homes it only if the Task
-            // it was on is the one that went.
-            let selected = selected_id(model);
+            // The sweep shifts every index after a cleared row, so the cursor is
+            // held by id. If its own row is going — only reachable with Completed
+            // Tasks revealed — it steps to the nearest row that survives, rather
+            // than falling back to the top of the pane.
+            let anchor = selected_id(model).and_then(|id| {
+                let swept = model
+                    .tasks
+                    .iter()
+                    .any(|t| t.id == id && t.status == Status::Completed);
+                if swept {
+                    display_neighbour(model, &id, |t| t.status != Status::Completed)
+                } else {
+                    Some(id)
+                }
+            });
             model.tasks.retain(|t| t.status != Status::Completed);
             model.pending_clears.insert(list.clone(), removed);
-            model.selected_task =
-                selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
             reselect_visible(model);
             vec![Command::ClearCompleted { list }]
         }

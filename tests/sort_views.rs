@@ -742,3 +742,33 @@ fn a_confirmed_insert_after_a_refresh_keeps_the_cursor() {
         "an insert elsewhere must not drag the cursor to another Task",
     );
 }
+
+#[test]
+fn clearing_the_row_under_the_cursor_anchors_the_neighbour() {
+    // Cursor on a Completed row that the Clear is about to sweep: it must land on
+    // the neighbouring surviving row, not jump to the top of the pane.
+    let mut m = pane(
+        vec![
+            open("a", None, Some(ymd(2026, 1, 1))),
+            open("b", None, Some(ymd(2026, 2, 1))),
+            task("done", None, Some(ymd(2026, 3, 1)), Status::Completed),
+            open("d", None, Some(ymd(2026, 4, 1))),
+        ],
+        0,
+    );
+    m.show_completed = true;
+    // A Completed Task has no group key, so it sits in the tail: a, b, d, done.
+    let done = m.tasks.iter().position(|t| t.title == "done").unwrap();
+    m.selected_task = Some(done);
+    assert_eq!(titles(&m.visible_tasks()), vec!["a", "b", "d", "done"]);
+
+    update(&mut m, press('C'));
+    update(&mut m, press('y'));
+
+    assert_eq!(m.tasks.len(), 3, "the Completed Task was swept");
+    assert_eq!(
+        selected_title(&m),
+        Some("d".to_string()),
+        "the neighbour below, not the first row",
+    );
+}

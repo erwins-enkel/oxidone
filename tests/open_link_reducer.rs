@@ -5,6 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Focus, Message, Model, Overlay};
+use oxidone::domain::Selection;
 use oxidone::domain::TaskLink;
 
 fn key(code: KeyCode) -> Message {
@@ -40,6 +41,7 @@ async fn model_with(notes: &str, links: Vec<TaskLink>) -> Model {
     let tasks = api.list_tasks(&l.id, true, false, None).await.unwrap();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab)); // focus task pane
     m

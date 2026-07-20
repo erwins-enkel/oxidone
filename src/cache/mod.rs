@@ -85,7 +85,8 @@ impl Cache {
     }
 
     /// Replace the cached List set with `lists` (a pure-mirror refresh): Lists
-    /// gone from Google drop out. Insertion order is preserved for the sidebar.
+    /// gone from Google drop out, and so do their Tasks. Insertion order is
+    /// preserved for the sidebar.
     ///
     /// TODO(write-through, ADR-0001): once Lists are locally editable, a refresh
     /// must diff rather than wipe — preserving `dirty` rows and their real
@@ -109,6 +110,15 @@ impl Cache {
                 ])?;
             }
         }
+        // Purge Tasks orphaned by a List that vanished from Google (pure mirror,
+        // ADR-0003): a List gone from Google takes its Tasks with it, exactly as
+        // `delete_list` does for a local delete. Without this a cross-List read
+        // (`all_tasks`, the Today view) would surface ghost rows with no live List
+        // — unwritable, and never purged since the fan-out only visits `lists`.
+        tx.execute(
+            "DELETE FROM tasks WHERE list_id NOT IN (SELECT id FROM lists)",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -356,6 +366,43 @@ impl Cache {
         Ok(tasks)
     }
 
+    /// Every cached Task across all Lists, each carrying its own `list`. Ordered
+    /// by `(list_id, position)` — the `tasks_by_list` index order — so the base is
+    /// stable; a caller needing a cross-List order (the Today view) re-sorts.
+    ///
+    /// Unlike [`tasks`](Self::tasks) the `list_id` is read from each row rather
+    /// than passed in, since the rows span Lists.
+    pub fn all_tasks(&self) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, list_id, parent, title, notes, status, due, completed_at, links, position, etag, updated
+             FROM tasks ORDER BY list_id, position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                TaskRow {
+                    id: row.get(0)?,
+                    parent: row.get(2)?,
+                    title: row.get(3)?,
+                    notes: row.get(4)?,
+                    status: row.get(5)?,
+                    due: row.get(6)?,
+                    completed_at: row.get(7)?,
+                    links: row.get(8)?,
+                    position: row.get(9)?,
+                    etag: row.get(10)?,
+                    updated: row.get(11)?,
+                },
+            ))
+        })?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let (list_id, task_row) = row?;
+            tasks.push(task_row.into_task(&ListId(list_id))?);
+        }
+        Ok(tasks)
+    }
+
     /// `(done, total)` per List over the mirrored Tasks, for the sidebar meters.
     ///
     /// The `tasks_by_list` index groups the scan by `list_id`, though `status`
@@ -528,5 +575,77 @@ mod tests {
         // Fail-closed (CLAUDE.md): a garbled value surfaces an error rather than
         // silently dropping links and reporting "you have none".
         assert!(parse_links(Some("{not json")).is_err());
+    }
+
+    fn list(id: &str) -> List {
+        List {
+            id: ListId(id.into()),
+            title: id.into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
+
+    fn task(id: &str, list: &str, position: &str) -> Task {
+        Task {
+            id: TaskId(id.into()),
+            list: ListId(list.into()),
+            parent: None,
+            title: id.into(),
+            notes: None,
+            status: Status::NeedsAction,
+            due: None,
+            completed_at: None,
+            links: Vec::new(),
+            position: position.into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
+
+    #[test]
+    fn replace_lists_purges_tasks_of_a_vanished_list() {
+        // Pure mirror (ADR-0003): a List gone from Google on the next refresh takes
+        // its Tasks with it, so a cross-List read never surfaces orphan ghost rows.
+        let cache = Cache::open_in_memory().unwrap();
+        cache.replace_lists(&[list("a"), list("b")]).unwrap();
+        cache
+            .replace_tasks(&ListId("a".into()), &[task("a1", "a", "1")])
+            .unwrap();
+        cache
+            .replace_tasks(&ListId("b".into()), &[task("b1", "b", "1")])
+            .unwrap();
+
+        // A refresh returns only List "a"; "b" (and its Task) must drop out.
+        cache.replace_lists(&[list("a")]).unwrap();
+        let all = cache.all_tasks().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id.0, "a1");
+    }
+
+    #[test]
+    fn all_tasks_spans_lists_carrying_each_row_s_own_list() {
+        // The cross-List read the Today view builds on: every cached Task, each
+        // reconstructed with the `list_id` from its own row (not a passed-in List).
+        let cache = Cache::open_in_memory().unwrap();
+        cache.replace_lists(&[list("a"), list("b")]).unwrap();
+        cache
+            .replace_tasks(&ListId("a".into()), &[task("a1", "a", "1")])
+            .unwrap();
+        cache
+            .replace_tasks(
+                &ListId("b".into()),
+                &[task("b1", "b", "1"), task("b2", "b", "2")],
+            )
+            .unwrap();
+
+        let all = cache.all_tasks().unwrap();
+        assert_eq!(all.len(), 3);
+        // Each Task carries the List it was stored under.
+        for t in &all {
+            assert!(t.id.0.starts_with(&t.list.0), "{t:?}");
+        }
+        assert!(all.iter().any(|t| t.id.0 == "a1" && t.list.0 == "a"));
+        assert!(all.iter().any(|t| t.id.0 == "b2" && t.list.0 == "b"));
     }
 }

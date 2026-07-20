@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 
 use crate::dateparse;
-use crate::domain::{EntryType, List, ListId, SortView, Status, Task, TaskId};
+use crate::domain::{
+    due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task, TaskId,
+};
 use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
 
@@ -37,9 +39,18 @@ impl Focus {
 #[derive(Debug, Clone)]
 pub struct Model {
     pub lists: Vec<List>,
-    /// Index into `lists` of the active List, if any.
-    pub selected_list: Option<usize>,
-    /// Tasks of the active List (in Manual order).
+    /// What the sidebar cursor points at: the pinned **Today** cross-List view, or
+    /// a real List by index into `lists`. Replaces a bare `Option<usize>` — Today
+    /// is always selectable (pinned, needs no List), so there is no unselected
+    /// state.
+    pub selected: Selection,
+    /// The concrete `ListId` that Google's `@default` alias resolves to, filled
+    /// once by a startup worker when online (ADR-0003: the alias is never stored,
+    /// only the real id). The target for the Today `a` capture; `None` until
+    /// resolved (offline, or resolution failed), where a Today capture fails closed.
+    pub default_list: Option<ListId>,
+    /// The active pane's Tasks: one List's (Manual order) for a `List` selection,
+    /// or the cross-List `due <= today` aggregate for `Today`.
     pub tasks: Vec<Task>,
     /// Index into `tasks` of the cursor, if any.
     pub selected_task: Option<usize>,
@@ -200,16 +211,30 @@ pub struct Confirm {
 /// The action a [`Confirm`] performs on "yes". Grows as destructive ops land.
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    DeleteTask { list: ListId, task: TaskId },
-    DeleteList { list: ListId },
-    ClearCompleted { list: ListId },
+    DeleteTask {
+        list: ListId,
+        task: TaskId,
+    },
+    DeleteList {
+        list: ListId,
+    },
+    ClearCompleted {
+        list: ListId,
+    },
+    /// Clear Completed across the Lists a Today sweep touches — one per List. The
+    /// per-List reconcile (`pending_clears`, `ClearedCompleted`) handles each.
+    ClearToday {
+        lists: Vec<ListId>,
+    },
 }
 
 impl Default for Model {
     fn default() -> Self {
         Self {
             lists: Vec::new(),
-            selected_list: None,
+            // Land on Today — the daily-log view this slice was built for.
+            selected: Selection::Today,
+            default_list: None,
             tasks: Vec::new(),
             selected_task: None,
             sort: SortView::Due,
@@ -254,11 +279,20 @@ impl Model {
         Self::default()
     }
 
-    /// The `ListId` of the active List, if one is selected.
+    /// The `ListId` of the active List, or `None` when Today is selected (Today is
+    /// not a List) or the index is transiently out of range. The single choke
+    /// point every write path and the sidebar identity read, so the Today branch
+    /// lives here rather than at each call site.
     pub fn selected_list_id(&self) -> Option<&ListId> {
-        self.selected_list
-            .and_then(|i| self.lists.get(i))
-            .map(|l| &l.id)
+        match self.selected {
+            Selection::Today => None,
+            Selection::List(i) => self.lists.get(i).map(|l| &l.id),
+        }
+    }
+
+    /// Whether the pinned Today view is the active pane.
+    pub fn today_active(&self) -> bool {
+        matches!(self.selected, Selection::Today)
     }
 
     /// The Tasks in the current `sort`'s **display order**.
@@ -287,6 +321,14 @@ impl Model {
     /// untouched. Navigation (`j`/`k`) follows this order, so the cursor never
     /// jumps between non-adjacent rows.
     pub fn sorted_tasks(&self) -> Vec<&Task> {
+        // Today is flat and cross-List: it bypasses `groups()` (parent/Subtask
+        // grouping is a per-List concept) for a single global order. This is the
+        // *one* ordering seam — `reselect_visible`, `display_successor`,
+        // `move_task_cursor`, and `visible_tasks` all read `sorted_tasks()`, so
+        // navigation and cursor re-anchoring walk exactly what the pane renders.
+        if self.today_active() {
+            return self.today_ordered();
+        }
         let mut groups = self.groups();
         match self.sort {
             // Vec order already; `groups` built it.
@@ -315,6 +357,42 @@ impl Model {
             }
         }
         groups.into_iter().flatten().collect()
+    }
+
+    /// The **Today** pane's flat, cross-List order: **due asc → List title →
+    /// `position`** (Due lens, and Manual, which Today treats as Due), or **display
+    /// title → List title → `position`** (Title lens). No parent grouping — rows
+    /// from different Lists sit together, so a global order is the only meaningful
+    /// one, and a Subtask sorts on its own key like any other row.
+    ///
+    /// Stable (`sort_by_cached_key`), so equal keys keep the cache's stored order.
+    /// Every Task carries its own `list`; the List title is looked up from `lists`
+    /// (empty string if the List is unknown, which sinks it consistently).
+    fn today_ordered(&self) -> Vec<&Task> {
+        let titles: HashMap<&ListId, &str> = self
+            .lists
+            .iter()
+            .map(|l| (&l.id, l.title.as_str()))
+            .collect();
+        let list_title = |t: &Task| titles.get(&t.list).copied().unwrap_or("").to_string();
+        let mut tasks: Vec<&Task> = self.tasks.iter().collect();
+        match self.sort {
+            SortView::Title => {
+                tasks.sort_by_cached_key(|t| {
+                    (
+                        t.display_title().to_lowercase(),
+                        list_title(t),
+                        t.position.clone(),
+                    )
+                });
+            }
+            // Due and Manual both order by due date; every Today row is dated
+            // (membership excludes undated), so `due` is always `Some` here.
+            SortView::Due | SortView::Manual => {
+                tasks.sort_by_cached_key(|t| (t.due, list_title(t), t.position.clone()));
+            }
+        }
+        tasks
     }
 
     /// Split `tasks` into groups in Vec order: each top-level Task followed by its
@@ -463,16 +541,27 @@ impl Model {
             .collect()
     }
 
-    /// Whether a Task is currently shown, combining the two view filters with
-    /// AND: it must pass both the Completed filter and the distant-due filter.
+    /// Whether a Task is currently shown, combining the view filters with AND: the
+    /// Completed filter, the distant-due horizon (#81), and — in Today only — the
+    /// `due <= today` membership (#61).
     fn is_visible(&self, task: &Task) -> bool {
-        self.completed_visible(task) && self.within_horizon(task)
+        self.completed_visible(task) && self.within_horizon(task) && self.within_today(task)
     }
 
     /// The Completed filter: a Task shows unless it is Completed and Completed
     /// Tasks are hidden.
     fn completed_visible(&self, task: &Task) -> bool {
         self.show_completed || task.status != Status::Completed
+    }
+
+    /// The Today membership filter: outside Today a no-op; in Today an entry shows
+    /// only if it is due on or before today. Enforced here — the *shared* predicate
+    /// read by `visible_tasks`, `display_successor`/`display_neighbour`, and
+    /// `move_task_cursor` — and gated on `today_active()` so it never leaks into an
+    /// ordinary List pane. So an optimistic `m`/`d` that pushes a Today row past
+    /// today drops it from view in the same frame.
+    fn within_today(&self, task: &Task) -> bool {
+        !self.today_active() || due_on_or_before(task.due, self.now.date_naive())
     }
 
     /// The distant-due filter: with `hide_distant` on, an entry is hidden only if
@@ -603,6 +692,16 @@ pub enum Message {
     CountsLoaded(HashMap<ListId, (usize, usize)>),
     /// The Tasks of a specific List. Ignored if that List is no longer active.
     TasksLoaded(ListId, Vec<Task>),
+    /// The **Today** aggregate (already filtered to `due <= today`, across all
+    /// Lists) plus the ListIds whose live fetch/mirror failed. Ignored unless
+    /// Today is still the active pane. Sent twice per load: the instant cache paint
+    /// (`failed` empty), then the live fan-out result.
+    TodayLoaded {
+        tasks: Vec<Task>,
+        failed: Vec<ListId>,
+    },
+    /// Google's `@default` alias resolved to a concrete `ListId` (startup, online).
+    DefaultListResolved(ListId),
     /// A write succeeded; reconcile the Model with the server's Task.
     TaskUpdated(Task),
     /// A field write failed; roll back to the pre-write snapshot.
@@ -698,6 +797,11 @@ pub enum Message {
 pub enum Command {
     /// Load the Tasks of a List (from cache, and later a live refresh).
     LoadTasks(ListId),
+    /// Load the **Today** aggregate: an instant cache paint, then (online) a
+    /// concurrent per-List fan-out. Carries the Lists to fan out over (id + title
+    /// for the sort) and the reducer's `today`, so membership is stamped by the
+    /// reducer, not a worker clock.
+    LoadToday { lists: Vec<List>, today: NaiveDate },
     /// Write-through a completion toggle for a Task.
     SetCompleted {
         list: ListId,
@@ -733,8 +837,10 @@ pub enum Command {
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
     /// Insert a new Task into a List; `temp` echoes back so the placeholder can
-    /// be reconciled with the server Task. `parent` is `Some` for a Subtask;
-    /// `due` is `Some` when a trailing date was parsed off the captured title.
+    /// be reconciled with the server Task. `parent` is `Some` for a Subtask. `due`
+    /// is set when a trailing date was parsed off the captured title (#80), or to
+    /// today for a Today capture (#61, so the server row stays in the Today set);
+    /// `None` for an ordinary add.
     AddTask {
         list: ListId,
         temp: TaskId,
@@ -793,6 +899,35 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         }
         Message::TasksLoaded(list, tasks) => {
             set_tasks(model, &list, tasks);
+            Vec::new()
+        }
+        Message::TodayLoaded { tasks, failed } => {
+            // Ignore a stale aggregate if the user has since switched to a List.
+            if !model.today_active() {
+                return Vec::new();
+            }
+            set_today_tasks(model, tasks);
+            // Name any List whose live fetch/mirror failed rather than rendering a
+            // short day as a light one (fail closed). Titles resolved from `lists`.
+            if failed.is_empty() {
+                model.status_line = None;
+            } else {
+                let names: Vec<String> = failed
+                    .iter()
+                    .map(|id| {
+                        model
+                            .lists
+                            .iter()
+                            .find(|l| &l.id == id)
+                            .map_or_else(|| id.0.clone(), |l| l.title.clone())
+                    })
+                    .collect();
+                model.status_line = Some(format!("failed to load: {}", names.join(", ")));
+            }
+            Vec::new()
+        }
+        Message::DefaultListResolved(id) => {
+            model.default_list = Some(id);
             Vec::new()
         }
         Message::TaskUpdated(task) => {
@@ -925,7 +1060,7 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 // Tasks now that it has a real id (a fresh List is empty, but this
                 // keeps the pane and cache consistent).
                 if model.selected_list_id() == Some(&list.id) {
-                    return request_selected_tasks(model, true);
+                    return request_selected(model, true);
                 }
             } else if !model.lists.iter().any(|l| l.id == list.id) {
                 // A refresh wiped the placeholder before the reply; don't lose
@@ -940,7 +1075,7 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             clamp_list_selection(model);
             model.status_line = Some(reason);
             if was_selected {
-                return request_selected_tasks(model, true);
+                return request_selected(model, true);
             }
             Vec::new()
         }
@@ -973,9 +1108,9 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                     model.lists.insert(at, previous);
                     // Restore the selection to the recovered List and reload its
                     // Tasks — the pane currently shows the List we fell back to.
-                    model.selected_list = Some(at);
+                    model.selected = Selection::List(at);
                     model.status_line = Some(reason);
-                    return request_selected_tasks(model, true);
+                    return request_selected(model, true);
                 }
             }
             model.status_line = Some(reason);
@@ -990,11 +1125,11 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 let swept: HashSet<TaskId> = removed.into_iter().map(|(_, task)| task.id).collect();
                 // A refresh may *already* have landed inside the round-trip and
                 // re-added the swept Tasks from a fetch Google had not yet cleared
-                // — so re-remove them (#51). Only when that List is still active:
-                // `model.tasks` holds just the active pane, and a List switch
-                // during the Clear left a different one in place (cf. the failure
-                // twin).
-                if model.selected_list_id() == Some(&list)
+                // — so re-remove them (#51). Only when that List's rows are on
+                // screen: the active List pane, or the Today aggregate (which spans
+                // Lists, so a Today `C` reconciles here too). A List switch during
+                // the Clear left a different pane in place (cf. the failure twin).
+                if (model.today_active() || model.selected_list_id() == Some(&list))
                     && model.tasks.iter().any(|t| swept.contains(&t.id))
                 {
                     // A cursor on a resurrected row steps to the nearest row that
@@ -1022,11 +1157,12 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         }
         Message::ClearCompletedFailed { list, reason } => {
             if let Some(removed) = model.pending_clears.remove(&list) {
-                // Re-insert the swept Tasks only if that List is still active — a
-                // List switch during the Clear left a different pane in place.
-                // Ascending by prior index restores original order; skip any a
-                // refresh already re-added so we can't duplicate (cf. delete).
-                if model.selected_list_id() == Some(&list) {
+                // Re-insert the swept Tasks only if that List's rows are on screen —
+                // the active List pane, or the Today aggregate (a Today `C` rolls
+                // back here too). A switch during the Clear left a different pane in
+                // place. Ascending by prior index restores original order; skip any
+                // a refresh already re-added so we can't duplicate (cf. delete).
+                if model.today_active() || model.selected_list_id() == Some(&list) {
                     let selected = selected_id(model);
                     for (index, task) in removed {
                         if !model.tasks.iter().any(|t| t.id == task.id) {
@@ -1112,7 +1248,7 @@ fn set_completed(task: &mut Task, completed: bool) {
 ///   (absent from `list_counts`), so a List never opened on this machine gets a
 ///   meter without a visit, while covered ones are left alone.
 ///
-/// The active List is **never** part of the fan-out — [`request_selected_tasks`]
+/// The active List is **never** part of the fan-out — [`request_selected`]
 /// already emitted its `LoadTasks`, and re-emitting would fetch it twice on a cold
 /// cache. So the commands come back **active List first**, then the fan-out.
 ///
@@ -1120,26 +1256,36 @@ fn set_completed(task: &mut Task, completed: bool) {
 /// id-less `LoadFailed`, so one List's failure never splashes onto the active
 /// pane's status line (see the reducer arm).
 fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
+    let was_today = model.today_active();
     let previously_selected = model.selected_list_id().cloned();
     model.lists = lists;
-    model.selected_list = if model.lists.is_empty() {
-        None
+    model.selected = if was_today {
+        Selection::Today // pinned, always valid
     } else {
+        // Preserve the active List by id; if it is gone, fall back to Today
+        // (always valid) rather than an arbitrary List.
         previously_selected
             .as_ref()
             .and_then(|id| model.lists.iter().position(|l| l.id == *id))
-            .or(Some(0))
+            .map_or(Selection::Today, Selection::List)
     };
     model.status_line = None;
-    // Only wipe the pane when the active List actually changed; a refresh that
-    // keeps the same List reloads its Tasks in place, without a blank flash.
-    let list_changed = previously_selected.as_ref() != model.selected_list_id();
-    let mut commands = request_selected_tasks(model, list_changed);
+    // Only wipe the pane when the target actually changed; a refresh that keeps the
+    // same selection (Today↔Today or List X↔List X) reloads in place, no blank flash.
+    let now_selected = model.selected_list_id().cloned();
+    let target_changed = was_today != model.today_active() || previously_selected != now_selected;
+    let mut commands = request_selected(model, target_changed);
 
     // Consume the flag unconditionally, so a Refresh's `full` never carries into a
     // later lazy cascade.
     let full = std::mem::take(&mut model.pending_refresh);
-    let active = model.selected_list_id().cloned();
+    // When Today is active its `LoadToday` already fans out every List (fetch +
+    // mirror), so a separate per-List meter fan-out would double-fetch — skip it.
+    // Recount fills the meters from the mirrored cache.
+    if model.today_active() {
+        return commands;
+    }
+    let active = now_selected;
     for list in &model.lists {
         // The active List's `LoadTasks` is already the head of `commands`.
         if active.as_ref() == Some(&list.id) {
@@ -1156,7 +1302,23 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
 /// Request the active List's Tasks. When `clear_pane`, the pane is emptied
 /// first (a List change); otherwise the current Tasks stay until the new ones
 /// arrive. With no List selected, the pane is always emptied.
-fn request_selected_tasks(model: &mut Model, clear_pane: bool) -> Vec<Command> {
+fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
+    if model.today_active() {
+        // Today has no Manual lens (cross-List order is undefined). Normalise a
+        // Manual carried in from a List to Due on entry, so the pane order and the
+        // header label agree — `next_today` keeps it out of Manual thereafter.
+        if model.sort == SortView::Manual {
+            model.sort = SortView::Due;
+        }
+        if clear_pane {
+            model.tasks.clear();
+            model.selected_task = None;
+        }
+        return vec![Command::LoadToday {
+            lists: model.lists.clone(),
+            today: model.now.date_naive(),
+        }];
+    }
     match model.selected_list_id().cloned() {
         Some(id) => {
             if clear_pane {
@@ -1217,6 +1379,35 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
     reselect_visible(model);
 }
 
+/// Fill the **Today** pane from a cross-List aggregate (already `due <= today`),
+/// keeping the cursor on the same Task by id where possible.
+///
+/// Drops any id confirmed deleted/Cleared under its own List (the #65 stale-fetch
+/// guard). It only *drops* here, never evicts: the aggregate is filtered to
+/// `due <= today`, so "absent from the aggregate" does not imply Google dropped
+/// the row, and Task ids are never reused — an un-evicted tombstone can only ever
+/// match its own dead id. Per-List eviction still happens when that List is viewed
+/// (`set_tasks` → `reconcile_tombstones`).
+fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
+    let tasks: Vec<Task> = tasks
+        .into_iter()
+        .filter(|t| {
+            !model
+                .tombstones
+                .get(&t.list)
+                .is_some_and(|set| set.contains(&t.id))
+        })
+        .collect();
+    let previously_selected = model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .map(|t| t.id.clone());
+    model.tasks = tasks;
+    model.selected_task =
+        previously_selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+    reselect_visible(model);
+}
+
 fn apply(model: &mut Model, action: Action) -> Vec<Command> {
     match action {
         Action::Quit => model.should_quit = true,
@@ -1243,10 +1434,17 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::AddList => open_add_list(model),
         Action::RenameList => open_rename_list(model),
         Action::DeleteList => open_delete_list_confirm(model),
-        // View-only: cycle the local lens. `tasks` (Manual order) is untouched
-        // and `selected_task` keeps indexing it, so the cursor stays on the
-        // same Task by id across the re-sort. Never emits a Command.
-        Action::CycleSort => model.sort = model.sort.next(),
+        // View-only: cycle the local lens. `tasks` is untouched and `selected_task`
+        // keeps indexing it, so the cursor stays on the same Task by id across the
+        // re-sort. Never emits a Command. In Today the cycle is Due↔Title only
+        // (Manual is undefined across Lists).
+        Action::CycleSort => {
+            model.sort = if model.today_active() {
+                model.sort.next_today()
+            } else {
+                model.sort.next()
+            }
+        }
         // View-only: reveal/hide Completed Tasks. Hiding may drop the selected
         // Task out of view, so re-anchor the cursor onto a visible one.
         Action::ToggleShowCompleted => {
@@ -1313,15 +1511,13 @@ fn migrate(model: &mut Model) -> Vec<Command> {
         model.status_line = Some("completed tasks are not migrated".to_string());
         return Vec::new();
     }
-    let (id, current) = (task.id.clone(), task.due);
+    // Target the row's own List (Today spans Lists; identical for a real List).
+    let (id, current, list) = (task.id.clone(), task.due, task.list.clone());
     // Single-flight: don't lose the migration silently if a write is running.
     if model.pending_writes.contains_key(&id) {
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
     let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
         return Vec::new();
     };
@@ -1331,6 +1527,10 @@ fn migrate(model: &mut Model) -> Vec<Command> {
         .pending_writes
         .insert(id.clone(), model.tasks[index].clone());
     model.tasks[index].due = due;
+    // In Today the row just left the `due <= today` set (migrate pushes it past
+    // today); re-anchor the cursor onto a still-visible row. A no-op in a real
+    // List, where the row stays visible.
+    reselect_visible(model);
     vec![Command::SetDue {
         list,
         task: id,
@@ -1352,7 +1552,8 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
     let Some(task) = focused_task(model) else {
         return Vec::new();
     };
-    let id = task.id.clone();
+    // Target the row's own List (Today spans Lists; identical for a real List).
+    let (id, list) = (task.id.clone(), task.list.clone());
     let Some(title) = step(task.entry_type()).retype(task.display_title()) else {
         model.status_line = Some("an entry needs a title before it can be typed".to_string());
         return Vec::new();
@@ -1363,9 +1564,6 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
     let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
         return Vec::new();
     };
@@ -1380,8 +1578,21 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
     }]
 }
 
-/// Open the capture overlay for a new Task (needs an active List to add into).
+/// Open the capture overlay for a new Task. Needs a target List: the active List
+/// normally, or — in Today — the resolved default List, refused up front (fail
+/// closed) when that is not yet known rather than opening an overlay that discards.
 fn open_add_task(model: &mut Model) {
+    if model.today_active() {
+        if model.default_list.is_none() {
+            model.status_line =
+                Some("can't capture: default list not resolved (connect to Google)".to_string());
+            return;
+        }
+        model.overlay = Some(Overlay::AddTask {
+            buffer: String::new(),
+        });
+        return;
+    }
     if model.selected_list_id().is_some() {
         model.overlay = Some(Overlay::AddTask {
             buffer: String::new(),
@@ -1402,6 +1613,19 @@ fn finish_add_task(model: &mut Model, buffer: String, literal: bool) -> Vec<Comm
     let (title, due) = capture_title_and_due(model, &buffer, literal);
     if title.is_empty() {
         return Vec::new();
+    }
+    if model.today_active() {
+        // Capture into the resolved default List. Default the due date to today so a
+        // dateless capture stays on the page it was created on (Today membership); a
+        // trailing date parsed off the title (#80) is honoured instead, so an entry
+        // the user explicitly scheduled for later correctly leaves the Today set.
+        let Some(list) = model.default_list.clone() else {
+            model.status_line =
+                Some("can't capture: default list not resolved (connect to Google)".to_string());
+            return Vec::new();
+        };
+        let due = due.or_else(|| Some(model.now.date_naive()));
+        return add_task_placeholder(model, list, title, None, 0, due);
     }
     let Some(list) = model.selected_list_id().cloned() else {
         return Vec::new();
@@ -1431,6 +1655,12 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
+    // Subtasks are a per-List, position-shaped concept; Today is a flat cross-List
+    // view, so `o` is disabled there (like the Moves).
+    if model.today_active() {
+        model.status_line = Some("subtasks are per-list — open the list to add one".to_string());
+        return;
+    }
     if let Some(reason) = detached_reason(model, task) {
         model.status_line = Some(reason.to_string());
         return;
@@ -1552,6 +1782,12 @@ fn add_task_placeholder(
 /// - `None` silently — nothing to act on (unfocused, no List, no selection).
 fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
     if model.focus != Focus::Tasks {
+        return None;
+    }
+    // Moves write Manual order (per-List `position`); across Lists that order is
+    // genuinely undefined, so J/K/>/< are disabled in Today.
+    if model.today_active() {
+        model.status_line = Some("can't move in Today — open the list to reorder".to_string());
         return None;
     }
     let list = model.selected_list_id().cloned()?;
@@ -1813,9 +2049,8 @@ fn finish_edit_notes(model: &mut Model, task: TaskId, notes: Option<String>) -> 
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
+    // The row's own List (Today spans Lists; identical for a real List).
+    let list = model.tasks[index].list.clone();
     model
         .pending_writes
         .insert(task.clone(), model.tasks[index].clone());
@@ -1828,10 +2063,13 @@ fn open_delete_confirm(model: &mut Model) {
         return;
     };
     // The display title: a destructive prompt is no place to leak the encoding.
-    let (id, title) = (task.id.clone(), task.display_title().to_string());
-    let Some(list) = model.selected_list_id().cloned() else {
-        return;
-    };
+    // Delete targets the row's own List (Today spans Lists; identical for a real
+    // List) — editing something whose home you cannot see is why the row shows it.
+    let (id, title, list) = (
+        task.id.clone(),
+        task.display_title().to_string(),
+        task.list.clone(),
+    );
     model.overlay = Some(Overlay::Confirm(Confirm {
         prompt: format!("Delete \"{title}\"? (y/n)"),
         action: ConfirmAction::DeleteTask { list, task: id },
@@ -1841,6 +2079,36 @@ fn open_delete_confirm(model: &mut Model) {
 /// Open the destructive-confirm for Clearing the active List's Completed Tasks.
 /// A no-op with no active List or nothing to Clear (don't prompt for zero).
 fn open_clear_completed_confirm(model: &mut Model) {
+    if model.today_active() {
+        // Cross-List sweep: group the visible Completed rows by their own List.
+        // Google's clear_completed is per-List, so one command per contributing
+        // List. The count is the Today-visible Completed rows; the sweep clears
+        // each List's Completed server-side (any not due today were never in view).
+        let mut lists: Vec<ListId> = Vec::new();
+        let mut done = 0usize;
+        for t in &model.tasks {
+            if t.status == Status::Completed {
+                done += 1;
+                if !lists.contains(&t.list) {
+                    lists.push(t.list.clone());
+                }
+            }
+        }
+        if done == 0 {
+            model.status_line = Some("no completed tasks to clear".to_string());
+            return;
+        }
+        let tplural = if done == 1 { "task" } else { "tasks" };
+        let lplural = if lists.len() == 1 { "list" } else { "lists" };
+        model.overlay = Some(Overlay::Confirm(Confirm {
+            prompt: format!(
+                "Clear {done} completed {tplural} from {} {lplural}? (y/n)",
+                lists.len()
+            ),
+            action: ConfirmAction::ClearToday { lists },
+        }));
+        return;
+    }
     let Some(list) = model.selected_list_id().cloned() else {
         return;
     };
@@ -1888,7 +2156,10 @@ fn focused_list(model: &Model) -> Option<&List> {
     if model.focus != Focus::Sidebar {
         return None;
     }
-    model.selected_list.and_then(|i| model.lists.get(i))
+    match model.selected {
+        Selection::List(i) => model.lists.get(i),
+        Selection::Today => None, // Today is not a List — R/X no-op here
+    }
 }
 
 /// Open the capture overlay for a new List (sidebar-focused only).
@@ -1919,7 +2190,7 @@ fn finish_add_list(model: &mut Model, buffer: String) -> Vec<Command> {
     });
     // Make the new List active. Don't emit LoadTasks for the placeholder id
     // (Google has no such List yet); the pane is empty until `ListInserted`.
-    model.selected_list = Some(model.lists.len() - 1);
+    model.selected = Selection::List(model.lists.len() - 1);
     model.tasks.clear();
     model.selected_task = None;
     vec![Command::AddList { temp, title }]
@@ -2085,12 +2356,11 @@ fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Com
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
     let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
         return Vec::new();
     };
+    // The row's own List (Today spans Lists; identical for a real List).
+    let list = model.tasks[index].list.clone();
     let title = model.tasks[index].entry_type().apply(display);
     model
         .pending_writes
@@ -2123,16 +2393,19 @@ fn finish_edit_due(model: &mut Model, task: TaskId, buffer: String) -> Vec<Comma
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
     let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
         return Vec::new();
     };
+    // The row's own List (Today spans Lists; identical for a real List).
+    let list = model.tasks[index].list.clone();
     model
         .pending_writes
         .insert(task.clone(), model.tasks[index].clone());
     model.tasks[index].due = due;
+    // In Today a new due date may move the row out of (or keep it in) the
+    // `due <= today` set; re-anchor the cursor onto a still-visible row. A no-op
+    // in a real List, where the row stays visible.
+    reselect_visible(model);
     vec![Command::SetDue { list, task, due }]
 }
 
@@ -2177,7 +2450,7 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             // default List), `ListDeleteFailed` restores everything.
             let mut cmds = vec![Command::DeleteList { list }];
             clamp_list_selection(model);
-            cmds.extend(request_selected_tasks(model, true));
+            cmds.extend(request_selected(model, true));
             cmds
         }
         ConfirmAction::ClearCompleted { list } => {
@@ -2218,16 +2491,62 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             reselect_visible(model);
             vec![Command::ClearCompleted { list }]
         }
+        ConfirmAction::ClearToday { lists } => {
+            // Snapshot the Completed rows per contributing List (indices into the
+            // current pane) and optimistically drop them all, one ClearCompleted
+            // per List — reusing the per-List reconcile arms, which also accept the
+            // Today pane. A List already mid-Clear is skipped (single-flight).
+            let mut cmds = Vec::new();
+            let mut swept: HashSet<TaskId> = HashSet::new();
+            for list in lists {
+                if model.pending_clears.contains_key(&list) {
+                    continue;
+                }
+                let removed: Vec<(usize, Task)> = model
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.list == list && t.status == Status::Completed)
+                    .map(|(i, t)| (i, t.clone()))
+                    .collect();
+                if removed.is_empty() {
+                    continue;
+                }
+                for (_, t) in &removed {
+                    swept.insert(t.id.clone());
+                }
+                model.pending_clears.insert(list.clone(), removed);
+                cmds.push(Command::ClearCompleted { list });
+            }
+            if swept.is_empty() {
+                return Vec::new();
+            }
+            // The sweep shifts indices; hold the cursor by id, stepping to the
+            // nearest surviving row only when its own row is going.
+            let anchor = selected_id(model).and_then(|id| {
+                if swept.contains(&id) {
+                    display_neighbour(model, &id, |t| !swept.contains(&t.id))
+                } else {
+                    Some(id)
+                }
+            });
+            model.tasks.retain(|t| !swept.contains(&t.id));
+            model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            reselect_visible(model);
+            cmds
+        }
     }
 }
 
-/// Keep `selected_list` in range after the List set shrinks.
+/// Keep the `Selection` in range after the List set shrinks.
 fn clamp_list_selection(model: &mut Model) {
-    model.selected_list = if model.lists.is_empty() {
-        None
-    } else {
-        Some(model.selected_list.unwrap_or(0).min(model.lists.len() - 1))
-    };
+    if let Selection::List(i) = model.selected {
+        model.selected = if model.lists.is_empty() {
+            Selection::Today // the pinned row is always valid
+        } else {
+            Selection::List(i.min(model.lists.len() - 1))
+        };
+    }
 }
 
 /// Toggle the selected Task's completion optimistically and request the
@@ -2236,13 +2555,15 @@ fn toggle_complete(model: &mut Model) -> Vec<Command> {
     if model.focus != Focus::Tasks {
         return Vec::new();
     }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
-    };
     let Some(index) = model.selected_task else {
         return Vec::new();
     };
-    let id = model.tasks[index].id.clone();
+    // The write targets the row's *own* List, not `selected_list_id()` — in Today
+    // the pane spans Lists (identical for a real List, where they coincide).
+    let Some(task) = model.tasks.get(index) else {
+        return Vec::new();
+    };
+    let (id, list) = (task.id.clone(), task.list.clone());
     // Single-flight: ignore a toggle while this Task's write is in flight.
     if model.pending_writes.contains_key(&id) {
         return Vec::new();
@@ -2345,22 +2666,22 @@ fn reselect_visible(model: &mut Model) {
 }
 
 fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
-    let before = model.selected_list;
-    move_index(&mut model.selected_list, model.lists.len(), delta);
-    if model.selected_list == before {
+    let before = model.selected;
+    // A flat cursor over the pinned Today row (slot 0) then the Lists (1..=len),
+    // clamped at both ends (no wrap), matching the task pane's navigation.
+    let cur = match model.selected {
+        Selection::Today => 0isize,
+        Selection::List(i) => i as isize + 1,
+    };
+    let last = model.lists.len() as isize; // Today occupies slot 0
+    let next = (cur + delta).clamp(0, last);
+    model.selected = if next == 0 {
+        Selection::Today
+    } else {
+        Selection::List((next - 1) as usize)
+    };
+    if model.selected == before {
         return Vec::new();
     }
-    request_selected_tasks(model, true)
-}
-
-/// Move a selection index by `delta`, clamped to `[0, len)`. No-op on empty.
-fn move_index(selection: &mut Option<usize>, len: usize, delta: isize) {
-    if len == 0 {
-        return;
-    }
-    let Some(current) = *selection else {
-        return;
-    };
-    let last = (len - 1) as isize;
-    *selection = Some((current as isize + delta).clamp(0, last) as usize);
+    request_selected(model, true)
 }

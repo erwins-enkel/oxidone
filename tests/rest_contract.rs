@@ -57,6 +57,25 @@ async fn list_lists_gets_users_me_lists_and_deserializes() {
 }
 
 #[tokio::test]
+async fn default_list_gets_the_default_alias_and_deserializes_to_the_concrete_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists/@default"))
+        .and(header("authorization", bearer().as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MDExMjIzMzQ0NTU", "title": "My Tasks", "etag": "e9",
+            "updated": "2023-11-14T22:13:20.000Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let list = client(&server).default_list().await.unwrap();
+    // The alias resolves to the real id we then use everywhere (ADR-0003).
+    assert_eq!(list.id, ListId("MDExMjIzMzQ0NTU".into()));
+    assert_eq!(list.title, "My Tasks");
+}
+
+#[tokio::test]
 async fn insert_list_posts_title() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

@@ -36,6 +36,9 @@ struct State {
     tasks: Vec<Entry>,
     seq: i64,
     next_error: Option<ApiError>,
+    /// The List `@default` resolves to. `None` falls back to the first List,
+    /// matching Google returning the default List first.
+    default: Option<ListId>,
 }
 
 impl State {
@@ -111,6 +114,11 @@ impl FakeTasksApi {
         self.state.lock().unwrap().next_error = Some(err);
     }
 
+    /// Point `@default` at a specific List (else it resolves to the first List).
+    pub fn set_default_list(&self, id: &ListId) {
+        self.state.lock().unwrap().default = Some(id.clone());
+    }
+
     /// Seed a Task's output-only `links[]` (#55). There is no write path for
     /// links in the real API, so this is the only way for a test to give a stored
     /// Task the links Google would have attached at creation — `list_tasks` then
@@ -136,6 +144,17 @@ impl TasksApi for FakeTasksApi {
         let mut st = self.state.lock().unwrap();
         st.take_error()?;
         Ok(st.lists.clone())
+    }
+
+    async fn default_list(&self) -> Result<List, ApiError> {
+        let mut st = self.state.lock().unwrap();
+        st.take_error()?;
+        let target = st.default.clone();
+        let list = match target {
+            Some(id) => st.lists.iter().find(|l| l.id == id).cloned(),
+            None => st.lists.first().cloned(),
+        };
+        list.ok_or(ApiError::NotFound)
     }
 
     async fn insert_list(&self, title: &str) -> Result<List, ApiError> {

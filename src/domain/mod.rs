@@ -116,6 +116,17 @@ impl SortView {
         }
     }
 
+    /// The next view in the **Today** cycle: Due ↔ Title only. Manual is excluded
+    /// there — `position` is per-List, so a hand-arranged order across Lists is
+    /// genuinely undefined (Moves are disabled in Today). `Manual` maps to `Due`
+    /// so a lens carried in from a real List lands on the home state on first `s`.
+    pub fn next_today(self) -> Self {
+        match self {
+            SortView::Due => SortView::Title,
+            SortView::Title | SortView::Manual => SortView::Due,
+        }
+    }
+
     /// A short lower-case label for the pane title. Every view names itself, so
     /// the header always says which lens is active — with `Due` the home state,
     /// an unlabelled pane would make Manual the silent one.
@@ -245,6 +256,28 @@ impl EntryType {
     }
 }
 
+/// What the sidebar cursor points at: the pinned **Today** view (a cross-List
+/// aggregate of what is due), or a real List by index into `Model::lists`.
+///
+/// Replaces a bare `Option<usize>`: Today is always selectable (it is pinned and
+/// needs no List), so there is no "nothing selected" state to model. `List(i)`
+/// with `i` out of range is transient (a List just removed) and clamped back to a
+/// valid selection — falling to `Today`, which is always valid — by the reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Today,
+    List(usize),
+}
+
+/// Whether an entry belongs to the **Today** view: dated on or before `today`.
+/// Undated entries are excluded — `None` is not `<= today` — so a Task with no due
+/// date never appears in Today. The single definition of Today membership, shared
+/// by the cache aggregate (`sync::today_from_cache`) and the view filter
+/// (`Model::is_visible`) so the two cannot drift.
+pub fn due_on_or_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
+    due.is_some_and(|d| d <= today)
+}
+
 // Newtypes keep List and Task ids from being swapped by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListId(pub String);
@@ -331,6 +364,21 @@ mod tests {
         for empty in ["", "○", "— ", "○ ○", "   "] {
             let (_, display) = EntryType::parse(empty);
             assert_eq!(EntryType::Event.retype(display), None, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn next_today_cycles_due_and_title_only_never_manual() {
+        // Today has no Manual order (position is per-List), so the cycle is a
+        // two-state flip and Manual folds into Due on the way in.
+        assert_eq!(SortView::Due.next_today(), SortView::Title);
+        assert_eq!(SortView::Title.next_today(), SortView::Due);
+        assert_eq!(SortView::Manual.next_today(), SortView::Due);
+        // Manual is never reachable by repeated Today cycling.
+        let mut sort = SortView::Manual;
+        for _ in 0..6 {
+            sort = sort.next_today();
+            assert_ne!(sort, SortView::Manual);
         }
     }
 

@@ -30,6 +30,26 @@ async fn seed_and_list_lists() {
 }
 
 #[tokio::test]
+async fn default_list_falls_back_to_first_then_honours_an_override() {
+    let api = fake();
+    let work = api.insert_list("Work").await.unwrap();
+    let home = api.insert_list("Home").await.unwrap();
+
+    // No override: `@default` is the first List (Google returns the default first).
+    assert_eq!(api.default_list().await.unwrap().id, work.id);
+
+    // Pointed elsewhere, it resolves to that List.
+    api.set_default_list(&home.id);
+    assert_eq!(api.default_list().await.unwrap().id, home.id);
+}
+
+#[tokio::test]
+async fn default_list_with_no_lists_is_not_found() {
+    let api = fake();
+    assert_eq!(api.default_list().await.unwrap_err(), ApiError::NotFound);
+}
+
+#[tokio::test]
 async fn patch_list_updates_title() {
     let api = fake();
     let l = api.insert_list("Wrok").await.unwrap();

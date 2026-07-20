@@ -66,6 +66,9 @@ async fn seeded() -> Model {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists));
+    // Startup lands on the pinned Today row (#61); select the List so its Tasks
+    // fill the pane and the pane-focused verbs act on it.
+    m.selected = oxidone::domain::Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id, tasks));
     m
 }
@@ -94,7 +97,7 @@ async fn focusing_past_the_edge_changes_nothing() {
     // No wrap: the focus keys are idempotent at the layout's two edges, and a
     // no-op means the *whole* model is untouched — not just `focus`.
     let mut m = seeded().await;
-    let (list, task) = (m.selected_list, m.selected_task);
+    let (list, task) = (m.selected, m.selected_task);
 
     for k in [key(KeyCode::Left), press('h')] {
         let cmds = update(&mut m, k);
@@ -103,7 +106,7 @@ async fn focusing_past_the_edge_changes_nothing() {
             "focusing left from the sidebar emitted work"
         );
         assert_eq!(m.focus, Focus::Sidebar);
-        assert_eq!(m.selected_list, list);
+        assert_eq!(m.selected, list);
         assert_eq!(m.selected_task, task);
     }
 
@@ -115,7 +118,7 @@ async fn focusing_past_the_edge_changes_nothing() {
             "focusing right from the tasks emitted work"
         );
         assert_eq!(m.focus, Focus::Tasks);
-        assert_eq!(m.selected_list, list);
+        assert_eq!(m.selected, list);
         assert_eq!(m.selected_task, task);
     }
 }

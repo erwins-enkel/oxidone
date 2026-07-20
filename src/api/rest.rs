@@ -314,6 +314,14 @@ impl TasksApi for RestClient {
         Ok(body.items.into_iter().map(WireList::into_domain).collect())
     }
 
+    async fn default_list(&self) -> Result<List, ApiError> {
+        // `@default` is Google's alias for the user's primary List; the response
+        // carries the concrete id, which is what we keep (ADR-0003).
+        let url = format!("{}/users/@me/lists/@default", self.base);
+        let body: WireList = self.send_json(self.http.get(url)).await?;
+        Ok(body.into_domain())
+    }
+
     async fn insert_list(&self, title: &str) -> Result<List, ApiError> {
         let url = format!("{}/users/@me/lists", self.base);
         let body: WireList = self

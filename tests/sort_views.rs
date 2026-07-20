@@ -8,7 +8,7 @@ use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{renders_as_subtask, update, Focus, Message, Model};
-use oxidone::domain::{List, ListId, SortView, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, SortView, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::empty())
@@ -70,6 +70,7 @@ async fn sort_key_cycles_due_title_manual_due() {
     let (l, tasks) = list_with(&[("a", None)]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
 
     assert_eq!(m.sort, SortView::Due); // default home state
@@ -94,6 +95,7 @@ async fn sort_never_mutates_manual_order() {
     let stored: Vec<String> = tasks.iter().map(|t| t.title.clone()).collect();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
 
     // Cycle through every view; `model.tasks` must never be reordered.
@@ -110,6 +112,7 @@ async fn cursor_stays_on_same_task_across_a_sort_change() {
     let (l, tasks) = list_with(&[("c", None), ("a", None), ("b", None)]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     m.selected_task = Some(1);
     let selected_id = m.tasks[1].id.clone();
@@ -138,6 +141,7 @@ async fn due_sort_orders_by_date_and_sinks_no_due_to_the_bottom() {
     .await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     m.sort = SortView::Due;
 
@@ -159,6 +163,7 @@ async fn title_sort_is_case_insensitive() {
     .await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     m.sort = SortView::Title;
 
@@ -174,6 +179,7 @@ async fn manual_sort_is_the_stored_order() {
     let (l, tasks) = list_with(&[("c", None), ("a", None), ("b", None)]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     m.sort = SortView::Manual; // the subject here is Manual's order, not the default
 
@@ -208,6 +214,7 @@ fn open(id: &str, parent: Option<&str>, due: Option<NaiveDate>) -> Task {
 /// A Model holding `tasks` in the given Vec (Manual) order, in `sort`.
 fn model(tasks: Vec<Task>, sort: SortView) -> Model {
     let mut m = Model::new();
+    m.selected = Selection::List(0);
     m.tasks = tasks;
     m.sort = sort;
     m
@@ -424,7 +431,7 @@ fn pane(tasks: Vec<Task>, display_pos: usize) -> Model {
         updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
     };
     m.lists = vec![l];
-    m.selected_list = Some(0);
+    m.selected = Selection::List(0);
     m.tasks = tasks;
     m.focus = Focus::Tasks;
     let id = m.sorted_tasks()[display_pos].id.clone();
@@ -912,6 +919,7 @@ async fn title_sort_orders_by_display_title_not_the_type_prefix() {
     .await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     m.sort = SortView::Title;
 

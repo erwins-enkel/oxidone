@@ -7,7 +7,7 @@
 use chrono::{Local, NaiveDate, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{update, Message, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -74,6 +74,7 @@ fn model_with(tasks: Vec<Task>) -> Model {
         .single()
         .unwrap();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab)); // focus task pane
     m

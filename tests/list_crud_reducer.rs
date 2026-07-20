@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, ConfirmAction, Message, Model, Overlay};
-use oxidone::domain::{List, ListId, Task};
+use oxidone::domain::{List, ListId, Selection, Task};
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -44,6 +44,9 @@ async fn model_with_two_lists() -> (Model, Vec<List>, Vec<Task>) {
     }
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists.clone()));
+    // Startup lands on the pinned Today row (#61); select the first List so the
+    // sidebar CRUD verbs (which are focused-List-gated) act on a real List.
+    m.selected = Selection::List(0);
     let first_tasks = api
         .list_tasks(&lists[0].id, true, false, None)
         .await
@@ -77,7 +80,7 @@ async fn typing_and_enter_appends_a_placeholder_and_requests_insert() {
     assert!(m.overlay.is_none());
     assert_eq!(m.lists.len(), 3);
     assert_eq!(m.lists[2].title, "Errands"); // Google appends new Lists
-    assert_eq!(m.selected_list, Some(2)); // becomes active
+    assert_eq!(m.selected, Selection::List(2)); // becomes active
     assert!(m.tasks.is_empty()); // a fresh List is empty
     assert_eq!(
         cmds,
@@ -141,7 +144,7 @@ async fn a_failed_list_add_drops_the_placeholder_and_reselects() {
     typed(&mut m, "Errands");
     update(&mut m, key(KeyCode::Enter));
     assert_eq!(m.lists.len(), 3);
-    assert_eq!(m.selected_list, Some(2));
+    assert_eq!(m.selected, Selection::List(2));
 
     let cmds = update(
         &mut m,
@@ -151,7 +154,7 @@ async fn a_failed_list_add_drops_the_placeholder_and_reselects() {
         },
     );
     assert_eq!(m.lists.len(), 2); // placeholder removed
-    assert_eq!(m.selected_list, Some(1)); // clamped back onto a real List
+    assert_eq!(m.selected, Selection::List(1)); // clamped back onto a real List
     assert_eq!(m.status_line.as_deref(), Some("boom"));
     // The now-active List's Tasks are reloaded.
     assert_eq!(cmds, vec![Command::LoadTasks(lists[1].id.clone())]);
@@ -286,8 +289,8 @@ async fn confirming_deletes_the_list_optimistically_and_reselects() {
     assert!(m.overlay.is_none());
     assert_eq!(m.lists.len(), 1); // "Work" removed optimistically
     assert_eq!(m.lists[0].title, "Home");
-    assert_eq!(m.selected_list, Some(0)); // "Home" is now active
-                                          // The delete is requested and the newly-active List's Tasks reloaded.
+    assert_eq!(m.selected, Selection::List(0)); // "Home" is now active
+                                                // The delete is requested and the newly-active List's Tasks reloaded.
     assert_eq!(
         cmds,
         vec![
@@ -327,7 +330,7 @@ async fn a_failed_list_delete_reinserts_and_reselects_it() {
     );
     assert_eq!(m.lists.len(), 2);
     assert_eq!(m.lists[0].title, "Work"); // back at index 0
-    assert_eq!(m.selected_list, Some(0)); // and reselected
+    assert_eq!(m.selected, Selection::List(0)); // and reselected
     assert_eq!(
         m.status_line.as_deref(),
         Some("cannot delete the default list")

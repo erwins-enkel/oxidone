@@ -1,10 +1,13 @@
 //! Reducer tests for the List read path (ticket #4): `ListsLoaded` handling and
 //! sidebar selection. `update` is pure — no terminal.
+//!
+//! The sidebar cursor spans `[Today, …lists]`: the pinned Today view (#61) sits
+//! above the real Lists, and startup lands on it.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, TasksApi};
 use oxidone::app::{update, Message, Model};
-use oxidone::domain::List;
+use oxidone::domain::{List, Selection};
 
 async fn two_lists() -> Vec<List> {
     // Build real `List` values via the fake (Work, then Home).
@@ -19,35 +22,43 @@ fn press(c: char) -> Message {
 }
 
 #[tokio::test]
-async fn lists_loaded_selects_the_first() {
+async fn lists_loaded_lands_on_today() {
+    // Today is pinned and is the startup landing, so loading Lists keeps the
+    // cursor on it rather than auto-selecting the first List.
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(two_lists().await));
     assert_eq!(m.lists.len(), 2);
-    assert_eq!(m.selected_list, Some(0));
+    assert_eq!(m.selected, Selection::Today);
 }
 
 #[tokio::test]
-async fn empty_lists_leaves_no_selection() {
+async fn empty_lists_stays_on_today() {
+    // With no Lists, Today is still selectable (pinned) — there is no "nothing
+    // selected" state to fall into.
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![]));
     assert!(m.lists.is_empty());
-    assert_eq!(m.selected_list, None);
+    assert_eq!(m.selected, Selection::Today);
 }
 
 #[tokio::test]
-async fn j_and_k_move_selection_within_bounds() {
+async fn j_and_k_move_selection_across_today_and_the_lists() {
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(two_lists().await));
-    assert_eq!(m.selected_list, Some(0));
+    assert_eq!(m.selected, Selection::Today);
 
     update(&mut m, press('j'));
-    assert_eq!(m.selected_list, Some(1));
+    assert_eq!(m.selected, Selection::List(0)); // Work
+    update(&mut m, press('j'));
+    assert_eq!(m.selected, Selection::List(1)); // Home
     update(&mut m, press('j')); // clamped at the end
-    assert_eq!(m.selected_list, Some(1));
+    assert_eq!(m.selected, Selection::List(1));
     update(&mut m, press('k'));
-    assert_eq!(m.selected_list, Some(0));
+    assert_eq!(m.selected, Selection::List(0));
+    update(&mut m, press('k'));
+    assert_eq!(m.selected, Selection::Today); // back up to the pinned row
     update(&mut m, press('k')); // clamped at the start
-    assert_eq!(m.selected_list, Some(0));
+    assert_eq!(m.selected, Selection::Today);
 }
 
 #[tokio::test]
@@ -56,13 +67,14 @@ async fn reload_preserves_the_selected_list_by_id() {
     let lists = two_lists().await;
     let home = lists[1].clone();
     update(&mut m, Message::ListsLoaded(lists));
-    update(&mut m, press('j')); // select Home (index 1)
-    assert_eq!(m.selected_list, Some(1));
+    update(&mut m, press('j')); // Today -> Work
+    update(&mut m, press('j')); // Work  -> Home (index 1)
+    assert_eq!(m.selected, Selection::List(1));
 
     // Reload with Work gone — Home is now index 0 and should stay selected.
     update(&mut m, Message::ListsLoaded(vec![home]));
     assert_eq!(m.lists.len(), 1);
-    assert_eq!(m.selected_list, Some(0));
+    assert_eq!(m.selected, Selection::List(0));
     assert_eq!(m.lists[0].title, "Home");
 }
 

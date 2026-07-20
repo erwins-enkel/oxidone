@@ -4,7 +4,7 @@
 //! `link_render.rs`.
 
 use oxidone::app::{Focus, Model};
-use oxidone::domain::{EntryType, List, ListId, Status, Task, TaskId};
+use oxidone::domain::{EntryType, List, ListId, Selection, Status, Task, TaskId};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -88,7 +88,7 @@ fn model_with(tasks: Vec<Task>) -> Model {
         etag: String::new(),
         updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
     }];
-    model.selected_list = Some(0);
+    model.selected = Selection::List(0);
     model.selected_task = Some(0);
     model.tasks = tasks;
     model.focus = Focus::Tasks;

@@ -24,20 +24,29 @@
 pub struct OpenableUrl(String);
 
 impl OpenableUrl {
-    /// Accept `raw` only if it is an `http`/`https` URL with something after the
-    /// `://`. The scheme compares case-insensitively (`HTTPS://` is valid per
-    /// RFC 3986), but the original spelling is what gets stored, displayed and
-    /// opened — normalising it would show the user a URL they did not write.
+    /// Accept `raw` only if [`is_openable`] does. The original spelling is what
+    /// gets stored, displayed and opened — normalising it would show the user a
+    /// URL they did not write.
     pub fn parse(raw: &str) -> Option<Self> {
-        let (scheme, rest) = raw.split_once("://")?;
-        if rest.is_empty() {
-            return None;
-        }
-        is_openable_scheme(scheme).then(|| Self(raw.to_string()))
+        is_openable(raw).then(|| Self(raw.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Whether `raw` is a URL [`OpenableUrl::parse`] would accept: an
+/// `http`/`https` scheme with something after the `://`.
+///
+/// The same test parse applies, without constructing the value — so the row
+/// marker can ask its yes/no question for every visible Task on every frame
+/// without allocating a `String` it immediately drops. Sharing it with `parse`
+/// is what keeps the cheap path and the guarded path from disagreeing.
+fn is_openable(raw: &str) -> bool {
+    match raw.split_once("://") {
+        Some((scheme, rest)) => !rest.is_empty() && is_openable_scheme(scheme),
+        None => false,
     }
 }
 
@@ -82,10 +91,11 @@ pub fn openable_urls(notes: &str) -> Vec<OpenableUrl> {
 ///
 /// Separate from [`openable_urls`] because the row marker asks this question for
 /// every visible Task on every frame: this short-circuits on the first hit and
-/// allocates nothing, where collecting would build a `Vec` plus a `String` per
+/// allocates nothing — it tests with [`is_openable`] rather than building an
+/// [`OpenableUrl`] — where collecting would build a `Vec` plus a `String` per
 /// URL just to test emptiness.
 pub fn has_openable_url(notes: &str) -> bool {
-    url_tokens(notes).any(|token| OpenableUrl::parse(token).is_some())
+    url_tokens(notes).any(is_openable)
 }
 
 /// Iterate the `scheme://` tokens of `notes` lazily, so callers that only need

@@ -380,17 +380,17 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             label: "del",
         },
         COMPLETED,
-        // Last two: `Enter` already aliases `e`, and the pane title names the
-        // active Sort view. Both drop first on a narrow pane.
+        // The last three announce themselves elsewhere, so they drop first on a
+        // narrow pane: `Enter` already aliases `e`, the pane title names the
+        // active Sort view, and a Task with links carries the `⧉` marker.
+        // Promoting `link` far enough to show at 80 columns would drop
+        // `c completed`, which outranks it because hiding Completed Tasks
+        // changes the screen with nothing on it to say so.
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::EditTitle]),
             label: "edit",
         },
         SORT,
-        // Last: the `⧉` row marker is itself visible, so an unknown `u` is
-        // recoverable via `?` in a way that a silently hidden Completed Task is
-        // not. Promoting it far enough to show at 80 columns would drop
-        // `c completed`, which outranks it for exactly that reason.
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::OpenLink]),
             label: "link",

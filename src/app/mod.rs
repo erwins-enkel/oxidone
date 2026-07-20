@@ -1540,14 +1540,22 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
                 return Vec::new();
             };
-            // Unconditional, unlike the async failure paths: the delete verb acts
-            // on the selection and the confirm overlay swallows keys, so the
-            // cursor is provably on the row about to disappear.
-            let successor = display_successor(model, &task);
+            // The verb acts on the selection, so the cursor is normally on the
+            // row about to go — but the overlay only gates keys, not the async
+            // `TasksLoaded` of an in-flight Refresh, which can re-anchor the
+            // cursor while the confirm is open. So re-home on the same terms as
+            // the async paths: only a cursor actually on the doomed row follows
+            // its successor; any other is re-resolved by id, since the `remove`
+            // shifts later indices.
+            let selected = selected_id(model);
+            let anchor = if selected.as_ref() == Some(&task) {
+                display_successor(model, &task)
+            } else {
+                selected
+            };
             let removed = model.tasks.remove(index); // optimistic delete
             model.pending_deletes.insert(task.clone(), (index, removed));
-            model.selected_task =
-                successor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
             reselect_visible(model);
             vec![Command::DeleteTask { list, task }]
         }
@@ -1674,9 +1682,9 @@ fn move_selection(model: &mut Model, delta: isize) -> Vec<Command> {
 }
 
 /// Move the task cursor by `delta` through the **displayed** order
-/// ([`visible_tasks`](Model::visible_tasks)) — the hierarchy under Manual, the
-/// sorted list otherwise, hidden rows already excluded — then map back to the
-/// Task's index in `tasks`. Clamps at the visible ends.
+/// ([`visible_tasks`](Model::visible_tasks)) — the grouped hierarchy in every
+/// lens, ordered by the active one, hidden rows already excluded — then map back
+/// to the Task's index in `tasks`. Clamps at the visible ends.
 fn move_task_cursor(model: &mut Model, delta: isize) {
     let visible = model.visible_tasks();
     if visible.is_empty() {

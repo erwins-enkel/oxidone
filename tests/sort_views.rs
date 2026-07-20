@@ -857,3 +857,34 @@ fn a_new_subtask_renders_at_the_head_of_its_groups_undated_tail() {
     );
     assert_eq!(selected_title(&m), Some("new".to_string()));
 }
+
+/// The confirm overlay gates keys but not an async `TasksLoaded`, so the cursor
+/// can move off the doomed row while the prompt is open. Only a cursor still on
+/// that row should follow its successor.
+///
+/// Driving that divergence through a real Refresh is currently not possible:
+/// `set_tasks` only moves the cursor when the selected Task becomes hidden, and
+/// it then picks the same display neighbour the delete would. The guard is
+/// pinned here directly so a future change to `set_tasks` cannot quietly
+/// reintroduce the yank.
+#[test]
+fn confirming_a_delete_does_not_yank_a_cursor_that_moved_away() {
+    let mut m = pane(scrambled(), 0); // on "b"
+    update(&mut m, press('x')); // confirm prompt for "b"
+
+    // Something async re-anchored the cursor while the prompt was open.
+    let elsewhere = m.tasks.iter().position(|t| t.title == "c").unwrap();
+    m.selected_task = Some(elsewhere);
+
+    update(&mut m, press('y'));
+
+    assert!(
+        !m.tasks.iter().any(|t| t.title == "b"),
+        "the confirmed Task is still the one deleted",
+    );
+    assert_eq!(
+        selected_title(&m),
+        Some("c".to_string()),
+        "the cursor stays where it was moved to, index shift and all",
+    );
+}

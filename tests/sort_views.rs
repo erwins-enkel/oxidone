@@ -7,7 +7,7 @@
 use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
-use oxidone::app::{update, Focus, Message, Model};
+use oxidone::app::{renders_as_subtask, update, Focus, Message, Model};
 use oxidone::domain::{List, ListId, SortView, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -388,19 +388,23 @@ fn renders_as_subtask_requires_the_parent_to_be_present() {
     fn by(m: &Model, id: &str) -> Task {
         m.tasks.iter().find(|t| t.id.0 == id).unwrap().clone()
     }
+    let top = m.top_level_ids();
     assert!(
-        !m.renders_as_subtask(&by(&m, "A")),
+        !renders_as_subtask(&top, &by(&m, "A")),
         "top-level never indents"
     );
-    assert!(m.renders_as_subtask(&by(&m, "a1")), "parent present");
-    assert!(!m.renders_as_subtask(&by(&m, "orphan")), "parent absent");
+    assert!(renders_as_subtask(&top, &by(&m, "a1")), "parent present");
+    assert!(
+        !renders_as_subtask(&top, &by(&m, "orphan")),
+        "parent absent"
+    );
 
     // A hidden Completed parent is still a parent: the indent must not flicker
     // when `show_completed` toggles.
     m.tasks[0].status = Status::Completed;
-    assert!(m.renders_as_subtask(&by(&m, "a1")));
+    assert!(renders_as_subtask(&m.top_level_ids(), &by(&m, "a1")));
     m.show_completed = true;
-    assert!(m.renders_as_subtask(&by(&m, "a1")));
+    assert!(renders_as_subtask(&m.top_level_ids(), &by(&m, "a1")));
 }
 
 // --- The cursor re-anchors in display order ---------------------------------
@@ -654,7 +658,7 @@ fn a_child_orphaned_by_a_parent_delete_stays_visible_and_flush_left() {
     assert_eq!(titles(&m.visible_tasks()), vec!["a1"]);
     let child = m.tasks[0].clone();
     assert!(
-        !m.renders_as_subtask(&child),
+        !renders_as_subtask(&m.top_level_ids(), &child),
         "its parent is gone, so it must not draw indented"
     );
 }
@@ -796,5 +800,28 @@ fn a_confirmed_insert_into_an_empty_pane_takes_the_cursor() {
         selected_title(&m),
         Some("server".to_string()),
         "the only row must be selected, not left unhighlighted",
+    );
+}
+
+#[test]
+fn a_task_parented_to_a_subtask_is_not_drawn_as_a_child() {
+    // Malformed depth-2 data (the one-level cap should prevent it, but Google is
+    // the source of truth). `groups` cannot nest it — it only nests under
+    // top-level Tasks — so it becomes its own group, and the indent must agree.
+    let m = model(
+        vec![
+            open("A", None, None),
+            open("a1", Some("A"), None),
+            open("deep", Some("a1"), None),
+        ],
+        SortView::Manual,
+    );
+    let top = m.top_level_ids();
+    let deep = m.tasks.iter().find(|t| t.title == "deep").unwrap();
+
+    assert_eq!(titles(&m.sorted_tasks()), vec!["A", "a1", "deep"]);
+    assert!(
+        !renders_as_subtask(&top, deep),
+        "grouping treats it as top-level, so the indent must too",
     );
 }

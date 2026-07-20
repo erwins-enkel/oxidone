@@ -3,7 +3,7 @@
 //! (api/sync/auth) only ever emit `Message`s into this reducer, and `update`
 //! emits `Command`s for them to run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 
@@ -288,14 +288,15 @@ impl Model {
         out
     }
 
-    /// Whether `task` should render indented: it has a parent **and** that parent
-    /// is in the Task set. An orphaned Subtask renders flush-left rather than as a
-    /// child of whatever precedes it. Independent of `show_completed` — a hidden
-    /// parent is still a parent — so the indent never flickers with the toggle.
-    pub fn renders_as_subtask(&self, task: &Task) -> bool {
-        task.parent
-            .as_ref()
-            .is_some_and(|p| self.tasks.iter().any(|t| &t.id == p))
+    /// The ids of every top-level Task — the rows a Subtask can be drawn under.
+    /// Built once per render so the per-row indent check is a hash lookup rather
+    /// than a scan of `tasks`.
+    pub fn top_level_ids(&self) -> HashSet<&TaskId> {
+        self.tasks
+            .iter()
+            .filter(|t| t.parent.is_none())
+            .map(|t| &t.id)
+            .collect()
     }
 
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
@@ -313,6 +314,19 @@ impl Model {
     fn is_visible(&self, task: &Task) -> bool {
         self.show_completed || task.status != Status::Completed
     }
+}
+
+/// Whether `task` should render indented, given `top_level` from the same Model
+/// (see [`Model::top_level_ids`]). True only when its parent is a present,
+/// top-level Task — which is exactly what [`Model::groups`] nests it under, so a
+/// row this returns `false` for is one grouping already treats as top-level: an
+/// orphan whose parent was deleted, or (malformed) one parented to a Subtask.
+/// Either renders flush-left rather than claiming the row above it as a parent.
+///
+/// Independent of `show_completed` — a hidden parent is still a parent — so the
+/// indent never flickers with the toggle.
+pub fn renders_as_subtask(top_level: &HashSet<&TaskId>, task: &Task) -> bool {
+    task.parent.as_ref().is_some_and(|p| top_level.contains(p))
 }
 
 /// The id of the Task under the cursor, if any.

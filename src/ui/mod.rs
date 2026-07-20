@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{Focus, Model, Overlay};
+use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::format_due_relative;
 use crate::domain::{Status, Task};
 use crate::keymap;
@@ -126,6 +126,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Overdue is a property of the date against today, decided here in the view
     // — `model.now` keeps that testable rather than reading the wall clock.
     let today = model.now.date_naive();
+    // Built once per render: the per-row indent check is then a hash lookup, not
+    // a scan of every Task.
+    let top_level = model.top_level_ids();
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -155,7 +158,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // Subtasks sit indented under their parent so the hierarchy reads.
             // An orphan (parent gone) draws flush-left rather than claiming the
             // row above it as its parent.
-            if model.renders_as_subtask(t) {
+            if renders_as_subtask(&top_level, t) {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
             spans.push(Span::styled(t.title.clone(), style));

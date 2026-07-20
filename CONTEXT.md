@@ -13,8 +13,8 @@ A Google TaskList; a named container of Tasks.
 _Avoid_: folder, group, category, tasklist.
 
 **Task**:
-A single item in a List.
-_Avoid_: todo, item, entry.
+A single item in a List, and one of the three **Entry types** — the actionable one, as against an Event or a Note. Unqualified "Task" still means the actionable type; **entry** is the umbrella term when the type does not matter.
+_Avoid_: todo, item.
 
 **Subtask**:
 A Task with a `parent`. Capped at **one nesting level** — a Subtask cannot itself have Subtasks — matching Google's own clients.
@@ -23,6 +23,26 @@ _Avoid_: child, nested todo.
 **Status**:
 The only two states a Task can be in: `needsAction` or `completed`. There is no "in progress," no priority.
 _Avoid_: open, done-ish, state.
+
+**Entry type**:
+Which of Bullet Journal's three kinds an entry is: a **Task**, an **Event**, or a **Note**. Derived from the title's leading glyph, never stored as a field (ADR-0008) — `Task` is the default and carries no glyph.
+_Avoid_: kind, category, entry kind.
+
+**Event**:
+An entry that happens on a day, written `○ ` before the title. Occupies the Due-load, never the Completion meter — an Event is not work you finish.
+_Avoid_: appointment, meeting.
+
+**Note** (the entry type):
+A jotting, written `— ` before the title. Counted by neither the Completion meter nor the Due-load.
+_Avoid_: notes (that is the field below), memo, comment.
+
+**Notes** (the field):
+Google's free-text body on a Task, edited with `n`. Unrelated to the **Note** entry type: a Note is what an entry *is*, notes are what it *carries*. Any entry type may have notes.
+_Avoid_: description, body, note.
+
+**Display title**:
+A Task's title with its type glyph removed — what the pane shows and the editor opens on. Equal to the raw title for a Task. Note this means "prefix removed", not "glyph-free": a title Google stores in a non-canonical form (`○Standup`, no space) is read as an untyped Task and keeps its glyph on screen until `t` normalises it.
+_Avoid_: clean title, stripped title.
 
 **Due date**:
 A **date, never a time**. Google's API discards the time portion, so oxidone never stores or shows a due time.
@@ -40,6 +60,23 @@ _Avoid_: sort order.
 
 **Move**:
 Repositioning or reparenting a Task (Google's `move` operation). The only action that writes Manual order or changes an existing Task's `parent`. Moves compute against stored order, so a Move pressed from a Sort view switches the pane back to Manual and stops — the next press performs the Move, against the adjacency now on screen.
+
+### The four dispositions
+
+Bullet Journal's daily review asks one question of every entry still `needsAction`: what becomes of it? These four answers are *not* the same list as **The four exits** below — two of them are not departures at all.
+
+| Disposition | BuJo signifier | oxidone | Leads to |
+| --- | --- | --- | --- |
+| Complete | `X` | `Space` | the **Completed** exit |
+| Scheduled | `<` | `d` | no exit — only the due date moves |
+| Migrated | `>` | `m` | no exit — only the due date moves |
+| Irrelevant | ~~strikethrough~~ | `x` | the **Deleted** exit |
+
+Two traps worth naming. BuJo's `X` means *complete*; oxidone's `x` key means *delete*, which is the opposite — the two must never be conflated. And `>`/`<` are unavailable as bindings (they are Indent and Outdent), so migration binds `m`, the verb's initial.
+
+**Migrate**:
+Pushing an entry's due date to `max(today, due) + 1 day` — Bullet Journal's `>`. **Not an exit**: the entry stays `needsAction` and nothing but its due date changes. Repeated migrations compose, a day at a time. Refused on a Completed entry, where re-dating means nothing.
+_Avoid_: defer, snooze, postpone, push (as a noun).
 
 ### The four exits
 
@@ -67,10 +104,18 @@ A local change not yet confirmed by Google. Dormant in v1 (failed writes roll ba
 **Completion log**:
 A local, append-only record of completion events (`task_id`, `list_id`, `title`, `completed_at`), kept *separately* from the pure-mirror cache. Feeds future activity views. It is **per-machine and non-authoritative** — it does not sync across machines and is never Google's truth.
 
+`title` holds the **Display title**, not the raw one: the log is human-readable history, not a mirror, so it records what an entry was called rather than the type encoding. Rows are keyed `(task_id, completed_at)` and written `INSERT OR IGNORE`, so first observation wins — a later retype or rename never reaches an already-logged row.
+
 ### Visual vocabulary
 
+**Signifier**:
+The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task.
+_Avoid_: bullet, icon, marker (that is the link `⧉`).
+
 **Completion meter**:
-A braille-cell progress bar of done ÷ total, shown per List and per parent Task. Braille gives 8× horizontal resolution over a block bar.
+A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown in the task-pane header, per List in the sidebar, and per parent Task for its Subtasks. Braille gives 8× horizontal resolution over a block bar.
+
+The three agree for the **active** List, which derives its counts live from the loaded pane. A List you have not selected is counted in SQL over the mirror, which does not read the type prefix — so a background List holding Events or Notes reads high until you select it. Known seam, not a rounding error: teaching the query the encoding would be a second definition of it, free to drift from `EntryType::parse`.
 
 **Due-load**:
-A braille histogram of Task counts per upcoming day — the "workload ahead" strip.
+A braille histogram of counts per upcoming day — the "workload ahead" strip. Counts Tasks and Events, not Notes. Deliberately narrower than the per-row due gutter, which shows a date for *any* dated entry: the gutter answers "does this carry a date?", the strip answers "how much is coming?".

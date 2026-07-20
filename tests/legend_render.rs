@@ -14,10 +14,12 @@ use ratatui::Terminal;
 const WIDTH: u16 = 80;
 const HEIGHT: u16 = 24;
 
-/// Draw a frame and return its rows as strings.
-fn rows(model: &Model) -> Vec<String> {
+/// Draw a frame `width` columns wide and return its rows as strings. Widened
+/// from a fixed 80 so the cells that fall below the default terminal's budget
+/// can still be pinned somewhere — following `link_render.rs`.
+fn rows_at(model: &Model, width: u16) -> Vec<String> {
     let mut terminal =
-        Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("TestBackend terminal");
+        Terminal::new(TestBackend::new(width, HEIGHT)).expect("TestBackend terminal");
     let theme = Theme::from_flavor("mocha");
     terminal
         .draw(|frame| ui::view(model, &theme, false, frame))
@@ -26,11 +28,15 @@ fn rows(model: &Model) -> Vec<String> {
     let buffer = terminal.backend().buffer().clone();
     (0..HEIGHT)
         .map(|y| {
-            (0..WIDTH)
+            (0..width)
                 .map(|x| buffer[(x, y)].symbol().to_string())
                 .collect()
         })
         .collect()
+}
+
+fn rows(model: &Model) -> Vec<String> {
+    rows_at(model, WIDTH)
 }
 
 fn model_with_status() -> Model {
@@ -87,4 +93,78 @@ fn help_is_pinned_to_the_last_column() {
         legend.ends_with("? help"),
         "expected help flush right, got {legend:?}"
     );
+}
+
+// --- Cells below the 80-column budget --------------------------------------
+//
+// The task legend's 80-column budget is 72 and the cells through `c completed`
+// already total exactly 72, so anything added at or above `completed` evicts it.
+// `m migrate` (and later `t/T type`) therefore sit *below* it and are invisible
+// at the default width — these two tests pin both halves of that bargain.
+
+/// Wide enough for every cell: the thirteen cells cost 117 cumulative and the
+/// pinned help cell reserves 8, so 125 is the floor. 130 leaves five columns of
+/// slack, so a one-character label change does not silently drop `u link`.
+const WIDE: u16 = 130;
+
+#[test]
+fn migrate_is_below_the_eighty_column_cut_and_evicts_nothing() {
+    let mut model = model_with_status();
+    model.focus = Focus::Tasks;
+
+    // The exact-string test above already pins the full row; this one states the
+    // intent — `c completed` survives and `m migrate` is the one that yields.
+    let legend = rows(&model)
+        .last()
+        .expect("a bottom row")
+        .trim_end()
+        .to_string();
+    assert!(
+        legend.contains("c completed"),
+        "completed evicted: {legend}"
+    );
+    for below in ["migrate", "type"] {
+        assert!(
+            !legend.contains(below),
+            "{below} must not fit 80 columns, or it displaced a cell: {legend}"
+        );
+    }
+}
+
+#[test]
+fn a_wide_pane_reveals_migrate_above_edit_and_type_below_link() {
+    let mut model = model_with_status();
+    model.focus = Focus::Tasks;
+
+    let rows = rows_at(&model, WIDE);
+    let legend = rows.last().expect("a bottom row").trim_end().to_string();
+
+    let at = |needle: &str| {
+        legend
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {legend:?}"))
+    };
+    assert!(at("c completed") < at("m migrate"), "{legend}");
+    assert!(at("m migrate") < at("e edit"), "{legend}");
+    // `type` sits below `link`: anything above it evicts `link` at 120, where
+    // `link_render.rs` pins it as present.
+    assert!(at("u link") < at("t/T type"), "{legend}");
+    assert!(legend.ends_with("? help"), "{legend}");
+}
+
+#[test]
+fn the_new_cells_do_not_evict_link_at_the_width_where_it_fits() {
+    // Regression: `t/T type` first landed above `link`, which pushed `link` off
+    // at 120 — the width `link_render.rs` pins it as present. Adding a cell must
+    // never cost an existing verb the width it already had.
+    let mut model = model_with_status();
+    model.focus = Focus::Tasks;
+
+    let legend = rows_at(&model, 120)
+        .last()
+        .expect("a bottom row")
+        .trim_end()
+        .to_string();
+    assert!(legend.contains("u link"), "link evicted at 120: {legend}");
+    assert!(legend.contains("m migrate"), "{legend}");
 }

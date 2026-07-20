@@ -20,7 +20,7 @@ use ratatui::Frame;
 
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::format_due_relative;
-use crate::domain::{Status, Task};
+use crate::domain::{EntryType, Status, Task};
 use crate::keymap;
 use crate::links::{self, OpenableUrl};
 use theme::Theme;
@@ -309,6 +309,38 @@ fn link_marker(has_urls: bool, ascii: bool) -> Option<&'static str> {
     has_urls.then_some(if ascii { " *" } else { " ⧉" })
 }
 
+/// The Bullet Journal signifier for an entry type: `Event` and `Note` carry a
+/// glyph, `Task` a blank of the same width — every variant occupies the same
+/// cell so titles stay aligned down the pane
+/// (`every_signifier_occupies_the_same_cell` pins that).
+///
+/// Degrades with the braille widgets (ADR-0006), following `link_marker`: both
+/// are per-row *data* glyphs, and data is what `ascii_fallback` governs. Chrome
+/// does not follow it — the panel borders, the `LIST_CURSOR` arrow and the pane
+/// title's em dash stay Unicode either way — so this is consistency with the
+/// marker beside it, not a claim about every glyph on screen.
+///
+/// Rendering only: `EntryType::apply` always writes the Unicode glyph, or
+/// toggling the flag would silently revert every typed entry to `Task` on the
+/// next read.
+///
+/// `○` and `—` are East Asian Ambiguous, so a terminal configured to render
+/// Ambiguous as double-width shifts signifier rows by a column. `ascii_fallback`
+/// is the remedy: `o` and `-` are unambiguously single-width.
+fn signifier(entry: EntryType, ascii: bool) -> &'static str {
+    match (entry, ascii) {
+        // A Task's blank is a *rendering* fact — `prefix()` is "" for a Task,
+        // because it writes nothing — so it is the one arm stated here.
+        (EntryType::Task, _) => "  ",
+        (EntryType::Event, true) => "o ",
+        (EntryType::Note, true) => "- ",
+        // Derived, never restated: the glyph drawn is the glyph written, so the
+        // two cannot drift into a state where a typed entry renders its raw
+        // title inline with no signifier beside it.
+        (typed, false) => typed.prefix(),
+    }
+}
+
 /// Style for a Task's due-date cell. Overdue reads in the palette's red so it
 /// catches the eye when scanning the column — but Completed wins: a done Task
 /// is settled, so its date stays dim alongside the struck-through title.
@@ -325,12 +357,19 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     let focused = model.focus == Focus::Tasks;
     // The displayed rows are a read-only lens over `tasks`: the current sort's
     // order with Completed Tasks filtered out unless revealed. `tasks` (Manual
-    // order) stays untouched, and the header meter still counts over all of it.
+    // order) stays untouched, and the header meter counts over all of it —
+    // hiding Completed Tasks never moves the meter. It is narrowed on the other
+    // axis though: only Task-typed entries count, so its `total` is *not*
+    // `model.tasks.len()` on a pane holding Events or Notes (see `header_title`).
     let ordered = model.visible_tasks();
     // Due dates lead the row in a fixed-width gutter so they scan vertically.
     // The gutter only exists when something in view has a due date — otherwise
     // every title would sit behind a column of blanks.
     let due_gutter = ordered.iter().any(|t| t.due.is_some());
+    // Like the due gutter: the cell only exists when something in view is typed.
+    // On an all-Task pane — the overwhelmingly common case — a column of blanks
+    // would spend width to say "ordinary".
+    let signifiers = ordered.iter().any(|t| t.entry_type() != EntryType::Task);
     // Overdue is a property of the date against today, decided here in the view
     // — `model.now` keeps that testable rather than reading the wall clock.
     let today = model.now.date_naive();
@@ -372,7 +411,22 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             if renders_as_subtask(&top_level, t) {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
-            spans.push(Span::styled(t.title.clone(), style));
+            // *After* the indent: hoisted outside it, a Subtask's glyph would
+            // share a column with its parent's and flatten the only cue telling
+            // them apart. Inherits the row style, like the link marker — a
+            // Completed Event reads as one settled line.
+            let cell = signifiers.then(|| signifier(t.entry_type(), ascii));
+            if let Some(cell) = cell {
+                spans.push(Span::styled(cell, style));
+            }
+            spans.push(Span::styled(t.display_title().to_string(), style));
+            // What the row actually put on screen, not what the Task stores: the
+            // signifier cell plus the *display* title. The Subtask meter budgets
+            // against this, so it must be derived from the same two values that
+            // were just drawn — `t.title` is neither of them, and on a pane with
+            // signifiers an untyped row's raw title understates the drawn width
+            // by the cell, handing the meter room the row does not have.
+            let drawn_width = cell.map_or(0, |c| c.width()) + t.display_title().width();
             // Trails the title so the due gutter and Subtask indent stay
             // aligned. Driven by the cheap predicate, not by collecting the
             // URLs: this runs for every visible row on every frame.
@@ -391,7 +445,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 subtask_counts.get(&t.id).copied(),
                 area.width,
                 due_gutter,
-                t.title.width(),
+                drawn_width,
                 marker.map_or(0, |m| m.width()),
                 ascii,
             );
@@ -431,12 +485,23 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     let inner = inner_width as usize;
     let mut title = base.to_string();
 
-    // Completion meter for the active List (done / total of the loaded Tasks).
-    let total = model.tasks.len();
-    if total > 0 {
-        let done = model
+    // Completion meter for the active List, over Task-typed entries only:
+    // Events and Notes are not work you complete, so counting them would make
+    // the meter permanently under-report. Numerator and denominator come from
+    // the *same* set — a completed Note counts in neither — or the label could
+    // read "4/3" while the bar clamped to full.
+    //
+    // A List holding only Events and Notes therefore shows no meter at all,
+    // via the `total > 0` guard: there is no completion to report.
+    let actionable = || {
+        model
             .tasks
             .iter()
+            .filter(|t| t.entry_type() == EntryType::Task)
+    };
+    let total = actionable().count();
+    if total > 0 {
+        let done = actionable()
             .filter(|t| t.status == Status::Completed)
             .count();
         let bar = meter::render(done, total, HEADER_METER_WIDTH, ascii);
@@ -459,9 +524,16 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     title
 }
 
-/// Bucket incomplete Tasks by due date into `days` daily buckets of "workload
+/// Bucket incomplete entries by due date into `days` daily buckets of "workload
 /// ahead": `[0]` = due today (and anything overdue, folded forward), `[1]` =
-/// tomorrow, ... Completed Tasks and Tasks with no due date are excluded.
+/// tomorrow, ... Completed entries and those with no due date are excluded.
+///
+/// Notes are excluded too: the strip forecasts work, and a Note is not work.
+/// Events are counted — they occupy a day even though you never complete them.
+///
+/// This is deliberately narrower than the due gutter beside each row, which
+/// shows a date for *any* dated entry including a Note. The gutter answers "does
+/// this carry a date?"; the strip answers "how much is coming?".
 fn due_load_counts(
     tasks: &[Task],
     now: chrono::DateTime<chrono::Local>,
@@ -470,7 +542,7 @@ fn due_load_counts(
     let today = now.date_naive();
     let mut counts = vec![0usize; days];
     for task in tasks {
-        if task.status == Status::Completed {
+        if task.status == Status::Completed || task.entry_type() == EntryType::Note {
             continue;
         }
         let Some(due) = task.due else { continue };
@@ -1314,11 +1386,17 @@ mod tests {
     }
 
     fn task(due: Option<NaiveDate>, status: Status) -> Task {
+        titled("t", due, status)
+    }
+
+    /// `task`, but with the raw title spelled out — so a fixture can carry a
+    /// type prefix.
+    fn titled(title: &str, due: Option<NaiveDate>, status: Status) -> Task {
         Task {
             id: TaskId("t".into()),
             list: ListId("l".into()),
             parent: None,
-            title: "t".into(),
+            title: title.into(),
             notes: None,
             status,
             due,
@@ -1692,5 +1770,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Entry-type signifiers and counters ------------------------------
+
+    fn model_with(tasks: Vec<Task>) -> Model {
+        let mut model = Model::new();
+        model.tasks = tasks;
+        model
+    }
+
+    /// `model_with`, plus a selected List — so `list_meter` takes its live
+    /// branch instead of falling through to the cached counts.
+    fn model_with_active_list(tasks: Vec<Task>) -> (Model, ListId) {
+        let id = ListId("l".into());
+        let mut model = model_with(tasks);
+        model.lists = vec![crate::domain::List {
+            id: id.clone(),
+            title: "L".into(),
+            etag: String::new(),
+            updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }];
+        model.selected_list = Some(0);
+        (model, id)
+    }
+
+    #[test]
+    fn every_signifier_occupies_the_same_cell() {
+        // Derived, not a magic constant: whatever width `Task`'s blank is, the
+        // glyphs must match it or titles stagger down the pane.
+        // Columns, not chars — the property is on-screen alignment, and it is
+        // the same measure `the_cursor_gutter_is_the_same_width_either_way`
+        // uses on the gutter this cell sits beside.
+        for ascii in [false, true] {
+            let width = signifier(EntryType::Task, ascii).width();
+            for entry in [EntryType::Event, EntryType::Note] {
+                assert_eq!(
+                    signifier(entry, ascii).width(),
+                    width,
+                    "{entry:?} ascii={ascii}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signifiers_degrade_to_ascii_with_the_braille_widgets() {
+        assert_eq!(signifier(EntryType::Event, false), "○ ");
+        assert_eq!(signifier(EntryType::Note, false), "— ");
+        assert_eq!(signifier(EntryType::Event, true), "o ");
+        assert_eq!(signifier(EntryType::Note, true), "- ");
+        // A Task is blank either way — rendering `•` on ~90% of rows would spend
+        // a column to say "ordinary".
+        assert_eq!(signifier(EntryType::Task, true).trim(), "");
+    }
+
+    #[test]
+    fn the_meter_counts_only_task_typed_entries() {
+        // Two Tasks, one done, plus a completed Note. The Note counts in neither
+        // numerator nor denominator, so the label reads 1/2 — never 2/3, and
+        // never the "2/1" a filtered denominator over an unfiltered numerator
+        // would produce.
+        let model = model_with(vec![
+            titled("alpha", None, Status::NeedsAction),
+            titled("beta", None, Status::Completed),
+            titled("— jotting", None, Status::Completed),
+        ]);
+        let title = header_title("Tasks", &model, 200, true);
+        assert!(title.contains(" 1/2"), "expected 1/2 in {title:?}");
+    }
+
+    #[test]
+    fn a_list_with_no_task_typed_entries_shows_no_meter() {
+        // There is no completion to report, so the meter is absent rather than
+        // rendering an empty bar or 0/0.
+        let model = model_with(vec![
+            titled("○ standup", None, Status::NeedsAction),
+            titled("— jotting", None, Status::NeedsAction),
+        ]);
+        let title = header_title("Tasks", &model, 200, true);
+        assert_eq!(title, "Tasks", "expected no meter, got {title:?}");
+    }
+
+    #[test]
+    fn due_load_counts_events_but_not_notes() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 3, 10, 9, 0, 0)
+            .single()
+            .expect("a valid local time");
+        let today = Some(ymd(2026, 3, 10));
+        let counts = due_load_counts(
+            &[
+                titled("alpha", today, Status::NeedsAction),
+                titled("○ standup", today, Status::NeedsAction),
+                titled("— jotting", today, Status::NeedsAction),
+            ],
+            now,
+            3,
+        );
+        // Task + Event, not the Note.
+        assert_eq!(counts[0], 2, "{counts:?}");
+    }
+
+    #[test]
+    fn the_header_and_sidebar_meters_agree_for_the_active_list() {
+        // `Model::list_meter` promises the two meters for the active List always
+        // agree. Entry types can break that promise from one side: the header
+        // counts only Task-typed entries, so a sidebar row counting Events
+        // beside it would contradict the row it sits next to — two numbers for
+        // one List, on screen at once.
+        let (model, list) = model_with_active_list(vec![
+            titled("alpha", None, Status::NeedsAction),
+            titled("beta", None, Status::Completed),
+            titled(
+                &EntryType::Event.apply("standup"),
+                None,
+                Status::NeedsAction,
+            ),
+            titled(&EntryType::Note.apply("jotting"), None, Status::Completed),
+        ]);
+
+        let (done, total) = model.list_meter(&list).expect("an active-List meter");
+        assert_eq!(
+            (done, total),
+            (1, 2),
+            "the sidebar must skip the Event and the Note"
+        );
+        assert!(
+            header_title("Tasks", &model, 200, true).contains(&format!(" {done}/{total}")),
+            "header and sidebar disagree for the same List"
+        );
+    }
+
+    #[test]
+    fn a_subtask_meter_skips_typed_children() {
+        // Same argument one level down: a Note nested under a parent is a
+        // jotting about it, not a step toward it.
+        let parent = titled("parent", None, Status::NeedsAction);
+        let mut done_child = titled("step", None, Status::Completed);
+        done_child.id = TaskId("c1".into());
+        done_child.parent = Some(parent.id.clone());
+        let mut note_child = titled(&EntryType::Note.apply("aside"), None, Status::NeedsAction);
+        note_child.id = TaskId("c2".into());
+        note_child.parent = Some(parent.id.clone());
+
+        let model = model_with(vec![parent.clone(), done_child, note_child]);
+        let top_level = model.top_level_ids();
+        let counts = model.subtask_counts(&top_level);
+
+        assert_eq!(
+            counts.get(&parent.id).copied(),
+            Some((1, 1)),
+            "the Note child should not be counted"
+        );
     }
 }

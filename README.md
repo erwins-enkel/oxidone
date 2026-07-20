@@ -26,6 +26,8 @@ a Tasks costume.
   (from a sort view, the first reorder key switches back to "my order")
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
+- Bullet Journal entry types — Task, Event (`○`), Note (`—`) — flipped with
+  `t`/`T`, and migration (`m`) to push an entry forward a day
 - Notes edited in your `$EDITOR`
 - Full list management (create / rename / delete)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles

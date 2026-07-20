@@ -209,7 +209,15 @@ impl Cache {
             )?;
             for t in tasks {
                 if let (Status::Completed, Some(at)) = (t.status, t.completed_at) {
-                    log.execute(params![t.id.0, t.list.0, t.title, at.to_rfc3339()])?;
+                    // The *display* title: the log is human-readable history
+                    // (ADR-0007), not a mirror, so it carries what the entry was
+                    // called rather than the type encoding.
+                    log.execute(params![
+                        t.id.0,
+                        t.list.0,
+                        t.display_title(),
+                        at.to_rfc3339()
+                    ])?;
                 }
             }
         }
@@ -255,6 +263,11 @@ impl Cache {
     /// (ADR-0007). A no-op unless the Task is Completed with a `completed_at`;
     /// idempotent on `(task_id, completed_at)`. Deliberately separate from the
     /// pure-mirror `tasks` table (ADR-0003).
+    ///
+    /// Records the *display* title. `INSERT OR IGNORE` on `(task_id,
+    /// completed_at)` means first observation wins, so a later retype or rename
+    /// never reaches the logged row — all the more reason to log what the entry
+    /// was called rather than an encoding the user never typed.
     pub fn log_completion(&self, task: &Task) -> Result<()> {
         let (Status::Completed, Some(at)) = (task.status, task.completed_at) else {
             return Ok(());
@@ -262,7 +275,13 @@ impl Cache {
         self.conn.execute(
             "INSERT OR IGNORE INTO completion_log (task_id, list_id, title, completed_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![task.id.0, task.list.0, task.title, at.to_rfc3339()],
+            // Display title, not raw — see `replace_tasks`.
+            params![
+                task.id.0,
+                task.list.0,
+                task.display_title(),
+                at.to_rfc3339()
+            ],
         )?;
         Ok(())
     }

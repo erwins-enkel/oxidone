@@ -106,3 +106,44 @@ fn a_cleared_completion_survives_in_the_log() {
     assert!(cache.tasks(&list).unwrap().is_empty()); // gone from the mirror
     assert_eq!(cache.completions().unwrap().len(), 1); // kept in the log
 }
+
+#[test]
+fn the_log_records_the_display_title_while_the_mirror_keeps_the_raw_one() {
+    // The mirror is a mirror (ADR-0003) and the log is human-readable history
+    // (ADR-0007), so a typed entry stores its glyph in one and not the other.
+    let cache = Cache::open_in_memory().unwrap();
+    let list = ListId("L".to_string());
+    let mut event = task("1", Status::Completed, Some(ts(10)));
+    event.title = "○ Standup".to_string();
+
+    cache
+        .replace_tasks(&list, std::slice::from_ref(&event))
+        .unwrap();
+
+    assert_eq!(cache.tasks(&list).unwrap()[0].title, "○ Standup");
+    let logged = cache.completions().unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].title, "Standup");
+}
+
+#[test]
+fn a_later_retype_does_not_rewrite_an_already_logged_completion() {
+    // `INSERT OR IGNORE` on (task_id, completed_at): first observation wins, so
+    // renaming or retyping afterwards never reaches the logged row.
+    let cache = Cache::open_in_memory().unwrap();
+    let list = ListId("L".to_string());
+    let mut t = task("1", Status::Completed, Some(ts(10)));
+    t.title = "○ Standup".to_string();
+    cache
+        .replace_tasks(&list, std::slice::from_ref(&t))
+        .unwrap();
+
+    t.title = "— Standup".to_string();
+    cache
+        .replace_tasks(&list, std::slice::from_ref(&t))
+        .unwrap();
+
+    let logged = cache.completions().unwrap();
+    assert_eq!(logged.len(), 1, "one event, not two");
+    assert_eq!(logged[0].title, "Standup"); // unchanged by the retype
+}

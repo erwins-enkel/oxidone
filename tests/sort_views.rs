@@ -891,3 +891,37 @@ fn confirming_a_delete_does_not_yank_a_cursor_that_moved_away() {
         "the cursor stays where it was moved to, index shift and all",
     );
 }
+
+#[tokio::test]
+async fn title_sort_orders_by_display_title_not_the_type_prefix() {
+    // U+2014 sorts above every ASCII letter, so sorting the raw title would
+    // exile "— Standup" past "Zulu" to the tail. Sorting the display title keeps
+    // the two Standups together, wherever the stable sort leaves the tie.
+    //
+    // "Zulu" is what makes this falsifiable: under a raw sort it lands *between*
+    // the pair, so adjacency can actually fail. Adjacency is the assertion, not
+    // an exact permutation — which of the tied entries comes first is a
+    // tie-break detail this feature does not govern.
+    let (l, tasks) = list_with(&[
+        ("Alpha", None),
+        ("— Standup", None),
+        ("Standup", None),
+        ("Zulu", None),
+    ])
+    .await;
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
+    m.sort = SortView::Title;
+
+    let order: Vec<&str> = m.sorted_tasks().iter().map(|t| t.display_title()).collect();
+    let first = order
+        .iter()
+        .position(|t| *t == "Standup")
+        .expect("a Standup in the sorted order");
+    assert_eq!(
+        order.get(first + 1).copied(),
+        Some("Standup"),
+        "the two Standups must sort adjacently, got {order:?}"
+    );
+}

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 
 use crate::dateparse;
-use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
+use crate::domain::{EntryType, List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 use crate::links::{self, OpenableUrl};
 
@@ -273,11 +273,14 @@ impl Model {
                 }
                 groups.sort_by_cached_key(|g| due_key(group_due_key(g)));
             }
+            // Sorts on the *display* title: U+2014 sorts above every ASCII
+            // letter, so sorting raw would exile every typed entry to the tail
+            // and separate it from the Tasks it reads alongside.
             SortView::Title => {
                 for group in &mut groups {
-                    group[1..].sort_by_cached_key(|t| t.title.to_lowercase());
+                    group[1..].sort_by_cached_key(|t| t.display_title().to_lowercase());
                 }
-                groups.sort_by_cached_key(|g| g[0].title.to_lowercase());
+                groups.sort_by_cached_key(|g| g[0].display_title().to_lowercase());
             }
         }
         groups.into_iter().flatten().collect()
@@ -353,14 +356,20 @@ impl Model {
     /// the active List shows its pre-delete count until the recount lands.
     pub fn list_meter(&self, list: &ListId) -> Option<(usize, usize)> {
         let (done, total) = if self.selected_list_id() == Some(list) && !self.tasks.is_empty() {
-            // Counted the same way the task-pane header counts, Subtasks
-            // included, so the two meters for this List always agree.
-            let done = self
-                .tasks
-                .iter()
+            // Counted the same way the task-pane header counts — Subtasks
+            // included, Events and Notes excluded — so the two meters for this
+            // List always agree. The type filter is what keeps that true: the
+            // header counts only actionable entries, and a sidebar row that
+            // counted Events beside it would contradict the row it sits next to.
+            let actionable = || {
+                self.tasks
+                    .iter()
+                    .filter(|t| t.entry_type() == EntryType::Task)
+            };
+            let done = actionable()
                 .filter(|t| t.status == Status::Completed)
                 .count();
-            (done, self.tasks.len())
+            (done, actionable().count())
         } else {
             *self.list_counts.get(list)?
         };
@@ -378,13 +387,17 @@ impl Model {
     /// Takes the caller's `top_level` set so the meter and the indent decision
     /// read the same data and cannot disagree — and so this stays one pass over
     /// `tasks` rather than a scan per row.
+    ///
+    /// Counts only Task-typed Subtasks, as the header and sidebar meters do: a
+    /// Note nested under a parent is a jotting about it, not a step toward it,
+    /// and counting it would hold the parent's meter below full forever.
     pub fn subtask_counts<'a>(
         &'a self,
         top_level: &HashSet<&'a TaskId>,
     ) -> HashMap<&'a TaskId, (usize, usize)> {
         let mut counts: HashMap<&TaskId, (usize, usize)> = HashMap::new();
         for task in &self.tasks {
-            if !renders_as_subtask(top_level, task) {
+            if !renders_as_subtask(top_level, task) || task.entry_type() != EntryType::Task {
                 continue;
             }
             let parent = task
@@ -1004,6 +1017,9 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::AddTask => open_add_task(model),
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
+        Action::Migrate => return migrate(model),
+        Action::CycleType => return cycle_type(model, EntryType::next),
+        Action::CycleTypeBack => return cycle_type(model, EntryType::prev),
         Action::EditNotes => return edit_notes(model),
         Action::OpenLink => return open_link(model),
         Action::DeleteTask => open_delete_confirm(model),
@@ -1039,13 +1055,105 @@ fn focused_task(model: &Model) -> Option<&Task> {
     model.selected_task.and_then(|i| model.tasks.get(i))
 }
 
+/// Open the title editor on the *display* title, so a typed entry's glyph never
+/// enters a buffer the user types into. `finish_edit_title` re-applies the type.
 fn open_edit_title(model: &mut Model) {
     if let Some(task) = focused_task(model) {
         model.overlay = Some(Overlay::EditTitle {
             task: task.id.clone(),
-            buffer: task.title.clone(),
+            buffer: task.display_title().to_string(),
         });
     }
+}
+
+/// Migrate the selected Task: push its due date one day past whichever is later,
+/// today or its current due date. Bullet Journal's `>` disposition.
+///
+/// `max(today, due) + 1` rather than a flat "tomorrow" so the verb composes:
+/// an overdue Task lands on tomorrow, a future one shifts a day, and repeated
+/// presses defer repeatedly. An undated Task gets tomorrow — `max` has nothing
+/// to compare against.
+///
+/// Refuses a Completed Task. Migration is for Tasks still `needsAction`;
+/// re-dating a finished one is semantically empty, and `m` is pressed rapidly
+/// down a list where a silent due-date rewrite would go unnoticed. This is not
+/// the same as blocking a state Google permits — `d` still sets any date on a
+/// Completed Task.
+///
+/// Rides `SetDue`, so single-flight guarding and rollback come from that path.
+fn migrate(model: &mut Model) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    if task.status == Status::Completed {
+        model.status_line = Some("completed tasks are not migrated".to_string());
+        return Vec::new();
+    }
+    let (id, current) = (task.id.clone(), task.due);
+    // Single-flight: don't lose the migration silently if a write is running.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
+        return Vec::new();
+    };
+    let today = model.now.date_naive();
+    let due = Some(current.map_or(today, |d| d.max(today)) + chrono::Duration::days(1));
+    model
+        .pending_writes
+        .insert(id.clone(), model.tasks[index].clone());
+    model.tasks[index].due = due;
+    vec![Command::SetDue {
+        list,
+        task: id,
+        due,
+    }]
+}
+
+/// Cycle the selected entry's Bullet Journal type, `step` choosing the direction
+/// ([`EntryType::next`] for `t`, [`EntryType::prev`] for `T`).
+///
+/// The type lives in the title (ADR-0008), so this is a title write and rides
+/// `SetTitle` — single-flight guarding and rollback come from that path.
+///
+/// Uses [`EntryType::retype`], never `apply`: retyping must repair a foreign
+/// prefix first, or a title Google handed back as `"○Standup"` would stack into
+/// `"○ ○Standup"` on the first press. `None` means the title strips to nothing,
+/// which is not something a type can be attached to.
+fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let id = task.id.clone();
+    let Some(title) = step(task.entry_type()).retype(task.display_title()) else {
+        model.status_line = Some("an entry needs a title before it can be typed".to_string());
+        return Vec::new();
+    };
+    // Single-flight: don't lose the type change silently if a write is running.
+    // `T` exists partly so this is rarely hit — every type is one press away.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
+        return Vec::new();
+    };
+    model
+        .pending_writes
+        .insert(id.clone(), model.tasks[index].clone());
+    model.tasks[index].title = title.clone();
+    vec![Command::SetTitle {
+        list,
+        task: id,
+        title,
+    }]
 }
 
 /// Open the capture overlay for a new Task (needs an active List to add into).
@@ -1458,7 +1566,8 @@ fn open_delete_confirm(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    let (id, title) = (task.id.clone(), task.title.clone());
+    // The display title: a destructive prompt is no place to leak the encoding.
+    let (id, title) = (task.id.clone(), task.display_title().to_string());
     let Some(list) = model.selected_list_id().cloned() else {
         return;
     };
@@ -1670,9 +1779,24 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
     }
 }
 
+/// Save an edited title, re-applying the entry's type.
+///
+/// Two orderings here are load-bearing.
+///
+/// **The empty-check runs before `apply`.** Applying first would turn a cleared
+/// Note title into a bare `"— "` — a title that is pure encoding with no content.
+///
+/// **The type is read now, not when the overlay opened.** A type change landing
+/// mid-edit (a refetch, a reconcile) is therefore preserved rather than reverted
+/// by a stale capture.
+///
+/// Uses [`EntryType::apply`], never `retype`: this path must not strip. Opening
+/// `e` on a title Google wrote as `"○Standup"` and pressing Enter unchanged has
+/// to write it back byte-identical — a keystroke meaning "save what is already
+/// there" must not silently delete a character.
 fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Command> {
-    let title = buffer.trim().to_string();
-    if title.is_empty() {
+    let display = buffer.trim();
+    if display.is_empty() {
         return Vec::new(); // cancel silently on an empty title
     }
     // Single-flight: don't lose the edit silently if a write is already running.
@@ -1686,6 +1810,7 @@ fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Com
     let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
         return Vec::new();
     };
+    let title = model.tasks[index].entry_type().apply(display);
     model
         .pending_writes
         .insert(task.clone(), model.tasks[index].clone());

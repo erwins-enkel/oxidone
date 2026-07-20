@@ -211,3 +211,151 @@ async fn a_second_due_edit_while_one_is_in_flight_is_guarded() {
     assert_eq!(m.tasks[0].due, Some(ymd(2027, 1, 1))); // still the first edit
     assert!(m.status_line.is_some());
 }
+
+// --- `m` migrate: Bullet Journal's `>` disposition -------------------------
+//
+// `max(today, due) + 1` rather than a flat "tomorrow", so the verb composes.
+// Every case pins `m.now`, keeping these independent of the wall clock.
+
+/// `model_with_tasks` plus a fixed clock: 2026-08-10, nine days past "alpha"'s
+/// due date of 2026-08-01, so "alpha" is overdue and "beta" undated.
+async fn model_at_2026_08_10() -> (Model, List, Vec<Task>) {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    m.now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 10, 9, 0, 0)
+        .single()
+        .unwrap();
+    (m, l, tasks)
+}
+
+#[tokio::test]
+async fn m_on_an_overdue_task_migrates_to_tomorrow_not_to_the_day_after_its_due() {
+    let (mut m, l, tasks) = model_at_2026_08_10().await;
+    let cmds = update(&mut m, ch('m')); // "alpha", due 2026-08-01, overdue
+
+    // The whole point of `max(today, due)`: a naive `due + 1` would land on
+    // 2026-08-02, still in the past.
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 11)));
+    assert_eq!(
+        cmds,
+        vec![Command::SetDue {
+            list: l.id,
+            task: tasks[0].id.clone(),
+            due: Some(ymd(2026, 8, 11)),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn m_on_a_future_task_shifts_it_one_day_later() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    m.tasks[0].due = Some(ymd(2026, 12, 25));
+    update(&mut m, ch('m'));
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 12, 26)));
+}
+
+#[tokio::test]
+async fn m_on_a_task_due_today_migrates_to_tomorrow() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    m.tasks[0].due = Some(ymd(2026, 8, 10));
+    update(&mut m, ch('m'));
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 11)));
+}
+
+#[tokio::test]
+async fn m_on_an_undated_task_lands_on_tomorrow() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    update(&mut m, key(KeyCode::Down)); // "beta", no due date
+    update(&mut m, ch('m'));
+    assert_eq!(m.tasks[1].due, Some(ymd(2026, 8, 11)));
+}
+
+#[tokio::test]
+async fn repeated_migrations_compose_a_day_at_a_time() {
+    let (mut m, _l, tasks) = model_at_2026_08_10().await;
+
+    // Each press must clear the in-flight guard before the next, or the second
+    // and third are refused — which is what `T` exists to spare the user.
+    for expected in [ymd(2026, 8, 11), ymd(2026, 8, 12), ymd(2026, 8, 13)] {
+        update(&mut m, ch('m'));
+        assert_eq!(m.tasks[0].due, Some(expected));
+        update(
+            &mut m,
+            Message::TaskUpdated(oxidone::domain::Task {
+                due: Some(expected),
+                ..tasks[0].clone()
+            }),
+        );
+    }
+}
+
+#[tokio::test]
+async fn m_refuses_a_completed_task() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    // Set the status directly rather than pressing Space: Space hides the Task
+    // (Completed are hidden by default) and re-anchors the cursor onto "beta",
+    // so `m` would migrate the wrong Task — and it would also leave a write in
+    // flight, which would make this pass on the single-flight guard instead of
+    // the Completed check. Reveal them so the cursor still sits on a visible row.
+    update(&mut m, ch('c'));
+    m.tasks[0].status = oxidone::domain::Status::Completed;
+    let before = m.tasks[0].due;
+
+    let cmds = update(&mut m, ch('m'));
+
+    assert!(cmds.is_empty(), "a completed task is not migrated");
+    assert_eq!(m.tasks[0].due, before);
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("completed tasks are not migrated")
+    );
+}
+
+#[tokio::test]
+async fn m_is_a_no_op_with_the_sidebar_focused() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    update(&mut m, key(KeyCode::Tab)); // back to the sidebar
+    let cmds = update(&mut m, ch('m'));
+    assert!(cmds.is_empty());
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 1))); // untouched
+}
+
+#[tokio::test]
+async fn m_is_a_no_op_with_no_selection() {
+    let mut m = Model::new();
+    m.now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 10, 9, 0, 0)
+        .single()
+        .unwrap();
+    update(&mut m, key(KeyCode::Tab)); // task pane, but no tasks at all
+    assert!(update(&mut m, ch('m')).is_empty());
+}
+
+#[tokio::test]
+async fn a_migration_while_a_write_is_in_flight_is_guarded() {
+    let (mut m, _l, _t) = model_at_2026_08_10().await;
+    let first = update(&mut m, ch('m'));
+    assert_eq!(first.len(), 1);
+
+    let second = update(&mut m, ch('m'));
+    assert!(second.is_empty());
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 11))); // still the first
+    assert!(m.status_line.is_some());
+}
+
+#[tokio::test]
+async fn a_failed_migration_rolls_back_to_the_prior_due_date() {
+    let (mut m, _l, tasks) = model_at_2026_08_10().await;
+    update(&mut m, ch('m'));
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 11))); // optimistic
+
+    update(
+        &mut m,
+        Message::TaskWriteFailed {
+            task: tasks[0].id.clone(),
+            reason: "boom".to_string(),
+        },
+    );
+    assert_eq!(m.tasks[0].due, Some(ymd(2026, 8, 1))); // rolled back
+    assert_eq!(m.status_line.as_deref(), Some("boom"));
+}

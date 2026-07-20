@@ -30,6 +30,39 @@ fn rows(model: &Model, ascii: bool) -> Vec<String> {
         .collect()
 }
 
+/// Draw a frame and return the buffer, so a test can read cell *styles* and not
+/// just symbols.
+fn buffer_of(model: &Model) -> ratatui::buffer::Buffer {
+    let mut terminal =
+        Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("TestBackend terminal");
+    let theme = Theme::from_flavor("mocha");
+    terminal
+        .draw(|frame| ui::view(model, &theme, false, frame))
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+/// The (x, y) of the first cell whose symbol is `needle`.
+fn cell_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            if buffer[(x, y)].symbol() == needle {
+                return (x, y);
+            }
+        }
+    }
+    panic!("{needle:?} not drawn");
+}
+
+/// The x of the first cell on row `y` whose symbol is `needle`. Row-scoped
+/// because the pane borders carry titles of their own — a bare search for "s"
+/// finds the "s" in "Lists" long before it reaches a task row.
+fn cell_on_row(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> u16 {
+    (0..WIDTH)
+        .find(|&x| buffer[(x, y)].symbol() == needle)
+        .unwrap_or_else(|| panic!("{needle:?} not on row {y}"))
+}
+
 fn task(id: &str, title: &str) -> Task {
     Task {
         id: TaskId(id.into()),
@@ -157,5 +190,64 @@ fn a_subtasks_signifier_is_indented_with_it_not_hoisted_out() {
     assert!(
         column_of(kid, '○') > column_of(parent, '○'),
         "the subtask's signifier should sit further right:\n{parent:?}\n{kid:?}"
+    );
+}
+
+#[test]
+fn a_completed_entrys_signifier_is_styled_like_its_title() {
+    // The signifier is row *content*, not chrome: a Completed Event must read as
+    // one settled line — glyph, title and link marker all dim and struck through
+    // together. Pushing the span with `Style::new()` instead of the row's style
+    // would leave every other test green while the glyph rendered bright beside
+    // its struck-out title.
+    let mut done = task("1", "○ standup");
+    done.status = Status::Completed;
+    let mut model = model_with(vec![done]);
+    model.show_completed = true; // Completed are hidden by default
+
+    let buffer = buffer_of(&model);
+    let (gx, row) = cell_at(&buffer, "○");
+    let tx = cell_on_row(&buffer, row, "s"); // first letter of "standup"
+
+    assert_eq!(
+        buffer[(gx, row)].style(),
+        buffer[(tx, row)].style(),
+        "the signifier must carry the row style, not its own"
+    );
+    assert!(
+        buffer[(gx, row)]
+            .style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::CROSSED_OUT),
+        "a Completed entry's signifier should be struck through with its title"
+    );
+}
+
+#[test]
+fn a_dated_note_still_shows_its_date_in_the_due_gutter() {
+    // The other half of a deliberate asymmetry: Notes are excluded from the
+    // due-load histogram but *not* from the per-row gutter. The gutter answers
+    // "does this entry carry a date?" — a dated Note does — while the histogram
+    // answers "how much work is coming?", which a Note is not. Without this,
+    // a later reader could "fix" the gutter to match the histogram and think
+    // they were removing an inconsistency.
+    // Pin the clock rather than leaning on the wall one: `Model::new()` does not
+    // stamp `now` from it, and the gutter falls back to an ISO date beyond the
+    // relative horizon.
+    use chrono::TimeZone;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 3, 10, 9, 0, 0)
+        .single()
+        .expect("a valid local time");
+    let mut note = task("1", "— jotting");
+    note.due = chrono::NaiveDate::from_ymd_opt(2026, 3, 11); // tomorrow
+    let mut model = model_with(vec![note]);
+    model.now = now;
+
+    let drawn = rows(&model, false);
+    let row = row_with(&drawn, "jotting");
+    assert!(
+        row.contains("tomorrow"),
+        "a dated Note should still show its date in the gutter: {row:?}"
     );
 }

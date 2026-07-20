@@ -172,7 +172,7 @@ pub fn bindings() -> &'static [Binding] {
         Binding {
             key: KeyCode::Char('m'),
             action: Action::Migrate,
-            help: "migrate (due + 1 day)",
+            help: "migrate (forward one day)",
         },
         Binding {
             key: KeyCode::Char('n'),

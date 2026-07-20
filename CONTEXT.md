@@ -111,7 +111,7 @@ The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, bl
 _Avoid_: bullet, icon, marker (that is the link `⧉`).
 
 **Completion meter**:
-A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown per List and per parent Task. Braille gives 8× horizontal resolution over a block bar.
+A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown today in the task-pane header for the active List; per-List sidebar meters and per-parent Subtask meters are follow-ups. Braille gives 8× horizontal resolution over a block bar.
 
 **Due-load**:
 A braille histogram of counts per upcoming day — the "workload ahead" strip. Counts Tasks and Events, not Notes. Deliberately narrower than the per-row due gutter, which shows a date for *any* dated entry: the gutter answers "does this carry a date?", the strip answers "how much is coming?".

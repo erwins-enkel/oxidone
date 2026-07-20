@@ -13,6 +13,10 @@ pub enum Action {
     ToggleHelp,
     CloseOverlay,
     SwitchPane,
+    // Directional pane focus, alongside `SwitchPane`'s toggle. Idempotent at the
+    // edges: there is no wrap, so focusing left from the sidebar is a no-op.
+    FocusLeft,
+    FocusRight,
     SelectNext,
     SelectPrev,
     ToggleComplete,
@@ -67,6 +71,28 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Esc,
             action: Action::CloseOverlay,
             help: "close overlay",
+        },
+        // Directional counterparts to `Tab`. Vim key first, then the arrow, the
+        // way `j`/`Down` and `k`/`Up` already pair.
+        Binding {
+            key: KeyCode::Char('h'),
+            action: Action::FocusLeft,
+            help: "focus pane left",
+        },
+        Binding {
+            key: KeyCode::Left,
+            action: Action::FocusLeft,
+            help: "focus pane left",
+        },
+        Binding {
+            key: KeyCode::Char('l'),
+            action: Action::FocusRight,
+            help: "focus pane right",
+        },
+        Binding {
+            key: KeyCode::Right,
+            action: Action::FocusRight,
+            help: "focus pane right",
         },
         Binding {
             key: KeyCode::Char('j'),

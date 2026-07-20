@@ -980,8 +980,12 @@ fn open_add_subtask(model: &mut Model) {
     });
 }
 
-/// Optimistically insert a placeholder Subtask under `parent` (as its first
-/// child, matching Google's top-of-list insert) and request the insert.
+/// Optimistically insert a placeholder Subtask directly after `parent` in
+/// **stored** order (its first child, matching Google's top-of-list insert) and
+/// request the insert. Where it *renders* is up to the active lens, exactly as
+/// for [`finish_add_task`]: the placeholder carries no due date, so under `Due`
+/// the group's children sort it to the **last** row of the group rather than the
+/// first. The cursor follows it either way.
 fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<Command> {
     let title = buffer.trim().to_string();
     if title.is_empty() {

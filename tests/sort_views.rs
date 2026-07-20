@@ -825,3 +825,32 @@ fn a_task_parented_to_a_subtask_is_not_drawn_as_a_child() {
         "grouping treats it as top-level, so the indent must too",
     );
 }
+
+#[test]
+fn a_new_subtask_renders_last_within_its_parents_group() {
+    // The placeholder goes in directly after its parent in stored order, but it
+    // has no due date — so under Due the group's children sink it to the bottom
+    // of the group, not the top. The cursor follows it there.
+    let mut m = pane(
+        vec![
+            open("A", None, Some(ymd(2026, 1, 1))),
+            open("early", Some("A"), Some(ymd(2026, 2, 1))),
+            open("late", Some("A"), Some(ymd(2026, 3, 1))),
+        ],
+        0, // on "A"
+    );
+
+    update(&mut m, press('o'));
+    for c in "new".chars() {
+        update(&mut m, press(c));
+    }
+    update(&mut m, Message::Key(key(KeyCode::Enter)));
+
+    assert_eq!(m.tasks[1].title, "new", "stored: first child of A");
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["A", "early", "late", "new"],
+        "displayed: last child, since it is undated",
+    );
+    assert_eq!(selected_title(&m), Some("new".to_string()));
+}

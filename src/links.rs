@@ -88,6 +88,20 @@ pub fn scan_urls(notes: &str) -> Vec<&str> {
     found
 }
 
+/// The authority of a `scheme://…` URL — the substring between `://` and the
+/// first `/`, `?`, or `#` — or `None` when it is empty (`file:///x`).
+///
+/// A deliberate *slice*, not a parse: userinfo and port are kept
+/// (`https://u@a.dev:8080/x` → `u@a.dev:8080`). This crate has no URL parser (see
+/// the module header) and the notes preview does not need one — a bare authority
+/// already drops the path that would clip mid-row and restate what `⧉` said.
+pub fn authority(url: &str) -> Option<&str> {
+    let (_scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    (!authority.is_empty()).then_some(authority)
+}
+
 /// The openable subset of [`scan_urls`], in the same order.
 pub fn openable_urls(notes: &str) -> Vec<OpenableUrl> {
     scan_urls(notes)

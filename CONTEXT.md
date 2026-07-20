@@ -118,6 +118,10 @@ The `≡` a row carries when its Task's **notes** hold anything visible. Trails 
 Not the same thing as an **Entry type** of `Note`, despite the word: that is a *signifier*, it *leads* the row, and it says what an entry **is**. `≡` says the entry **has a notes body**. The two are independent — a Note need not carry notes, and any entry type may (`— call the notary ≡`).
 _Avoid_: note marker (ambiguous with the Entry type), notes icon.
 
+**Notes preview**:
+The first reader-visible line of a Task's **notes**, drawn dim at the very end of the row after every bounded widget (the `≡` marker, the link `⧉`, the Subtask meter). Shown only when the row can spare a minimum of cells for it; otherwise the `≡` marker stands alone. A line that is *nothing but* a URL collapses to that URL's authority (`https://a.dev/1` → `a.dev`) — the `⧉` already says a link is there, and the host is what a preview can usefully add. Layout-hostile characters (controls, a tab, the bidi format controls that would reorder the row) are replaced with a space before drawing; the preview keeps the row's strike on a Completed Task, unlike the meter.
+_Avoid_: notes snippet, notes excerpt.
+
 **Completion meter**:
 A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown in the task-pane header, per List in the sidebar, and per parent Task for its Subtasks. Braille gives 8× horizontal resolution over a block bar.
 

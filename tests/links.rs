@@ -3,7 +3,8 @@
 
 use oxidone::domain::TaskLink;
 use oxidone::links::{
-    has_openable_link, has_openable_url, openable_links, openable_urls, scan_urls, OpenableUrl,
+    authority, has_openable_link, has_openable_url, openable_links, openable_urls, scan_urls,
+    OpenableUrl,
 };
 
 /// A `links[]` entry, terse for the merge tests below.
@@ -443,4 +444,35 @@ fn has_openable_link_agrees_with_the_merge_on_whether_anything_opens() {
             "disagreement on links={links:?} notes={notes:?}",
         );
     }
+}
+
+#[test]
+fn authority_is_the_slice_between_the_scheme_and_the_path() {
+    // The common case the preview leans on: a URL-only notes line collapses to
+    // just this, dropping the path that would clip mid-row.
+    assert_eq!(authority("https://a.dev/1"), Some("a.dev"));
+    assert_eq!(authority("https://a.dev"), Some("a.dev"));
+    assert_eq!(authority("https://a.dev?q=1"), Some("a.dev"));
+    assert_eq!(authority("https://a.dev#frag"), Some("a.dev"));
+}
+
+#[test]
+fn authority_keeps_userinfo_and_port_it_is_a_slice_not_a_parse() {
+    // Deliberately un-parsed: this crate has no URL parser, and a fuller-but-never
+    // -wrong preview beats inventing one.
+    assert_eq!(authority("https://a.dev:8080/x"), Some("a.dev:8080"));
+    assert_eq!(authority("https://u@a.dev/x"), Some("u@a.dev"));
+    assert_eq!(
+        authority("https://u:p@a.dev:8080/x"),
+        Some("u:p@a.dev:8080")
+    );
+    assert_eq!(authority("https://[::1]:8080/x"), Some("[::1]:8080"));
+}
+
+#[test]
+fn an_empty_authority_is_none() {
+    // `file:///x` has no authority; a schemeless string has no `://` at all.
+    assert_eq!(authority("file:///srv/dump"), None);
+    assert_eq!(authority("https://"), None);
+    assert_eq!(authority("not a url"), None);
 }

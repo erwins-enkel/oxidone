@@ -1,8 +1,9 @@
-//! The notes marker as actually drawn (#54). `notes_marker` and `has_notes_body`
-//! are pure and unit-tested next to the view, but both pass whether or not `view`
-//! ever puts their result on a row — and whether or not the row it lands on still
-//! has room for everything else. That is what this file covers, following
-//! `link_render.rs` and `meters_render.rs`.
+//! The notes marker and its inline preview as actually drawn (#54, #68).
+//! `notes_marker`, `notes_preview_line` and `notes_preview_segment` are pure and
+//! unit-tested next to the view, but all pass whether or not `view` ever puts
+//! their result on a row — and whether or not the row it lands on still has room
+//! for everything else. That is what this file covers, following `link_render.rs`
+//! and `meters_render.rs`.
 //!
 //! "Notes" here always means a Task's free-text body, edited with `n`. The Bullet
 //! Journal `EntryType::Note` is a different thing that happens to share the word:
@@ -370,4 +371,293 @@ fn a_typed_pane_still_marks_and_still_fits() {
     let row = pane_row(&model, title);
     assert!(row.contains('≡'), "still marked on a typed pane: {row:?}");
     assert!(row.contains("0/1"), "the meter survives: {row:?}");
+}
+
+// --- The inline notes preview (#68) ----------------------------------------
+
+/// The foreground colour of the first cell of `text` on row `y`, or `None` when
+/// the row does not contain `text`. The preview's dimness is a per-span colour a
+/// modifier check cannot see.
+fn fg_of(model: &Model, y: usize, text: &str) -> Option<ratatui::style::Color> {
+    let buffer = buffer_at(model, MIN_WIDTH);
+    let row: String = (0..MIN_WIDTH)
+        .map(|x| buffer[(x, y as u16)].symbol().to_string())
+        .collect();
+    let start = row.find(text)?;
+    let col = row[..start].chars().count();
+    buffer[(col as u16, y as u16)].style().fg
+}
+
+#[test]
+fn a_prose_notes_body_previews_after_the_marker() {
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("ring the notary first"),
+    )]);
+    let row = pane_row(&model, "alpha");
+    let marker = row.find('≡').expect("the marker");
+    let preview = row.find("ring the notary first").expect("the preview");
+    assert!(marker < preview, "the preview trails the marker: {row:?}");
+}
+
+#[test]
+fn a_url_only_notes_body_previews_its_authority_not_the_path() {
+    // The operator's choice: a bare-URL line collapses to its authority so the
+    // preview does not merely restate what `⧉` already flagged, nor clip mid-path.
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("https://a.dev/deep/path"),
+    )]);
+    let row = pane_row(&model, "alpha");
+    assert!(row.contains("a.dev"), "the authority is shown: {row:?}");
+    assert!(!row.contains("a.dev/deep"), "the path is dropped: {row:?}");
+    assert!(
+        row.contains('⧉'),
+        "the openable URL is still marked: {row:?}"
+    );
+}
+
+#[test]
+fn a_url_only_line_keeps_its_port_it_is_a_slice_not_a_parse() {
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("https://a.dev:8080/x"),
+    )]);
+    assert!(pane_row(&model, "alpha").contains("a.dev:8080"));
+}
+
+#[test]
+fn a_prose_line_with_an_inline_url_is_shown_as_is() {
+    // Only a line that is *nothing but* a URL collapses; prose that merely carries
+    // one is preview text like any other.
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("see https://a.dev/1"),
+    )]);
+    assert!(pane_row(&model, "alpha").contains("see https://a.dev/1"));
+}
+
+#[test]
+fn a_hostile_first_line_falls_through_to_prose() {
+    // A line of only an RLO sanitises to spaces; the preview is the next line, not
+    // a blank drawn beside a marker that promised text.
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("\u{202e}\nring Bob"),
+    )]);
+    let row = pane_row(&model, "alpha");
+    assert!(
+        row.contains("ring Bob"),
+        "fell through to the prose line: {row:?}"
+    );
+    assert!(
+        !row.contains('\u{202e}'),
+        "the RLO never reached the row: {row:?}"
+    );
+}
+
+#[test]
+fn layout_hostile_characters_are_scrubbed_from_the_preview() {
+    // A bidi control reorders the whole drawn row in a real terminal, a tab
+    // expands to a tab stop — both would move the due gutter. Neither may reach the
+    // buffer; the visible letters survive, spaced where the control was.
+    for hostile in ['\u{202e}', '\t', '\u{061c}'] {
+        let notes = format!("a{hostile}b prose");
+        let model = model_with(vec![task(
+            "1",
+            "alpha",
+            Status::NeedsAction,
+            None,
+            Some(&notes),
+        )]);
+        let row = pane_row(&model, "alpha");
+        assert!(
+            !row.contains(hostile),
+            "{hostile:?} reached the row: {row:?}"
+        );
+        assert!(
+            row.contains("a b prose"),
+            "the prose survives scrubbed: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn a_combining_mark_only_notes_body_is_still_marked() {
+    // Accepted residual: a lone combining mark is legitimate zero-width text, so it
+    // is content — it earns a marker rather than being scrubbed like a control.
+    let model = model_with(vec![task(
+        "1",
+        "alpha",
+        Status::NeedsAction,
+        None,
+        Some("\u{301}"),
+    )]);
+    assert!(pane_row(&model, "alpha").contains('≡'));
+}
+
+#[test]
+fn the_preview_appears_only_with_min_cells_of_room() {
+    // Concrete title widths, not the constant, pin the floor at 80 cols. A
+    // top-level prose row (≡ only, no meter) has 52 usable cells, so
+    // budget = 52 - title - 2(≡) - 1(sep): a 41-cell title leaves 8 (preview
+    // shown), a 42-cell title leaves 7 (marker alone). Flip MIN_PREVIEW_CELLS and
+    // one of these fails.
+    let prose = "ring the notary before noon please today";
+    let shows = format!("show {}", "x".repeat(36)); // 41 cells
+    let hides = format!("hide {}", "x".repeat(37)); // 42 cells
+    assert_eq!(shows.chars().count(), 41);
+    assert_eq!(hides.chars().count(), 42);
+    let model = model_with(vec![
+        task("1", &shows, Status::NeedsAction, None, Some(prose)),
+        task("2", &hides, Status::NeedsAction, None, Some(prose)),
+    ]);
+    let shown = pane_row(&model, &shows);
+    let hidden = pane_row(&model, &hides);
+    assert!(
+        shown.contains('≡') && shown.contains("ring"),
+        "budget 8 shows a preview: {shown:?}"
+    );
+    assert!(hidden.contains('≡'), "budget 7 still marks: {hidden:?}");
+    assert!(
+        !hidden.contains("ring"),
+        "budget 7 shows no preview: {hidden:?}"
+    );
+}
+
+#[test]
+fn an_intermediate_band_keeps_the_text_meter_and_drops_the_preview() {
+    // Between the extremes: the Subtask meter has degraded to its text-only form
+    // (braille bar dropped) while the preview is suppressed for want of room. The
+    // meter keeps priority; the preview is what yields. At 80 cols a top-level
+    // parent has 52 usable cells; a 40-cell title + `⧉≡` (4) leaves 8 — the bar
+    // (10) will not fit but `  0/1` (5) does, and 8 - 5 - 1 = 2 is below the floor.
+    let title = "forty characters of parent title here xx";
+    assert_eq!(title.chars().count(), 40);
+    let model = model_with(vec![
+        task(
+            "p",
+            title,
+            Status::NeedsAction,
+            None,
+            Some("see https://a.dev/1"),
+        ),
+        task("c1", "child", Status::NeedsAction, Some("p"), None),
+    ]);
+    let row = pane_row(&model, title);
+    assert!(row.contains("0/1"), "the text-only meter survives: {row:?}");
+    assert!(
+        !row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+        "the braille bar should have dropped: {row:?}"
+    );
+    assert!(!row.contains("see"), "no preview at this width: {row:?}");
+}
+
+#[test]
+fn a_preview_reads_dim() {
+    let theme = Theme::from_flavor("mocha");
+    // Two rows, cursor pinned to the first: the highlighted row's accent fg would
+    // mask the preview's own dim colour, so the assertion is on the other row.
+    let mut model = model_with(vec![
+        task("1", "alpha", Status::NeedsAction, None, Some("selected")),
+        task(
+            "2",
+            "bravo",
+            Status::NeedsAction,
+            None,
+            Some("dim prose here"),
+        ),
+    ]);
+    model.selected_task = Some(0);
+    let y = rows(&model)
+        .iter()
+        .position(|r| r.contains("bravo"))
+        .expect("the bravo row");
+    assert_eq!(fg_of(&model, y, "dim prose"), Some(theme.subtext));
+}
+
+#[test]
+fn a_completed_row_strikes_its_preview_but_not_its_meter() {
+    // The preview is this Task's own text, like the markers, so it reads struck
+    // with the title — the opposite of the meter, whose braille stays legible.
+    let mut model = model_with(vec![
+        task(
+            "p",
+            "parent",
+            Status::Completed,
+            None,
+            Some("wrap up the invoice"),
+        ),
+        task("c1", "child", Status::Completed, Some("p"), None),
+    ]);
+    model.show_completed = true;
+    let y = rows(&model)
+        .iter()
+        .position(|r| r.contains("parent"))
+        .expect("the parent row");
+    assert_eq!(
+        modifier_over(&model, y, "wrap up", Modifier::CROSSED_OUT),
+        Some(true),
+        "the preview is struck with the row"
+    );
+    assert_eq!(
+        modifier_over(&model, y, "1/1", Modifier::CROSSED_OUT),
+        Some(false),
+        "the meter keeps its legibility"
+    );
+}
+
+#[test]
+fn the_preview_folds_its_ellipsis_to_ascii_under_fallback() {
+    let notes = "a preview long enough to be truncated on this row for sure";
+    let model = model_with(vec![task(
+        "1",
+        "a title that is moderately long here",
+        Status::NeedsAction,
+        None,
+        Some(notes),
+    )]);
+    let ascii: String = rows_at(&model, MIN_WIDTH, true)
+        .iter()
+        .find(|r| r.contains("a title"))
+        .map(|r| task_pane(r, MIN_WIDTH))
+        .expect("the title row");
+    assert!(ascii.contains("..."), "ascii ellipsis: {ascii:?}");
+    assert!(
+        !ascii.contains('…'),
+        "no braille glyph under fallback: {ascii:?}"
+    );
+}
+
+#[test]
+fn the_preview_trails_the_subtask_meter() {
+    let model = model_with(vec![
+        task(
+            "p",
+            "parent",
+            Status::NeedsAction,
+            None,
+            Some("some preview prose"),
+        ),
+        task("c1", "child", Status::NeedsAction, Some("p"), None),
+    ]);
+    let row = pane_row(&model, "parent");
+    let meter = row.find("0/1").expect("the meter");
+    let preview = row.find("some preview").expect("the preview");
+    assert!(meter < preview, "the preview follows the meter: {row:?}");
 }

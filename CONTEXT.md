@@ -24,6 +24,26 @@ _Avoid_: child, nested todo.
 The only two states a Task can be in: `needsAction` or `completed`. There is no "in progress," no priority.
 _Avoid_: open, done-ish, state.
 
+**Entry type**:
+Which of Bullet Journal's three kinds an entry is: a **Task**, an **Event**, or a **Note**. Derived from the title's leading glyph, never stored as a field (ADR-0008) — `Task` is the default and carries no glyph.
+_Avoid_: kind, category, entry kind.
+
+**Event**:
+An entry that happens on a day, written `○ ` before the title. Occupies the Due-load, never the Completion meter — an Event is not work you finish.
+_Avoid_: appointment, meeting.
+
+**Note** (the entry type):
+A jotting, written `— ` before the title. Counted by neither the Completion meter nor the Due-load.
+_Avoid_: notes (that is the field below), memo, comment.
+
+**Notes** (the field):
+Google's free-text body on a Task, edited with `n`. Unrelated to the **Note** entry type: a Note is what an entry *is*, notes are what it *carries*. Any entry type may have notes.
+_Avoid_: description, body, note.
+
+**Display title**:
+A Task's title with its type glyph removed — what the pane shows and the editor opens on. Equal to the raw title for a Task. Note this means "prefix removed", not "glyph-free": a title Google stores in a non-canonical form (`○Standup`, no space) is read as an untyped Task and keeps its glyph on screen until `t` normalises it.
+_Avoid_: clean title, stripped title.
+
 **Due date**:
 A **date, never a time**. Google's API discards the time portion, so oxidone never stores or shows a due time.
 _Avoid_: deadline, due time, due-at.
@@ -40,6 +60,23 @@ _Avoid_: sort order.
 
 **Move**:
 Repositioning or reparenting a Task (Google's `move` operation). The only action that writes Manual order or changes an existing Task's `parent`. Moves compute against stored order, so a Move pressed from a Sort view switches the pane back to Manual and stops — the next press performs the Move, against the adjacency now on screen.
+
+### The four dispositions
+
+Bullet Journal's daily review asks one question of every entry still `needsAction`: what becomes of it? These four answers are *not* the same list as **The four exits** below — two of them are not departures at all.
+
+| Disposition | BuJo signifier | oxidone | Leads to |
+| --- | --- | --- | --- |
+| Complete | `X` | `Space` | the **Completed** exit |
+| Scheduled | `<` | `d` | no exit — only the due date moves |
+| Migrated | `>` | `m` | no exit — only the due date moves |
+| Irrelevant | ~~strikethrough~~ | `x` | the **Deleted** exit |
+
+Two traps worth naming. BuJo's `X` means *complete*; oxidone's `x` key means *delete*, which is the opposite — the two must never be conflated. And `>`/`<` are unavailable as bindings (they are Indent and Outdent), so migration binds `m`, the verb's initial.
+
+**Migrate**:
+Pushing an entry's due date to `max(today, due) + 1 day` — Bullet Journal's `>`. **Not an exit**: the entry stays `needsAction` and nothing but its due date changes. Repeated migrations compose, a day at a time. Refused on a Completed entry, where re-dating means nothing.
+_Avoid_: defer, snooze, postpone, push (as a noun).
 
 ### The four exits
 
@@ -69,8 +106,12 @@ A local, append-only record of completion events (`task_id`, `list_id`, `title`,
 
 ### Visual vocabulary
 
+**Signifier**:
+The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task.
+_Avoid_: bullet, icon, marker (that is the link `⧉`).
+
 **Completion meter**:
-A braille-cell progress bar of done ÷ total, shown per List and per parent Task. Braille gives 8× horizontal resolution over a block bar.
+A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown per List and per parent Task. Braille gives 8× horizontal resolution over a block bar.
 
 **Due-load**:
-A braille histogram of Task counts per upcoming day — the "workload ahead" strip.
+A braille histogram of counts per upcoming day — the "workload ahead" strip. Counts Tasks and Events, not Notes. Deliberately narrower than the per-row due gutter, which shows a date for *any* dated entry: the gutter answers "does this carry a date?", the strip answers "how much is coming?".

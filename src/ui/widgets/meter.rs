@@ -1,7 +1,11 @@
 //! Completion meter: a braille-cell progress bar of `done / total`, giving 8x
-//! horizontal resolution over a block bar. Currently shown for the active List
-//! in the task-pane header; per-List sidebar meters (need cross-list counts) and
-//! per-parent subtask meters (need subtasks, #11) are follow-ups.
+//! horizontal resolution over a block bar. Drawn three ways: the active List in
+//! the task-pane header, each List in the sidebar, and each parent Task's
+//! Subtasks on its own row.
+//!
+//! The sidebar's counts come from a cache aggregate, so they cover the Lists
+//! whose Tasks have been mirrored; fetching counts for a List never opened on
+//! this machine is a follow-up.
 //!
 //! Braille encodes DATA only (ADR-0006): the bar is the completion ratio, never
 //! decoration, and degrades to an ASCII `#`/`-` block bar when `ascii_fallback`

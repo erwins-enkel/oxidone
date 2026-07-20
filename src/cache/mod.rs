@@ -7,6 +7,7 @@
 //! `user_version`, so later slices add tables by appending — never editing
 //! shipped migrations.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -326,6 +327,41 @@ impl Cache {
             tasks.push(row?.into_task(list)?);
         }
         Ok(tasks)
+    }
+
+    /// `(done, total)` per List over the mirrored Tasks, for the sidebar meters.
+    ///
+    /// The `tasks_by_list` index groups the scan by `list_id`, though `status`
+    /// is read from the rows themselves — it is not a covering index. Cheap
+    /// enough at personal scale to re-run whenever the cache changes. Subtasks
+    /// count alongside top-level Tasks — the same definition the task-pane
+    /// header meter uses, so the two agree.
+    ///
+    /// A List with no cached Tasks yields **no entry** rather than `(0, 0)`.
+    /// That keeps "we have never seen this List's Tasks" indistinguishable from
+    /// "it is empty" — both render no meter — and, unlike a `LEFT JOIN` over
+    /// `lists`, leaves a List whose fetch failed uncovered so the next attempt
+    /// still has reason to fetch it.
+    pub fn list_counts(&self) -> Result<HashMap<ListId, (usize, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT list_id, COUNT(*), SUM(status = ?1) FROM tasks GROUP BY list_id")?;
+        // Bound, never inlined: the stored spelling of a status lives only in
+        // `status_str`, and a literal here would silently stop matching if it
+        // ever changed — leaving `done` at 0 with nothing to fail.
+        let rows = stmt.query_map(params![status_str(Status::Completed)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (list, total, done) = row?;
+            counts.insert(ListId(list), (done as usize, total as usize));
+        }
+        Ok(counts)
     }
 }
 

@@ -70,6 +70,11 @@ pub struct Model {
     /// reducer can resolve relative due dates ("tomorrow") without reading the
     /// clock itself — keeping `update` pure/testable (ADR-0005).
     pub now: chrono::DateTime<chrono::Local>,
+    /// Whether an external editor (`$VISUAL`/`$EDITOR`) is available, stamped by
+    /// the runtime like `now`. Decides the notes-editing path purely: with an
+    /// editor, `EditNotes` emits `SpawnEditor`; without, it opens the inline
+    /// single-line fallback overlay.
+    pub editor_available: bool,
 }
 
 /// A modal overlay drawn over the panes.
@@ -81,6 +86,9 @@ pub enum Overlay {
     AddTask { buffer: String },
     /// Due-date entry for a Task: natural language or ISO, or empty to clear.
     EditDue { task: TaskId, buffer: String },
+    /// Inline single-line notes editor — the fallback used when no external
+    /// editor is configured. Empty clears the notes.
+    EditNotes { task: TaskId, buffer: String },
     /// Capture a new List's title.
     AddList { buffer: String },
     /// In-place title editor for a List.
@@ -96,6 +104,7 @@ impl Overlay {
             Overlay::EditTitle { buffer, .. }
             | Overlay::AddTask { buffer }
             | Overlay::EditDue { buffer, .. }
+            | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
             | Overlay::RenameList { buffer, .. } => Some(buffer),
             Overlay::Confirm(_) => None,
@@ -142,6 +151,8 @@ impl Default for Model {
             now: chrono::DateTime::from_timestamp(0, 0)
                 .expect("epoch is valid")
                 .with_timezone(&chrono::Local),
+            // Defaults to the inline fallback; the runtime stamps the real value.
+            editor_available: false,
         }
     }
 }
@@ -244,6 +255,13 @@ pub enum Message {
         list: ListId,
         reason: String,
     },
+    /// The external notes editor returned changed text; write it through. `notes`
+    /// is `None` when the user emptied the buffer (clears the notes). The runtime
+    /// emits this only on an actual change — an unchanged buffer emits nothing.
+    NotesEdited {
+        task: TaskId,
+        notes: Option<String>,
+    },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
 }
@@ -271,6 +289,16 @@ pub enum Command {
         task: TaskId,
         due: Option<NaiveDate>,
     },
+    /// Write-through a notes change for a Task. `None` clears the notes.
+    SetNotes {
+        list: ListId,
+        task: TaskId,
+        notes: Option<String>,
+    },
+    /// Suspend the TUI and open the Task's notes in the external editor. Handled
+    /// synchronously by the runtime (it owns the terminal), which feeds the
+    /// result back as `Message::NotesEdited`. Only emitted when an editor exists.
+    SpawnEditor { task: TaskId, notes: Option<String> },
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
     /// Insert a new Task into a List; `temp` echoes back so the placeholder can
@@ -425,6 +453,7 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             model.status_line = Some(reason);
             Vec::new()
         }
+        Message::NotesEdited { task, notes } => finish_edit_notes(model, task, notes),
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
             Vec::new()
@@ -517,6 +546,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::AddTask => open_add_task(model),
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
+        Action::EditNotes => return edit_notes(model),
         Action::DeleteTask => open_delete_confirm(model),
         Action::AddList => open_add_list(model),
         Action::RenameList => open_rename_list(model),
@@ -601,6 +631,59 @@ fn open_edit_due(model: &mut Model) {
             buffer,
         });
     }
+}
+
+/// Begin editing the selected Task's notes. With an external editor available
+/// (`model.editor_available`), emit `SpawnEditor` for the runtime to suspend the
+/// TUI and open it; otherwise open the inline single-line fallback overlay.
+fn edit_notes(model: &mut Model) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let (id, notes) = (task.id.clone(), task.notes.clone());
+    // Don't open the editor over an in-flight write: the result would be rejected
+    // by `finish_edit_notes`'s single-flight guard on submit, silently discarding
+    // whatever the user typed. Refuse up front with an explanation instead.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    if model.editor_available {
+        vec![Command::SpawnEditor { task: id, notes }]
+    } else {
+        model.overlay = Some(Overlay::EditNotes {
+            task: id,
+            buffer: notes.unwrap_or_default(),
+        });
+        Vec::new()
+    }
+}
+
+/// Write-through a notes edit (from either the external editor or the inline
+/// fallback): optimistically set `notes`, snapshot for rollback, and emit the
+/// write — mirroring [`finish_edit_due`]. An empty/whitespace buffer clears the
+/// notes. A no-op when the notes are unchanged.
+fn finish_edit_notes(model: &mut Model, task: TaskId, notes: Option<String>) -> Vec<Command> {
+    let notes = notes.filter(|n| !n.trim().is_empty()); // empty => cleared
+    let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
+        return Vec::new();
+    };
+    if model.tasks[index].notes == notes {
+        return Vec::new(); // nothing changed; don't write
+    }
+    // Single-flight: don't lose the edit silently if a write is already running.
+    if model.pending_writes.contains_key(&task) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    model
+        .pending_writes
+        .insert(task.clone(), model.tasks[index].clone());
+    model.tasks[index].notes = notes.clone();
+    vec![Command::SetNotes { list, task, notes }]
 }
 
 fn open_delete_confirm(model: &mut Model) {
@@ -736,6 +819,7 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
         Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
         Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
         Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
+        Some(Overlay::EditNotes { task, buffer }) => finish_edit_notes(model, task, Some(buffer)),
         Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),
         Some(Overlay::RenameList { list, buffer }) => finish_rename_list(model, list, buffer),
         other => {

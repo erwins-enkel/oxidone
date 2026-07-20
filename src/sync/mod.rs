@@ -152,6 +152,34 @@ pub async fn write_due(
     Ok(updated)
 }
 
+/// Patch a Task's notes on Google and return the updated Task (no cache write —
+/// see [`patch_completed`] for the split rationale). `notes = None` clears them.
+pub async fn patch_notes(
+    api: &dyn TasksApi,
+    list: &ListId,
+    task: &TaskId,
+    notes: Option<String>,
+) -> std::result::Result<Task, ApiError> {
+    let patch = TaskPatch {
+        notes: Some(notes),
+        ..Default::default()
+    };
+    api.patch_task(list, task, patch).await
+}
+
+/// Write-through a notes change: patch on Google, mirror into the cache.
+pub async fn write_notes(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    task: &TaskId,
+    notes: Option<String>,
+) -> Result<Task> {
+    let updated = patch_notes(api, list, task, notes).await?;
+    cache.upsert_task(&updated)?;
+    Ok(updated)
+}
+
 /// Insert a List on Google and mirror it into the cache. Returns the server
 /// List (with its real id).
 pub async fn insert_list(api: &dyn TasksApi, cache: &Cache, title: &str) -> Result<List> {

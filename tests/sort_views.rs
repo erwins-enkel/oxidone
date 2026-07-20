@@ -827,14 +827,17 @@ fn a_task_parented_to_a_subtask_is_not_drawn_as_a_child() {
 }
 
 #[test]
-fn a_new_subtask_renders_last_within_its_parents_group() {
+fn a_new_subtask_renders_at_the_head_of_its_groups_undated_tail() {
     // The placeholder goes in directly after its parent in stored order, but it
-    // has no due date — so under Due the group's children sink it to the bottom
-    // of the group, not the top. The cursor follows it there.
+    // has no due date — so under Due it sits in the group's undated tail. It
+    // leads that tail rather than ending it: the sort is stable and it is the
+    // first child in stored order. The existing undated "someday" pins that; with
+    // only dated children the placeholder would be last, which is the weaker case.
     let mut m = pane(
         vec![
             open("A", None, Some(ymd(2026, 1, 1))),
             open("early", Some("A"), Some(ymd(2026, 2, 1))),
+            open("someday", Some("A"), None),
             open("late", Some("A"), Some(ymd(2026, 3, 1))),
         ],
         0, // on "A"
@@ -849,8 +852,8 @@ fn a_new_subtask_renders_last_within_its_parents_group() {
     assert_eq!(m.tasks[1].title, "new", "stored: first child of A");
     assert_eq!(
         titles(&m.visible_tasks()),
-        vec!["A", "early", "late", "new"],
-        "displayed: last child, since it is undated",
+        vec!["A", "early", "late", "new", "someday"],
+        "displayed: dated children first, then the undated tail in stored order",
     );
     assert_eq!(selected_title(&m), Some("new".to_string()));
 }

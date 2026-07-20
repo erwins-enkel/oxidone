@@ -208,9 +208,7 @@ impl Model {
             .map(|l| &l.id)
     }
 
-    /// The Tasks in the current `sort`'s **display order**. A pure, read-only
-    /// lens: it borrows `tasks` and never mutates Manual order (`position`) nor
-    /// emits any Command — the view renders this, the model is untouched.
+    /// The Tasks in the current `sort`'s **display order**.
     ///
     /// Every lens keeps the parent/Subtask hierarchy: a Task group is a top-level
     /// Task plus its Subtasks, and only the ordering *of* and *within* groups
@@ -245,9 +243,8 @@ impl Model {
             // stored order they were collected in; it also computes each key
             // once rather than per comparison, which matters for the group key
             // (a scan) and the lowercased title (an allocation). And only
-            // `group[1..]` is sorted: the
-            // parent stays the head of its group, or a Subtask could render
-            // above the row it belongs to.
+            // `group[1..]` is sorted: the parent stays the head of its group, or
+            // a Subtask could render above the row it belongs to.
             SortView::Due => {
                 for group in &mut groups {
                     group[1..].sort_by_cached_key(|t| due_key(t.due));
@@ -590,7 +587,11 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             } else if !model.tasks.iter().any(|t| t.id == task.id) {
                 // A refresh wiped the placeholder before the reply; don't lose
                 // the confirmed Task (and don't duplicate one a refresh added).
+                // The insert shifts every later index, so hold the cursor by id.
+                let selected = selected_id(model);
                 model.tasks.insert(0, task);
+                model.selected_task =
+                    selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
             }
             Vec::new()
         }
@@ -687,12 +688,15 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 // Ascending by prior index restores original order; skip any a
                 // refresh already re-added so we can't duplicate (cf. delete).
                 if model.selected_list_id() == Some(&list) {
+                    let selected = selected_id(model);
                     for (index, task) in removed {
                         if !model.tasks.iter().any(|t| t.id == task.id) {
                             let at = index.min(model.tasks.len());
                             model.tasks.insert(at, task);
                         }
                     }
+                    model.selected_task =
+                        selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                     reselect_visible(model);
                 }
             }
@@ -1487,8 +1491,14 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
                 .filter(|(_, t)| t.status == Status::Completed)
                 .map(|(i, t)| (i, t.clone()))
                 .collect();
+            // The sweep shifts every index after a cleared row, so hold the
+            // cursor by id; `reselect_visible` then re-homes it only if the Task
+            // it was on is the one that went.
+            let selected = selected_id(model);
             model.tasks.retain(|t| t.status != Status::Completed);
             model.pending_clears.insert(list.clone(), removed);
+            model.selected_task =
+                selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
             reselect_visible(model);
             vec![Command::ClearCompleted { list }]
         }

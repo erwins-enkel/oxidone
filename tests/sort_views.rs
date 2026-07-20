@@ -658,3 +658,87 @@ fn a_child_orphaned_by_a_parent_delete_stays_visible_and_flush_left() {
         "its parent is gone, so it must not draw indented"
     );
 }
+
+// --- Mutations elsewhere must keep the cursor on the same Task ---------------
+
+#[test]
+fn clearing_completed_keeps_the_cursor_on_the_same_task() {
+    // A Completed Task ahead of the cursor: sweeping it shifts every later index.
+    let mut m = pane(
+        vec![
+            task("done", None, None, Status::Completed),
+            open("a", None, Some(ymd(2026, 1, 1))),
+            open("b", None, Some(ymd(2026, 2, 1))),
+            open("c", None, Some(ymd(2026, 3, 1))),
+        ],
+        2, // displayed: a, b, c (done is hidden) -> on "c"
+    );
+    m.show_completed = true; // reveal so the cursor sits past the swept row
+    let on = selected_title(&m);
+    assert_eq!(on, Some("c".to_string()));
+
+    update(&mut m, press('C')); // clear completed
+    update(&mut m, press('y'));
+
+    assert_eq!(m.tasks.len(), 3, "the Completed Task was actually swept");
+    assert_eq!(
+        selected_title(&m),
+        Some("c".to_string()),
+        "the cursor must stay on the Task it was on, not slide to a neighbour",
+    );
+}
+
+#[test]
+fn a_failed_clear_restores_without_moving_the_cursor() {
+    let mut m = pane(
+        vec![
+            task("done", None, None, Status::Completed),
+            open("a", None, Some(ymd(2026, 1, 1))),
+            open("b", None, Some(ymd(2026, 2, 1))),
+        ],
+        1, // on "b"
+    );
+    m.show_completed = true;
+    let list = m.lists[0].id.clone();
+    update(&mut m, press('C'));
+    update(&mut m, press('y'));
+    assert_eq!(m.tasks.len(), 2, "the Completed Task was actually swept");
+    assert_eq!(selected_title(&m), Some("b".to_string()));
+
+    update(
+        &mut m,
+        Message::ClearCompletedFailed {
+            list,
+            reason: "boom".to_string(),
+        },
+    );
+
+    assert_eq!(
+        selected_title(&m),
+        Some("b".to_string()),
+        "re-inserting the swept Tasks must not slide the cursor",
+    );
+}
+
+#[test]
+fn a_confirmed_insert_after_a_refresh_keeps_the_cursor() {
+    // The placeholder is gone (a refresh wiped it), so the confirmed Task is
+    // inserted at stored index 0 — shifting every index under the cursor.
+    let mut m = pane(scrambled(), 0); // on "b"
+    let on = selected_title(&m);
+
+    update(
+        &mut m,
+        Message::TaskInserted {
+            temp: TaskId("temp-gone".to_string()),
+            task: open("server", None, Some(ymd(2026, 1, 1))),
+        },
+    );
+
+    assert_eq!(m.tasks.len(), 4, "the confirmed Task is not lost");
+    assert_eq!(
+        selected_title(&m),
+        on,
+        "an insert elsewhere must not drag the cursor to another Task",
+    );
+}

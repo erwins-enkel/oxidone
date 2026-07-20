@@ -18,6 +18,7 @@ pub enum Action {
     ToggleComplete,
     AddTask,
     EditTitle,
+    EditDue,
     DeleteTask,
     CycleSort,
 }
@@ -86,6 +87,11 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('e'),
             action: Action::EditTitle,
             help: "edit title",
+        },
+        Binding {
+            key: KeyCode::Char('d'),
+            action: Action::EditDue,
+            help: "edit due date",
         },
         Binding {
             key: KeyCode::Char('x'),

@@ -5,6 +5,9 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDate;
+
+use crate::dateparse;
 use crate::domain::{List, ListId, SortView, Status, Task, TaskId};
 use crate::keymap::{self, Action};
 
@@ -55,6 +58,10 @@ pub struct Model {
     /// Counter for minting placeholder ids for optimistically-added Tasks, before
     /// the server assigns the real id.
     next_temp: u64,
+    /// The current local time, stamped by the runtime before each event so the
+    /// reducer can resolve relative due dates ("tomorrow") without reading the
+    /// clock itself — keeping `update` pure/testable (ADR-0005).
+    pub now: chrono::DateTime<chrono::Local>,
 }
 
 /// A modal overlay drawn over the panes.
@@ -64,6 +71,8 @@ pub enum Overlay {
     EditTitle { task: TaskId, buffer: String },
     /// Capture a new Task's title.
     AddTask { buffer: String },
+    /// Due-date entry for a Task: natural language or ISO, or empty to clear.
+    EditDue { task: TaskId, buffer: String },
     /// A reusable destructive-action confirmation (delete Task now; Clear and
     /// List delete later).
     Confirm(Confirm),
@@ -73,7 +82,9 @@ impl Overlay {
     /// The editable text buffer of a text-input overlay, if this is one.
     fn input_buffer(&mut self) -> Option<&mut String> {
         match self {
-            Overlay::EditTitle { buffer, .. } | Overlay::AddTask { buffer } => Some(buffer),
+            Overlay::EditTitle { buffer, .. }
+            | Overlay::AddTask { buffer }
+            | Overlay::EditDue { buffer, .. } => Some(buffer),
             Overlay::Confirm(_) => None,
         }
     }
@@ -108,6 +119,10 @@ impl Default for Model {
             pending_writes: HashMap::new(),
             pending_deletes: HashMap::new(),
             next_temp: 0,
+            // A fixed placeholder; the runtime overwrites it before each event.
+            now: chrono::DateTime::from_timestamp(0, 0)
+                .expect("epoch is valid")
+                .with_timezone(&chrono::Local),
         }
     }
 }
@@ -206,6 +221,12 @@ pub enum Command {
         list: ListId,
         task: TaskId,
         title: String,
+    },
+    /// Write-through a due-date change for a Task. `None` clears the due date.
+    SetDue {
+        list: ListId,
+        task: TaskId,
+        due: Option<NaiveDate>,
     },
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
@@ -381,6 +402,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::ToggleComplete => return toggle_complete(model),
         Action::AddTask => open_add_task(model),
         Action::EditTitle => open_edit_title(model),
+        Action::EditDue => open_edit_due(model),
         Action::DeleteTask => open_delete_confirm(model),
         // View-only: cycle the local lens. `tasks` (Manual order) is untouched
         // and `selected_task` keeps indexing it, so the cursor stays on the
@@ -450,6 +472,20 @@ fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
     vec![Command::AddTask { list, temp, title }]
 }
 
+/// Open the due-date editor, prefilled with the current due (ISO) or empty.
+fn open_edit_due(model: &mut Model) {
+    if let Some(task) = focused_task(model) {
+        let buffer = task
+            .due
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        model.overlay = Some(Overlay::EditDue {
+            task: task.id.clone(),
+            buffer,
+        });
+    }
+}
+
 fn open_delete_confirm(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
@@ -497,6 +533,7 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
     match model.overlay.take() {
         Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
         Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
+        Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
         other => {
             model.overlay = other;
             Vec::new()
@@ -525,6 +562,43 @@ fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Com
         .insert(task.clone(), model.tasks[index].clone());
     model.tasks[index].title = title.clone();
     vec![Command::SetTitle { list, task, title }]
+}
+
+/// Submit the due editor: empty clears the due date, otherwise parse it. On a
+/// parse error, keep the overlay open with a status-line hint (don't drop the
+/// edit). On success, optimistically set `due`, snapshot for rollback, and emit
+/// the write-through — mirroring [`submit_edit_title`].
+fn finish_edit_due(model: &mut Model, task: TaskId, buffer: String) -> Vec<Command> {
+    let trimmed = buffer.trim();
+    let due = if trimmed.is_empty() {
+        None // clear the due date
+    } else {
+        match dateparse::parse_due_relative_to(trimmed, model.now) {
+            Ok(date) => Some(date),
+            Err(_) => {
+                model.status_line = Some(format!("could not parse due date: {trimmed:?}"));
+                // Keep the overlay open so the user can fix the input.
+                model.overlay = Some(Overlay::EditDue { task, buffer });
+                return Vec::new();
+            }
+        }
+    };
+    // Single-flight: don't lose the edit silently if a write is already running.
+    if model.pending_writes.contains_key(&task) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
+        return Vec::new();
+    };
+    model
+        .pending_writes
+        .insert(task.clone(), model.tasks[index].clone());
+    model.tasks[index].due = due;
+    vec![Command::SetDue { list, task, due }]
 }
 
 fn execute_confirm(model: &mut Model) -> Vec<Command> {

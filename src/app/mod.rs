@@ -779,13 +779,45 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             Vec::new()
         }
         Message::TaskDeleted(task) => {
-            // Confirmed gone; drop the rollback snapshot (Task already removed).
-            // Remember it as a tombstone under its List, so a *stale* refresh —
-            // one whose fetch was issued before Google applied the delete — cannot
-            // resurrect the row when its `TasksLoaded` lands after this reply
-            // (#65). Only a delete we initiated arms one: a spurious reply carries
-            // no snapshot and must not suppress a live row.
+            // Confirmed gone; drop the rollback snapshot. Two interleavings need
+            // handling on top of the ordinary case, where the row is already off
+            // screen and neither branch does anything:
+            //
+            // - A stale refresh may *still* land after this reply, its fetch
+            //   issued before Google applied the delete. Remember the id as a
+            //   tombstone under its List, so `set_tasks` drops it from that later
+            //   fetch instead of resurrecting the row (#65).
+            // - A refresh may *already* have landed inside the round-trip and
+            //   re-added the row from a fetch Google had not yet applied the delete
+            //   to — so re-remove it here too, mirroring the guard
+            //   `TaskDeleteFailed` carries for the same interleaving (#51). Only
+            //   the resurrected case does any work; with the row already absent
+            //   this stays a no-op, so a delete reply never disturbs a cursor the
+            //   user has moved on to.
+            //
+            // Only a delete we initiated does either: a spurious reply carries no
+            // snapshot and must not suppress or drop a live row. No "list still
+            // active" guard is needed (unlike `ClearedCompleted`): Task ids are
+            // unique across Lists, so a reply arriving after a List switch matches
+            // nothing.
             if let Some((_, previous)) = model.pending_deletes.remove(&task) {
+                if model.tasks.iter().any(|t| t.id == task) {
+                    // Only a cursor sitting on the resurrected row needs a new
+                    // home; one elsewhere is left where the user put it. Either
+                    // way the `retain` shifts indices, so the anchor is resolved
+                    // by id after.
+                    let anchor = if selected_id(model).as_ref() == Some(&task) {
+                        // Taken before the row goes: afterwards it has no display
+                        // position to anchor from.
+                        display_successor(model, &task)
+                    } else {
+                        selected_id(model)
+                    };
+                    model.tasks.retain(|t| t.id != task);
+                    model.selected_task =
+                        anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+                    reselect_visible(model);
+                }
                 model
                     .tombstones
                     .entry(previous.list)
@@ -914,14 +946,41 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             Vec::new()
         }
         Message::ClearedCompleted(list) => {
-            // Confirmed swept; drop the rollback snapshot (Tasks already removed).
-            // Tombstone the swept ids under their List, so a stale refresh cannot
-            // resurrect them (as with a delete, #65). By snapshot id, never by
-            // `Status::Completed`: a fetch may also carry Tasks completed after the
-            // sweep, which this Clear never swept and must stay.
+            // Confirmed swept; drop the rollback snapshot. Two interleavings, as
+            // with a delete — by snapshot **id** throughout, never by
+            // `Status::Completed`: a refresh may also carry Tasks completed after
+            // the sweep, which this Clear never swept and which must stay.
             if let Some(removed) = model.pending_clears.remove(&list) {
-                let set = model.tombstones.entry(list).or_default();
-                set.extend(removed.into_iter().map(|(_, task)| task.id));
+                let swept: HashSet<TaskId> = removed.into_iter().map(|(_, task)| task.id).collect();
+                // A refresh may *already* have landed inside the round-trip and
+                // re-added the swept Tasks from a fetch Google had not yet cleared
+                // — so re-remove them (#51). Only when that List is still active:
+                // `model.tasks` holds just the active pane, and a List switch
+                // during the Clear left a different one in place (cf. the failure
+                // twin).
+                if model.selected_list_id() == Some(&list)
+                    && model.tasks.iter().any(|t| swept.contains(&t.id))
+                {
+                    // A cursor on a resurrected row steps to the nearest row that
+                    // survives; one elsewhere is held by id, since the `retain`
+                    // shifts every later index.
+                    let anchor = selected_id(model).and_then(|id| {
+                        if swept.contains(&id) {
+                            display_neighbour(model, &id, |t| !swept.contains(&t.id))
+                        } else {
+                            Some(id)
+                        }
+                    });
+                    model.tasks.retain(|t| !swept.contains(&t.id));
+                    model.selected_task =
+                        anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+                    reselect_visible(model);
+                }
+                // A stale refresh may *still* land later — even after switching
+                // away and back — so tombstone the swept ids under their List,
+                // regardless of the active pane, so `set_tasks` drops them instead
+                // of resurrecting them (#65).
+                model.tombstones.entry(list).or_default().extend(swept);
             }
             Vec::new()
         }

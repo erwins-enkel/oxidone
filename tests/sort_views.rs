@@ -769,6 +769,32 @@ fn clearing_the_row_under_the_cursor_anchors_the_neighbour() {
     assert_eq!(
         selected_title(&m),
         Some("d".to_string()),
-        "the neighbour below, not the first row",
+        "the nearest surviving neighbour — here the row above, since the swept \
+         Completed row has no group key and sits last",
+    );
+}
+
+#[test]
+fn a_confirmed_insert_into_an_empty_pane_takes_the_cursor() {
+    // A refresh emptied the pane before the add reply landed, so there is no
+    // selection to preserve. The confirmed Task must still get the highlight —
+    // otherwise the pane renders a row no keypress is pointing at.
+    let mut m = pane(scrambled(), 0);
+    let list = m.lists[0].id.clone();
+    update(&mut m, Message::TasksLoaded(list, vec![]));
+    assert_eq!(m.selected_task, None, "nothing left to select");
+
+    update(
+        &mut m,
+        Message::TaskInserted {
+            temp: TaskId("temp-gone".to_string()),
+            task: open("server", None, None),
+        },
+    );
+
+    assert_eq!(
+        selected_title(&m),
+        Some("server".to_string()),
+        "the only row must be selected, not left unhighlighted",
     );
 }

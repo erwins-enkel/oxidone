@@ -588,11 +588,14 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             } else if !model.tasks.iter().any(|t| t.id == task.id) {
                 // A refresh wiped the placeholder before the reply; don't lose
                 // the confirmed Task (and don't duplicate one a refresh added).
-                // The insert shifts every later index, so hold the cursor by id.
+                // The insert shifts every later index, so hold the cursor by id —
+                // then re-anchor, since a refresh that emptied the pane leaves no
+                // selection and this Task would otherwise render unhighlighted.
                 let selected = selected_id(model);
                 model.tasks.insert(0, task);
                 model.selected_task =
                     selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+                reselect_visible(model);
             }
             Vec::new()
         }

@@ -104,6 +104,23 @@ pub async fn write_title(
     Ok(updated)
 }
 
+/// Insert a Task into a List on Google and mirror it into the cache. Returns
+/// the server Task (with its real id/position).
+pub async fn insert_task(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    title: &str,
+) -> Result<Task> {
+    let new = crate::api::NewTask {
+        title: title.to_string(),
+        ..Default::default()
+    };
+    let task = api.insert_task(list, new).await?;
+    cache.upsert_task(&task)?;
+    Ok(task)
+}
+
 /// Delete a Task on Google and mirror the removal into the cache.
 pub async fn delete_task(
     api: &dyn TasksApi,

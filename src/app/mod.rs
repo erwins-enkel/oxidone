@@ -52,6 +52,9 @@ pub struct Model {
     /// Optimistically-removed Tasks awaiting delete confirmation from the server,
     /// mapped to their prior (index, Task) for rollback on failure.
     pending_deletes: HashMap<TaskId, (usize, Task)>,
+    /// Counter for minting placeholder ids for optimistically-added Tasks, before
+    /// the server assigns the real id.
+    next_temp: u64,
 }
 
 /// A modal overlay drawn over the panes.
@@ -59,9 +62,21 @@ pub struct Model {
 pub enum Overlay {
     /// In-place title editor for a Task.
     EditTitle { task: TaskId, buffer: String },
+    /// Capture a new Task's title.
+    AddTask { buffer: String },
     /// A reusable destructive-action confirmation (delete Task now; Clear and
     /// List delete later).
     Confirm(Confirm),
+}
+
+impl Overlay {
+    /// The editable text buffer of a text-input overlay, if this is one.
+    fn input_buffer(&mut self) -> Option<&mut String> {
+        match self {
+            Overlay::EditTitle { buffer, .. } | Overlay::AddTask { buffer } => Some(buffer),
+            Overlay::Confirm(_) => None,
+        }
+    }
 }
 
 /// A yes/no confirmation of a destructive action.
@@ -92,6 +107,7 @@ impl Default for Model {
             overlay: None,
             pending_writes: HashMap::new(),
             pending_deletes: HashMap::new(),
+            next_temp: 0,
         }
     }
 }
@@ -160,6 +176,16 @@ pub enum Message {
         task: TaskId,
         reason: String,
     },
+    /// An add succeeded; replace the placeholder (by temp id) with the server Task.
+    TaskInserted {
+        temp: TaskId,
+        task: Task,
+    },
+    /// An add failed; drop the placeholder (by temp id).
+    TaskAddFailed {
+        temp: TaskId,
+        reason: String,
+    },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
 }
@@ -183,6 +209,13 @@ pub enum Command {
     },
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
+    /// Insert a new Task into a List; `temp` echoes back so the placeholder can
+    /// be reconciled with the server Task.
+    AddTask {
+        list: ListId,
+        temp: TaskId,
+        title: String,
+    },
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
@@ -237,6 +270,23 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                     clamp_task_selection(model);
                 }
             }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
+        Message::TaskInserted { temp, task } => {
+            // Reconcile the optimistic placeholder with the server's real Task.
+            if let Some(slot) = model.tasks.iter_mut().find(|t| t.id == temp) {
+                *slot = task;
+            } else if !model.tasks.iter().any(|t| t.id == task.id) {
+                // A refresh wiped the placeholder before the reply; don't lose
+                // the confirmed Task (and don't duplicate one a refresh added).
+                model.tasks.insert(0, task);
+            }
+            Vec::new()
+        }
+        Message::TaskAddFailed { temp, reason } => {
+            model.tasks.retain(|t| t.id != temp);
+            clamp_task_selection(model);
             model.status_line = Some(reason);
             Vec::new()
         }
@@ -329,6 +379,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::SelectNext => return move_selection(model, 1),
         Action::SelectPrev => return move_selection(model, -1),
         Action::ToggleComplete => return toggle_complete(model),
+        Action::AddTask => open_add_task(model),
         Action::EditTitle => open_edit_title(model),
         Action::DeleteTask => open_delete_confirm(model),
         // View-only: cycle the local lens. `tasks` (Manual order) is untouched
@@ -356,6 +407,49 @@ fn open_edit_title(model: &mut Model) {
     }
 }
 
+/// Open the capture overlay for a new Task (needs an active List to add into).
+fn open_add_task(model: &mut Model) {
+    if model.selected_list_id().is_some() {
+        model.overlay = Some(Overlay::AddTask {
+            buffer: String::new(),
+        });
+    }
+}
+
+/// Optimistically insert a placeholder Task at the top (Google adds new Tasks to
+/// the top of a List) and request the insert. The placeholder carries a `temp-N`
+/// id; the server Task replaces it via `TaskInserted`. Exact position reconciles
+/// on the next refresh.
+fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
+    let title = buffer.trim().to_string();
+    if title.is_empty() {
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let temp = TaskId(format!("temp-{}", model.next_temp));
+    model.next_temp += 1;
+    model.tasks.insert(
+        0,
+        Task {
+            id: temp.clone(),
+            list: list.clone(),
+            parent: None,
+            title: title.clone(),
+            notes: None,
+            status: Status::NeedsAction,
+            due: None,
+            completed_at: None,
+            position: String::new(),
+            etag: String::new(),
+            updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        },
+    );
+    model.selected_task = Some(0); // cursor moves to the new Task
+    vec![Command::AddTask { list, temp, title }]
+}
+
 fn open_delete_confirm(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
@@ -370,32 +464,22 @@ fn open_delete_confirm(model: &mut Model) {
     }));
 }
 
-/// Route a key to the active overlay: text editing for `EditTitle`, yes/no for
-/// `Confirm`.
+/// Route a key to the active overlay: text editing for input overlays, yes/no
+/// for `Confirm`.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
-    let is_input = matches!(model.overlay, Some(Overlay::EditTitle { .. }));
-    if is_input {
+    let input = model.overlay.as_mut().and_then(Overlay::input_buffer);
+    if let Some(buffer) = input {
         match key.code {
-            KeyCode::Char(c) => {
-                if let Some(Overlay::EditTitle { buffer, .. }) = &mut model.overlay {
-                    buffer.push(c);
-                }
-                Vec::new()
-            }
+            KeyCode::Char(c) => buffer.push(c),
             KeyCode::Backspace => {
-                if let Some(Overlay::EditTitle { buffer, .. }) = &mut model.overlay {
-                    buffer.pop();
-                }
-                Vec::new()
+                buffer.pop();
             }
-            KeyCode::Enter => submit_edit_title(model),
-            KeyCode::Esc => {
-                model.overlay = None;
-                Vec::new()
-            }
-            _ => Vec::new(),
+            KeyCode::Enter => return submit_input(model),
+            KeyCode::Esc => model.overlay = None,
+            _ => {}
         }
+        Vec::new()
     } else {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
@@ -408,10 +492,19 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     }
 }
 
-fn submit_edit_title(model: &mut Model) -> Vec<Command> {
-    let Some(Overlay::EditTitle { task, buffer }) = model.overlay.take() else {
-        return Vec::new();
-    };
+/// Submit whichever text-input overlay is active.
+fn submit_input(model: &mut Model) -> Vec<Command> {
+    match model.overlay.take() {
+        Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
+        Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
+        other => {
+            model.overlay = other;
+            Vec::new()
+        }
+    }
+}
+
+fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Command> {
     let title = buffer.trim().to_string();
     if title.is_empty() {
         return Vec::new(); // cancel silently on an empty title

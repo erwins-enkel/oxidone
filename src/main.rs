@@ -176,6 +176,17 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::AddTask { list, temp, title } => match api {
+                Some(api) => {
+                    spawn_add_task(api.clone(), cache.clone(), tx.clone(), list, temp, title)
+                }
+                None => {
+                    let _ = tx.send(Message::TaskAddFailed {
+                        temp,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
         }
     }
 }
@@ -232,6 +243,37 @@ fn spawn_write_title(
             Err(e) => Message::TaskWriteFailed {
                 task,
                 reason: format!("failed to update task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Insert a Task on Google, mirror into the cache, and reconcile the optimistic
+/// placeholder (by `temp` id) with the server Task — or drop it on failure.
+fn spawn_add_task(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    temp: TaskId,
+    title: String,
+) {
+    tokio::spawn(async move {
+        let new = oxidone::api::NewTask {
+            title,
+            ..Default::default()
+        };
+        let message = match api.insert_task(&list, new).await {
+            Ok(task) => {
+                if let Err(e) = cache.lock().unwrap().upsert_task(&task) {
+                    tracing::warn!(error = %e, "failed to cache inserted task");
+                }
+                Message::TaskInserted { temp, task }
+            }
+            Err(e) => Message::TaskAddFailed {
+                temp,
+                reason: format!("failed to add task: {e}"),
             },
         };
         let _ = tx.send(message);

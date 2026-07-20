@@ -79,6 +79,18 @@ pub struct Model {
     /// per-item snapshot — like `pending_deletes` — so a failed Clear re-inserts
     /// only the swept Tasks, never clobbering a concurrent edit or a reload.
     pending_clears: HashMap<ListId, Vec<(usize, Task)>>,
+    /// Ids confirmed deleted or Cleared, per List, so a *stale* refresh cannot
+    /// resurrect the row. A fetch issued before Google applied the delete still
+    /// lists the id; if its `TasksLoaded` lands *after* the confirmation dropped
+    /// the rollback snapshot, nothing else records the row is gone. `set_tasks`
+    /// drops any tombstoned id from the fetch, and evicts a tombstone once a
+    /// fetch of *that List* omits the id (Google has caught up). Keyed by List so
+    /// a fetch of another List never evicts these — closing the switch-away race.
+    ///
+    /// Ephemeral reducer bookkeeping, the same category as `pending_deletes`, not
+    /// a field on the Task cache: it augments nothing Google stores and
+    /// round-trips nothing, so the pure-mirror rule (ADR-0003) holds.
+    tombstones: HashMap<ListId, HashSet<TaskId>>,
     /// A Move (indent/outdent/reorder) in flight, with the List and the pre-Move
     /// `tasks` snapshot for rollback. A Move renumbers many positions, so it is
     /// single-flight (one at a time) and reconciled by a whole-pane refetch on
@@ -206,6 +218,7 @@ impl Default for Model {
             pending_list_writes: HashMap::new(),
             pending_list_deletes: HashMap::new(),
             pending_clears: HashMap::new(),
+            tombstones: HashMap::new(),
             pending_move: None,
             next_temp: 0,
             // A fixed placeholder, deliberately not the real clock: `Default`
@@ -769,7 +782,18 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         }
         Message::TaskDeleted(task) => {
             // Confirmed gone; drop the rollback snapshot (Task already removed).
-            model.pending_deletes.remove(&task);
+            // Remember it as a tombstone under its List, so a *stale* refresh —
+            // one whose fetch was issued before Google applied the delete — cannot
+            // resurrect the row when its `TasksLoaded` lands after this reply
+            // (#65). Only a delete we initiated arms one: a spurious reply carries
+            // no snapshot and must not suppress a live row.
+            if let Some((_, previous)) = model.pending_deletes.remove(&task) {
+                model
+                    .tombstones
+                    .entry(previous.list)
+                    .or_default()
+                    .insert(task);
+            }
             Vec::new()
         }
         Message::TaskDeleteFailed { task, reason } => {
@@ -893,7 +917,14 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         }
         Message::ClearedCompleted(list) => {
             // Confirmed swept; drop the rollback snapshot (Tasks already removed).
-            model.pending_clears.remove(&list);
+            // Tombstone the swept ids under their List, so a stale refresh cannot
+            // resurrect them (as with a delete, #65). By snapshot id, never by
+            // `Status::Completed`: a fetch may also carry Tasks completed after the
+            // sweep, which this Clear never swept and must stay.
+            if let Some(removed) = model.pending_clears.remove(&list) {
+                let set = model.tombstones.entry(list).or_default();
+                set.extend(removed.into_iter().map(|(_, task)| task.id));
+            }
             Vec::new()
         }
         Message::ClearCompletedFailed { list, reason } => {
@@ -1049,12 +1080,36 @@ fn request_selected_tasks(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     }
 }
 
+/// Drop tombstoned ids from a `list` fetch, and evict any tombstone the fetch
+/// shows Google has caught up on. A tombstone marks an id whose delete/Clear was
+/// confirmed but which a stale fetch may still list (its request predated the
+/// delete); dropping it keeps the row gone (#65).
+///
+/// Reads the incoming id set *before* filtering, so a just-suppressed id is not
+/// mistaken for "absent" and does not evict its own tombstone in the same pass.
+/// Eviction is scoped to `list`, so a fetch of another List never spends these.
+fn reconcile_tombstones(model: &mut Model, list: &ListId, tasks: Vec<Task>) -> Vec<Task> {
+    let Some(set) = model.tombstones.get_mut(list) else {
+        return tasks;
+    };
+    let incoming: HashSet<TaskId> = tasks.iter().map(|t| t.id.clone()).collect();
+    // Evict tombstones Google has processed (id absent from this fetch)…
+    set.retain(|id| incoming.contains(id));
+    // …then drop the ids that are still stale.
+    let tasks = tasks.into_iter().filter(|t| !set.contains(&t.id)).collect();
+    if set.is_empty() {
+        model.tombstones.remove(list);
+    }
+    tasks
+}
+
 /// Fill the task pane, ignoring results for a List that is no longer active.
 /// Keeps the task cursor on the same Task by id where possible.
 fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
     if model.selected_list_id() != Some(list) {
         return;
     }
+    let tasks = reconcile_tombstones(model, list, tasks);
     let previously_selected = model
         .selected_task
         .and_then(|i| model.tasks.get(i))

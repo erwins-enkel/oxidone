@@ -1,0 +1,100 @@
+name: build-release
+
+# Builds the release binaries and attaches them to the GitHub Release for `tag`.
+# Reusable: release-please calls this when it publishes a release; it can also be
+# dispatched by hand (e.g. to (re)build the first tag). The build matrix uses
+# native runners per target so the bundled SQLite C compiles without a cross
+# toolchain.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upload:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Third-party actions pinned to full commit SHAs (supply-chain hardening),
+      # matching CI. Dependabot keeps them current.
+      - name: Install stable toolchain
+        # dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Untrusted-input hardening: `${{...}}` context values are passed via `env:`
+      # and referenced as quoted shell vars, never interpolated into `run:`.
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist="oxidone-${TAG}-${TARGET}"
+          mkdir "$dist"
+          cp "target/${TARGET}/release/oxidone" "$dist/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/"
+          tar czf "$dist.tar.gz" "$dist"
+          echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist="oxidone-${TAG}-${TARGET}"
+          mkdir "$dist"
+          cp "target/${TARGET}/release/oxidone.exe" "$dist/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/"
+          7z a "$dist.zip" "$dist" >/dev/null
+          echo "ASSET=$dist.zip" >> "$GITHUB_ENV"
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" "$ASSET" --clobber

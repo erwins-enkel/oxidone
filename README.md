@@ -5,8 +5,9 @@ A keyboard-driven daily-driver for triaging tasks across multiple lists — styl
 [btop](https://github.com/aristocratos/btop)'s visual language (rounded panels, braille
 meters) with a [Catppuccin](https://catppuccin.com) palette.
 
-> Status: **early**. The domain model and architecture are settled (see
-> [`CONTEXT.md`](CONTEXT.md) and [`docs/adr/`](docs/adr)); the implementation is in progress.
+> Status: **0.1.0** — the v1 scope ([#1](https://github.com/erwins-enkel/oxidone/issues/1))
+> is implemented. The domain model and architecture are settled (see
+> [`CONTEXT.md`](CONTEXT.md) and [`docs/adr/`](docs/adr)).
 
 ## Why
 
@@ -34,7 +35,21 @@ recurrence and reminders (not exposed by the API).
 
 ## Install
 
-Requires a Rust toolchain (stable). From source:
+### Prebuilt binaries
+
+Each [release](https://github.com/erwins-enkel/oxidone/releases) ships prebuilt
+binaries for Linux (x86-64), macOS (Intel + Apple Silicon), and Windows (x86-64).
+Download the archive for your platform, extract, and put `oxidone` on your `PATH`:
+
+```sh
+# Linux / macOS example (adjust tag + target)
+tar xzf oxidone-v0.1.0-aarch64-apple-darwin.tar.gz
+install oxidone-v0.1.0-aarch64-apple-darwin/oxidone /usr/local/bin/
+```
+
+### From source
+
+Requires a Rust toolchain (stable):
 
 ```sh
 git clone https://github.com/erwins-enkel/oxidone
@@ -43,7 +58,7 @@ cargo build --release
 # binary at target/release/oxidone
 ```
 
-Prebuilt binaries and `cargo install oxidone` will follow at the first tagged release.
+`cargo install oxidone` (crates.io) is planned.
 
 ## First-run setup (bring your own Google credentials)
 

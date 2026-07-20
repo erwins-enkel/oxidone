@@ -7,11 +7,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # RUSTFLAGS is intentionally NOT set here: `make gate` runs
+  # `cargo clippy --all-targets --all-features -- -D warnings`, which already
+  # denies rustc's warnings too. A workflow-level RUSTFLAGS would diverge from
+  # the hook (which cannot set it without thrashing the local build cache).
 
 jobs:
   check:
-    name: fmt · clippy · test
+    name: gate · smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -28,19 +31,38 @@ jobs:
       # Swatinem/rust-cache@v2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      # cargo-machete must land before `make gate`, which runs it. rust-cache
+      # caches ~/.cargo/bin, so the install is paid once per cache generation.
+      - name: Install dev tools
+        run: make dev-tools
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Gate
+        run: make gate
 
-      - name: Test
-        run: cargo test --all-features
+      # Regression seam for install/config/PREFIX. PROFILE=dev reuses the dev
+      # artifacts `gate` just built instead of paying a cold release compile.
+      # XDG_CONFIG_HOME (not HOME — that would relocate CARGO_HOME and drop the
+      # cache) scopes the config write to a throwaway dir.
+      - name: Install smoke test
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/xdg
+        run: |
+          set -euo pipefail
+          make install PROFILE=dev PREFIX="$RUNNER_TEMP/pfx"
+          "$RUNNER_TEMP/pfx/bin/oxidone" --version
 
-      # Unused-dependency audit. rust-cache caches ~/.cargo/bin, so the install
-      # is paid once per cache generation.
-      - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
+          # Ask the installed binary for the path — never re-derive it here.
+          cfg="$("$RUNNER_TEMP/pfx/bin/oxidone" --print-config-path)"
 
-      - name: Unused dependencies
-        run: cargo machete
+          # create-when-absent
+          make config PROFILE=dev
+          test -s "$cfg"
+
+          # never-overwrite: a sentinel must survive a second run
+          echo 'theme = "SENTINEL"' > "$cfg"
+          make config PROFILE=dev
+          grep -q SENTINEL "$cfg"
+
+          # teardown gives uninstall a seam too
+          make uninstall PREFIX="$RUNNER_TEMP/pfx"
+          test ! -e "$RUNNER_TEMP/pfx/bin/oxidone"

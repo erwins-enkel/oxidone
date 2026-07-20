@@ -57,16 +57,23 @@ install oxidone-v0.1.0-aarch64-apple-darwin/oxidone /usr/local/bin/
 
 ### From source
 
-Requires a Rust toolchain (stable):
+Requires a Rust toolchain (stable). With `make`:
 
 ```sh
 git clone https://github.com/erwins-enkel/oxidone
 cd oxidone
-cargo build --release
-# binary at target/release/oxidone
+make install          # builds and installs to ~/.local/bin (override: PREFIX=/usr/local)
 ```
 
-`cargo install oxidone` (crates.io) is planned.
+Later, to update to the latest commit and reinstall in one step:
+
+```sh
+make update           # git pull --ff-only, then make install
+```
+
+`make install` installs to `$PREFIX/bin` (default `~/.local/bin`); make sure that
+directory is on your `PATH`. Plain `cargo build --release` still works too (binary
+at `target/release/oxidone`). `cargo install oxidone` (crates.io) is planned.
 
 ## First-run setup (bring your own Google credentials)
 
@@ -96,9 +103,14 @@ Config lives at the platform config dir (`directories`):
 - macOS: `~/Library/Application Support/oxidone/config.toml`
 - Linux: `~/.config/oxidone/config.toml`
 
+Run `make config` to drop a starter file (a copy of
+[`config.example.toml`](config.example.toml)) there if none exists; it never
+overwrites an existing config. The fields:
+
 ```toml
-# Path to your downloaded OAuth client (step 4 above)
-client_secret_path = "~/.config/oxidone/client_secret.json"
+# Absolute path to your downloaded OAuth client (step 4 above).
+# Must be absolute — `~` is NOT expanded.
+client_secret_path = "/home/you/.config/oxidone/client_secret.json"
 
 # Catppuccin flavor: "latte" | "frappe" | "macchiato" | "mocha"
 theme = "mocha"
@@ -121,12 +133,12 @@ git config core.hooksPath .githooks
 That enables a `pre-push` hook mirroring CI (fmt · clippy · test · unused deps) and a
 `commit-msg` hook enforcing [Conventional Commits](https://www.conventionalcommits.org/).
 
+The gate lives in one place — the `Makefile` — and both the hook and CI run it:
+
 ```sh
-cargo check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo machete                 # unused deps; cargo install cargo-machete
+make gate         # fmt · clippy · test · unused deps — the full gate
+make check        # cargo check --all-targets --all-features — fast inner loop
+make dev-tools    # once, installs cargo-machete (needed by the gate)
 ```
 
 The core (TEA reducer, `TasksApi` trait, cache, sync) is testable with no terminal and

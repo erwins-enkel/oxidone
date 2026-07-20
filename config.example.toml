@@ -1,0 +1,13 @@
+# oxidone configuration. `make config` copies this to your platform config dir
+# (~/.config/oxidone/config.toml on Linux) if none exists; it never overwrites.
+
+# Absolute path to your downloaded OAuth client (step 4 of the README).
+# Must be absolute — `~` is NOT expanded (see issue #67). Uncomment and edit:
+# client_secret_path = "/absolute/path/to/client_secret.json"
+
+# Catppuccin flavor: "latte" | "frappe" | "macchiato" | "mocha"
+theme = "mocha"
+
+# Render ASCII block bars instead of braille, for terminals/fonts without
+# braille glyphs.
+ascii_fallback = false

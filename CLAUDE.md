@@ -12,15 +12,13 @@ One command decides whether the work is done. Run it; paste the output.
 ```sh
 git config core.hooksPath .githooks   # once per clone — enables the hooks below
 
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo machete                         # cargo install cargo-machete
+make gate                             # fmt · clippy · test · unused deps
+make dev-tools                        # once, if `cargo machete` is missing
 ```
 
-`.githooks/pre-push` runs exactly this and mirrors `.github/workflows/ci.yml`, so
-a green push is a green CI. If you change one, change all three — a hook that
-drifts from CI is worse than no hook.
+`make gate` is the single source of truth for the gate commands. `.githooks/pre-push`
+and `.github/workflows/ci.yml` both run exactly `make gate`, so a green push is a
+green CI — there is one definition to keep honest, not three copies to sync.
 
 `.githooks/commit-msg` enforces Conventional Commits
 (`feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert`), optionally via

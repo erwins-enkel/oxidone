@@ -23,11 +23,13 @@ a Tasks costume.
   an always-visible legend of the most common keys for the focused pane
 - Create / complete / edit / delete tasks; un-complete; clear completed
 - Subtasks (one level, matching Google), indent/outdent, manual reorder
+  (from a sort view, the first reorder key switches back to "my order")
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
 - Notes edited in your `$EDITOR`
 - Full list management (create / rename / delete)
-- Local-order-preserving, plus throwaway sort views (by due, by title)
+- Opens in due order, Subtasks still grouped under their parent; `s` cycles
+  due → title → "my order" (Google's), the only view a reorder writes to
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*
 

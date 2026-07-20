@@ -153,7 +153,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 ));
             }
             // Subtasks sit indented under their parent so the hierarchy reads.
-            if t.is_subtask() {
+            // An orphan (parent gone) draws flush-left rather than claiming the
+            // row above it as its parent.
+            if model.renders_as_subtask(t) {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
             spans.push(Span::styled(t.title.clone(), style));

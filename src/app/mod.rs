@@ -42,8 +42,9 @@ pub struct Model {
     pub tasks: Vec<Task>,
     /// Index into `tasks` of the cursor, if any.
     pub selected_task: Option<usize>,
-    /// Local, read-only reordering of the task pane. Never mutates `tasks`
-    /// (Manual order) and never writes `position` to Google.
+    /// Local, read-only regrouping of the task pane. Never mutates `tasks`
+    /// (Manual order) and never writes `position` to Google. Starts at
+    /// [`SortView::Due`]; a Move press switches it back to `Manual` first.
     pub sort: SortView,
     /// Whether Completed Tasks are revealed in the pane. Off by default (they are
     /// hidden, the way the Google app does); a toggle reveals them. Purely a local
@@ -166,7 +167,7 @@ impl Default for Model {
             selected_list: None,
             tasks: Vec::new(),
             selected_task: None,
-            sort: SortView::Manual,
+            sort: SortView::Due,
             show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
@@ -211,60 +212,88 @@ impl Model {
     /// lens: it borrows `tasks` and never mutates Manual order (`position`) nor
     /// emits any Command — the view renders this, the model is untouched.
     ///
-    /// - `Manual`: the parent/Subtask hierarchy — each top-level Task followed by
-    ///   its Subtasks. Derived from `parent` + Vec order, so it is correct whether
-    ///   `position` strings are global (the fake) or per-sibling-group (Google).
-    /// - `Due`: due date ascending; Tasks with no due date sink to the bottom,
-    ///   stable within that no-due group (a deterministic tail). Flat — a triage
-    ///   lens ignores the hierarchy.
-    /// - `Title`: case-insensitive by title, stable on ties. Flat, as `Due`.
+    /// Every lens keeps the parent/Subtask hierarchy: a Task group is a top-level
+    /// Task plus its Subtasks, and only the ordering *of* and *within* groups
+    /// changes. An indented row therefore always sits under its real parent.
     ///
-    /// Navigation (`j`/`k`) follows this order, so the cursor never jumps between
-    /// non-adjacent rows.
+    /// - `Manual`: groups and children in Vec order. Derived from `parent` + Vec
+    ///   order, so it is correct whether `position` strings are global (the fake)
+    ///   or per-sibling-group (Google).
+    /// - `Due`: children by due date ascending (undated last); a group sorts by
+    ///   the earliest due among its **incomplete** Tasks, so an urgent Subtask
+    ///   lifts its parent and a Completed one never does — group order is the
+    ///   same whether or not `show_completed` reveals them.
+    /// - `Title`: children and groups case-insensitive by title.
+    ///
+    /// Ordering is **stable over stored order** everywhere: groups are built in
+    /// Vec order and sorted stably, so equal keys — including the key-less
+    /// undated tail — keep Manual order. An orphaned Subtask (parent absent) is
+    /// its own single-Task group, so it sorts on its own key rather than sinking
+    /// to the bottom; `Manual` keeps appending it last.
+    ///
+    /// A pure, read-only lens: it borrows `tasks` and never mutates Manual order
+    /// (`position`) nor emits any Command — the view renders this, the model is
+    /// untouched. Navigation (`j`/`k`) follows this order, so the cursor never
+    /// jumps between non-adjacent rows.
     pub fn sorted_tasks(&self) -> Vec<&Task> {
-        // Manual is the hierarchy; the flat triage lenses share one collect+sort.
-        if self.sort == SortView::Manual {
-            return self.hierarchical();
-        }
-        let mut ordered: Vec<&Task> = self.tasks.iter().collect();
+        let mut groups = self.groups();
         match self.sort {
-            // Stable sort keeps the stored order as the tie-breaker, so the
-            // no-due tail (and same-day Tasks) stay in Manual order.
-            SortView::Due => ordered.sort_by(|a, b| match (a.due, b.due) {
-                (Some(x), Some(y)) => x.cmp(&y),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }),
-            SortView::Title => ordered.sort_by_cached_key(|t| t.title.to_lowercase()),
-            SortView::Manual => unreachable!("handled by the early return above"),
-        }
-        ordered
-    }
-
-    /// Flatten `tasks` into parent-then-Subtasks order: each top-level Task in Vec
-    /// order, immediately followed by its Subtasks (also in Vec order). Any Task
-    /// whose parent is absent (an orphaned Subtask, e.g. after its parent was
-    /// deleted) is appended rather than dropped, so nothing ever vanishes.
-    fn hierarchical(&self) -> Vec<&Task> {
-        let mut out: Vec<&Task> = Vec::with_capacity(self.tasks.len());
-        for parent in self.tasks.iter().filter(|t| t.parent.is_none()) {
-            out.push(parent);
-            for child in self
-                .tasks
-                .iter()
-                .filter(|c| c.parent.as_ref() == Some(&parent.id))
-            {
-                out.push(child);
+            // Vec order already; `groups` built it.
+            SortView::Manual => {}
+            // Two rules hold for both lenses below. `sort_by_key` is stable, so
+            // equal keys — including the key-less tail — keep the stored order
+            // they were collected in. And only `group[1..]` is sorted: the
+            // parent stays the head of its group, or a Subtask could render
+            // above the row it belongs to.
+            SortView::Due => {
+                for group in &mut groups {
+                    group[1..].sort_by_key(|t| due_key(t.due));
+                }
+                groups.sort_by_key(|g| due_key(group_due_key(g)));
+            }
+            SortView::Title => {
+                for group in &mut groups {
+                    group[1..].sort_by_key(|t| t.title.to_lowercase());
+                }
+                groups.sort_by_key(|g| g[0].title.to_lowercase());
             }
         }
-        // Orphans: Subtasks whose parent isn't in the set — keep them visible.
+        groups.into_iter().flatten().collect()
+    }
+
+    /// Split `tasks` into groups in Vec order: each top-level Task followed by its
+    /// Subtasks, then each orphaned Subtask (parent absent, e.g. after the parent
+    /// was deleted) as a group of its own. Every Task lands in exactly one group,
+    /// so nothing ever vanishes and flattening always reproduces the whole set.
+    fn groups(&self) -> Vec<Vec<&Task>> {
+        let mut out: Vec<Vec<&Task>> = Vec::new();
+        for parent in self.tasks.iter().filter(|t| t.parent.is_none()) {
+            let mut group = vec![parent];
+            group.extend(
+                self.tasks
+                    .iter()
+                    .filter(|c| c.parent.as_ref() == Some(&parent.id)),
+            );
+            out.push(group);
+        }
+        // Orphans keep their Vec position among the groups, so a stable sort
+        // leaves them where Manual would put them when their key ties.
         for task in &self.tasks {
-            if !out.iter().any(|t| t.id == task.id) {
-                out.push(task);
+            if !out.iter().flatten().any(|t| t.id == task.id) {
+                out.push(vec![task]);
             }
         }
         out
+    }
+
+    /// Whether `task` should render indented: it has a parent **and** that parent
+    /// is in the Task set. An orphaned Subtask renders flush-left rather than as a
+    /// child of whatever precedes it. Independent of `show_completed` — a hidden
+    /// parent is still a parent — so the indent never flickers with the toggle.
+    pub fn renders_as_subtask(&self, task: &Task) -> bool {
+        task.parent
+            .as_ref()
+            .is_some_and(|p| self.tasks.iter().any(|t| &t.id == p))
     }
 
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
@@ -282,6 +311,47 @@ impl Model {
     fn is_visible(&self, task: &Task) -> bool {
         self.show_completed || task.status != Status::Completed
     }
+}
+
+/// The Task that should take the cursor when `task` leaves the view: the next
+/// **visible** Task after it in display order, else the nearest before it, else
+/// `None`. Must be called *before* `task` is removed — afterwards it has no
+/// display position to anchor from.
+fn display_successor(model: &Model, task: &TaskId) -> Option<TaskId> {
+    let ordered = model.sorted_tasks();
+    let pos = ordered.iter().position(|t| &t.id == task)?;
+    ordered[pos + 1..]
+        .iter()
+        .find(|t| model.is_visible(t))
+        .or_else(|| ordered[..pos].iter().rev().find(|t| model.is_visible(t)))
+        .map(|t| t.id.clone())
+}
+
+/// Stored index of the first Task in display order, or `None` when there are no
+/// Tasks. The cursor's home when there is no selection to preserve.
+fn first_displayed_index(model: &Model) -> Option<usize> {
+    let first = model.sorted_tasks().first().map(|t| t.id.clone())?;
+    model.tasks.iter().position(|t| t.id == first)
+}
+
+/// Sort key for a due date under `Due`: dated ascending, undated last. The
+/// leading flag does the sinking — `Option`'s own ordering would put `None`
+/// first — and every undated value compares equal, so a stable sort leaves the
+/// tail in stored order.
+fn due_key(due: Option<NaiveDate>) -> (bool, Option<NaiveDate>) {
+    (due.is_none(), due)
+}
+
+/// The `Due` key for a group: the earliest due date among its **incomplete**
+/// Tasks, so an urgent Subtask lifts its parent out of the tail. Completed Tasks
+/// never contribute — otherwise a row hidden by `show_completed` could set the
+/// group's position, and toggling the filter would reorder the pane.
+fn group_due_key(group: &[&Task]) -> Option<NaiveDate> {
+    group
+        .iter()
+        .filter(|t| t.status != Status::Completed)
+        .filter_map(|t| t.due)
+        .min()
 }
 
 /// Everything that can happen. Keys plus worker results.
@@ -486,8 +556,12 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 // re-insert when it's genuinely absent, so we can't duplicate.
                 if !model.tasks.iter().any(|t| t.id == previous.id) {
                     let at = index.min(model.tasks.len());
+                    let restored = previous.id.clone();
                     model.tasks.insert(at, previous);
-                    clamp_task_selection(model);
+                    // A rolled-back delete should leave the user looking at what
+                    // came back, wherever the active lens puts it.
+                    model.selected_task = model.tasks.iter().position(|t| t.id == restored);
+                    reselect_visible(model);
                 }
             }
             model.status_line = Some(reason);
@@ -505,8 +579,13 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             Vec::new()
         }
         Message::TaskAddFailed { temp, reason } => {
+            // Pick the successor before dropping the placeholder — afterwards it
+            // has no display position to anchor from.
+            let successor = display_successor(model, &temp);
             model.tasks.retain(|t| t.id != temp);
-            clamp_task_selection(model);
+            model.selected_task =
+                successor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            reselect_visible(model);
             model.status_line = Some(reason);
             Vec::new()
         }
@@ -688,13 +767,12 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
         .and_then(|i| model.tasks.get(i))
         .map(|t| t.id.clone());
     model.tasks = tasks;
-    model.selected_task = if model.tasks.is_empty() {
-        None
-    } else {
-        previously_selected
-            .and_then(|id| model.tasks.iter().position(|t| t.id == id))
-            .or(Some(0))
-    };
+    // Keep the cursor on the same Task; if it is gone, fall back to the first
+    // *displayed* row rather than stored index 0, which is an arbitrary row in
+    // every lens but Manual.
+    model.selected_task = previously_selected
+        .and_then(|id| model.tasks.iter().position(|t| t.id == id))
+        .or_else(|| first_displayed_index(model));
     // Don't leave the cursor on a Task hidden by the completed filter.
     reselect_visible(model);
 }
@@ -768,10 +846,13 @@ fn open_add_task(model: &mut Model) {
     }
 }
 
-/// Optimistically insert a placeholder Task at the top (Google adds new Tasks to
-/// the top of a List) and request the insert. The placeholder carries a `temp-N`
-/// id; the server Task replaces it via `TaskInserted`. Exact position reconciles
-/// on the next refresh.
+/// Optimistically insert a placeholder Task at the top of **stored** order
+/// (Google adds new Tasks to the top of a List) and request the insert. Where it
+/// *renders* is up to the active lens: the placeholder carries no due date, so
+/// under `Due` it appears in the undated tail rather than the first row. The
+/// cursor follows it either way. The placeholder carries a `temp-N` id; the
+/// server Task replaces it via `TaskInserted`. Exact position reconciles on the
+/// next refresh.
 fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
     let title = buffer.trim().to_string();
     if title.is_empty() {
@@ -856,15 +937,27 @@ fn add_task_placeholder(
     }]
 }
 
-/// Preconditions shared by every Move: the task pane focused, Manual sort (Sort
-/// views are read-only — a Move writes `position`), an active List, a selection,
-/// and no Move already in flight. Returns `(list, selected index)` when allowed.
+/// Preconditions shared by every Move, checked in this order: the task pane
+/// focused, an active List, a selection, no Move already in flight, no field
+/// write in flight, and finally Manual sort.
+///
+/// The order is load-bearing. The sort check comes **last** because it is the
+/// only one that mutates state: from a Sort view it switches the pane to
+/// `Manual`, reports the switch, and returns `None` without moving anything —
+/// the Move lands on the *next* press, against the adjacency the user can now
+/// see. Every verb computes over stored order (`indent` picks the previous
+/// top-level Task by Vec index, `reorder` swaps sibling slots), so applying a
+/// Move while a Sort view is displayed would reorder against rows that were
+/// off-screen. Putting the switch after the other guards keeps a Move refused
+/// for any other reason from disturbing the lens.
+///
+/// Three outcomes:
+/// - `Some((list, selected index))` — go ahead;
+/// - `None` with a status line — refused (Move/write in flight), or the lens was
+///   just switched to `Manual` and the user should press again;
+/// - `None` silently — nothing to act on (unfocused, no List, no selection).
 fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
     if model.focus != Focus::Tasks {
-        return None;
-    }
-    if model.sort != SortView::Manual {
-        model.status_line = Some("reordering is only available in manual order (s)".to_string());
         return None;
     }
     let list = model.selected_list_id().cloned()?;
@@ -877,6 +970,11 @@ fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
     // reconcile would clobber that optimistic edit before it lands.
     if model.pending_writes.contains_key(&model.tasks[idx].id) {
         model.status_line = Some("a write is already in progress for this task".to_string());
+        return None;
+    }
+    if model.sort != SortView::Manual {
+        model.sort = SortView::Manual;
+        model.status_line = Some("switched to manual order — press again to move".to_string());
         return None;
     }
     Some((list, idx))
@@ -1323,9 +1421,12 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
                 return Vec::new();
             };
+            let successor = display_successor(model, &task);
             let removed = model.tasks.remove(index); // optimistic delete
             model.pending_deletes.insert(task.clone(), (index, removed));
-            clamp_task_selection(model);
+            model.selected_task =
+                successor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+            reselect_visible(model);
             vec![Command::DeleteTask { list, task }]
         }
         ConfirmAction::DeleteList { list } => {
@@ -1378,15 +1479,6 @@ fn clamp_list_selection(model: &mut Model) {
     };
 }
 
-/// Keep `selected_task` in range after the Task set shrinks.
-fn clamp_task_selection(model: &mut Model) {
-    model.selected_task = if model.tasks.is_empty() {
-        None
-    } else {
-        Some(model.selected_task.unwrap_or(0).min(model.tasks.len() - 1))
-    };
-}
-
 /// Toggle the selected Task's completion optimistically and request the
 /// write-through. A no-op unless the task pane is focused with a Task selected.
 fn toggle_complete(model: &mut Model) -> Vec<Command> {
@@ -1405,12 +1497,23 @@ fn toggle_complete(model: &mut Model) -> Vec<Command> {
         return Vec::new();
     }
     let snapshot = model.tasks[index].clone();
-    let completed = model.tasks[index].status == Status::NeedsAction; // completing iff open
+    // Completing iff open.
+    let completed = model.tasks[index].status == Status::NeedsAction;
+    // Completing a Task while completed are hidden drops it from view, so the
+    // cursor moves onto the next visible Task (the Google-app behaviour). Take
+    // that successor *before* the status changes: completing empties the Task's
+    // group key, which sinks it to the undated tail, and scanning from there
+    // would anchor on the row before its new position instead of the next one
+    // by due date.
+    let hides_it = completed && !model.show_completed;
+    let successor = hides_it.then(|| display_successor(model, &id)).flatten();
+
     set_completed(&mut model.tasks[index], completed);
     model.pending_writes.insert(id.clone(), snapshot);
-    // Completing a Task while completed are hidden drops it from view; move the
-    // cursor onto the next visible Task (the Google-app behaviour).
-    if completed && !model.show_completed {
+    if hides_it {
+        if let Some(next) = successor {
+            model.selected_task = model.tasks.iter().position(|t| t.id == next);
+        }
         reselect_visible(model);
     }
     vec![Command::SetCompleted {
@@ -1456,26 +1559,38 @@ fn move_task_cursor(model: &mut Model, delta: isize) {
     model.selected_task = model.tasks.iter().position(|t| t.id == target);
 }
 
-/// Ensure `selected_task` points at a visible Task. Keeps the current selection
-/// when it is visible; otherwise moves to the nearest visible Task at or after
-/// it, then the nearest before it, then `None` when nothing is visible.
+/// Ensure `selected_task` points at a visible Task, re-anchoring in **display**
+/// order so the cursor lands where the eye is — under a Sort view the stored
+/// neighbour is an arbitrary row.
+///
+/// - Keeps the current selection when its Task is still visible.
+/// - Otherwise takes the nearest visible Task at or after it in display order,
+///   then the nearest before it.
+/// - With no usable selection — `None`, or an index past the end after the Task
+///   set shrank — anchors on the first visible Task in display order. (Stored
+///   index 0, the old clamp, is an arbitrary row in every lens but Manual.)
+/// - `None` when nothing is visible.
 fn reselect_visible(model: &mut Model) {
-    if model.tasks.is_empty() {
-        model.selected_task = None;
-        return;
-    }
-    if let Some(i) = model.selected_task {
-        if i < model.tasks.len() && model.is_visible(&model.tasks[i]) {
+    let ordered = model.sorted_tasks();
+    // Display position of the current selection, if it still resolves to a Task.
+    let start = model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
+
+    if let Some(pos) = start {
+        if model.is_visible(ordered[pos]) {
             return;
         }
     }
-    let start = model.selected_task.unwrap_or(0).min(model.tasks.len() - 1);
-    let forward = (start..model.tasks.len()).find(|&i| model.is_visible(&model.tasks[i]));
-    model.selected_task = forward.or_else(|| {
-        (0..start)
-            .rev()
-            .find(|&i| model.is_visible(&model.tasks[i]))
-    });
+    let from = start.unwrap_or(0);
+    let anchor = ordered[from..]
+        .iter()
+        .find(|t| model.is_visible(t))
+        .or_else(|| ordered[..from].iter().rev().find(|t| model.is_visible(t)))
+        .map(|t| t.id.clone());
+
+    model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
 }
 
 fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {

@@ -35,7 +35,8 @@ pub enum Action {
     // Manual Refresh: re-pull the List set (and, via the cascade, the active
     // List's Tasks) from Google. Modeless — it is not gated on a pane.
     Refresh,
-    // Subtasks & reorder — all Move operations (task pane, Manual order).
+    // Subtasks & reorder — all Move operations (task pane; a Move from a Sort
+    // view switches back to Manual first).
     AddSubtask,
     Indent,
     Outdent,
@@ -162,7 +163,7 @@ pub fn bindings() -> &'static [Binding] {
         Binding {
             key: KeyCode::Char('s'),
             action: Action::CycleSort,
-            help: "cycle sort (manual/due/title)",
+            help: "cycle sort (due/title/my order)",
         },
         Binding {
             key: KeyCode::Char('c'),

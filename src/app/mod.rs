@@ -400,14 +400,6 @@ impl Model {
         counts
     }
 
-    /// One parent's Subtask counts, or `None` if the pane nests nothing under it.
-    /// Builds its own `top_level` set — for single lookups, where clarity beats
-    /// sharing. The render path uses [`subtask_counts`](Self::subtask_counts).
-    pub fn subtask_meter(&self, parent: &TaskId) -> Option<(usize, usize)> {
-        let top_level = self.top_level_ids();
-        self.subtask_counts(&top_level).get(parent).copied()
-    }
-
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
     /// with Completed Tasks filtered out unless `show_completed` reveals them.
     /// The view renders this; the completion meter still counts over all `tasks`.

@@ -331,9 +331,11 @@ impl Cache {
 
     /// `(done, total)` per List over the mirrored Tasks, for the sidebar meters.
     ///
-    /// Covered by the `tasks_by_list` index, so it stays cheap enough to re-run
-    /// whenever the cache changes. Subtasks count alongside top-level Tasks —
-    /// the same definition the task-pane header meter uses, so the two agree.
+    /// The `tasks_by_list` index groups the scan by `list_id`, though `status`
+    /// is read from the rows themselves — it is not a covering index. Cheap
+    /// enough at personal scale to re-run whenever the cache changes. Subtasks
+    /// count alongside top-level Tasks — the same definition the task-pane
+    /// header meter uses, so the two agree.
     ///
     /// A List with no cached Tasks yields **no entry** rather than `(0, 0)`.
     /// That keeps "we have never seen this List's Tasks" indistinguishable from

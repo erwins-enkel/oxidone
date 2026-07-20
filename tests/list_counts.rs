@@ -339,6 +339,15 @@ fn an_empty_or_never_fetched_list_shows_no_meter() {
 
 // --------------------------------------------------- per-parent subtask counts
 
+/// One parent's Subtask counts, the way the renderer asks for them: over the
+/// `top_level` set that decides which rows are drawn indented.
+fn subtask_meter(m: &Model, parent: &str) -> Option<(usize, usize)> {
+    let top_level = m.top_level_ids();
+    m.subtask_counts(&top_level)
+        .get(&TaskId(parent.to_string()))
+        .copied()
+}
+
 /// Load `tasks` into a single-List Model, task pane focused.
 fn model_with(tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
@@ -356,8 +365,8 @@ fn a_parent_counts_only_its_own_subtasks() {
         task("other", Status::Completed, None),
     ]);
 
-    assert_eq!(m.subtask_meter(&TaskId("p".to_string())), Some((1, 2)));
-    assert_eq!(m.subtask_meter(&TaskId("other".to_string())), None);
+    assert_eq!(subtask_meter(&m, "p"), Some((1, 2)));
+    assert_eq!(subtask_meter(&m, "other"), None);
 }
 
 #[test]
@@ -373,7 +382,7 @@ fn the_meter_ignores_the_completed_filter() {
     ]);
 
     assert!(!m.show_completed);
-    assert_eq!(m.subtask_meter(&TaskId("p".to_string())), Some((2, 2)));
+    assert_eq!(subtask_meter(&m, "p"), Some((2, 2)));
     assert_eq!(m.visible_tasks().len(), 1, "only the parent is drawn");
 }
 
@@ -388,9 +397,9 @@ fn a_depth_two_task_is_nobodys_subtask() {
         task("deep", Status::Completed, Some("a1")),
     ]);
 
-    assert_eq!(m.subtask_meter(&TaskId("A".to_string())), Some((0, 1)));
-    assert_eq!(m.subtask_meter(&TaskId("a1".to_string())), None);
-    assert_eq!(m.subtask_meter(&TaskId("deep".to_string())), None);
+    assert_eq!(subtask_meter(&m, "A"), Some((0, 1)));
+    assert_eq!(subtask_meter(&m, "a1"), None);
+    assert_eq!(subtask_meter(&m, "deep"), None);
 }
 
 #[test]
@@ -402,6 +411,6 @@ fn an_orphan_and_its_child_are_both_their_own_groups() {
         task("child", Status::Completed, Some("orphan")),
     ]);
 
-    assert_eq!(m.subtask_meter(&TaskId("orphan".to_string())), None);
-    assert_eq!(m.subtask_meter(&TaskId("child".to_string())), None);
+    assert_eq!(subtask_meter(&m, "orphan"), None);
+    assert_eq!(subtask_meter(&m, "child"), None);
 }

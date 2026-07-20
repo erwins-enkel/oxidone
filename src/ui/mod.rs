@@ -413,7 +413,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Inline btop-style data widgets in the header: a completion meter for the
     // active List and a due-load strip. Both drop out (never the text) when the
     // pane is too narrow — braille degrades before the title (ADR-0006).
-    let inner_width = area.width.saturating_sub(2); // rounded borders
+    let inner_width = area.width.saturating_sub(PANEL_BORDERS);
     let title = header_title(&base, model, inner_width, ascii);
     render_selectable(frame, area, &title, items, selected, focused, theme);
 }

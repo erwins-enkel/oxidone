@@ -1055,8 +1055,17 @@ fn add_task_placeholder(
 /// see. Every verb computes over stored order (`indent` picks the previous
 /// top-level Task by Vec index, `reorder` swaps sibling slots), so applying a
 /// Move while a Sort view is displayed would reorder against rows that were
-/// off-screen. Putting the switch after the other guards keeps a Move refused
-/// for any other reason from disturbing the lens.
+/// off-screen. Ordering the switch last keeps the *in-flight* refusals — a Move
+/// or a field write already running — from disturbing the lens: those report and
+/// return with `sort` untouched.
+///
+/// It does **not** cover the verb-level refusals, which run after this function
+/// returns and so always see the lens already switched: `detached_reason`,
+/// "already a subtask", "not a subtask", "already first"/"already last". From a
+/// Sort view those take two presses — the first switches, the second refuses with
+/// the verb's own reason. That is intended: the refusal is about the row's
+/// position among its neighbours, which the user can only judge once the pane is
+/// showing the order the Move would act on.
 ///
 /// Three outcomes:
 /// - `Some((list, selected index))` — go ahead;

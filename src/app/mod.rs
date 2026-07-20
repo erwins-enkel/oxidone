@@ -1120,7 +1120,7 @@ fn refresh(model: &mut Model) -> Vec<Command> {
         model.status_line = Some(OFFLINE.to_string());
         return Vec::new();
     }
-    model.status_line = Some("refreshing...".to_string());
+    model.status_line = Some("refreshing…".to_string());
     vec![Command::RefreshLists]
 }
 

@@ -610,6 +610,7 @@ fn every_write_verb_refuses_on_an_orphan_with_the_same_reason() {
             task("B", None),
         ]);
         m.selected_task = Some(1);
+        assert!(!renders_as_subtask(&m.top_level_ids(), &m.tasks[1]));
         let before: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
 
         let cmds = update(&mut m, ch(verb));
@@ -623,6 +624,47 @@ fn every_write_verb_refuses_on_an_orphan_with_the_same_reason() {
         let after: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
         assert_eq!(after, before, "{verb} must not reparent anything");
     }
+}
+
+/// Depth-2 data (Google caps nesting at one level, so this is malformed): the
+/// pane draws it flush-left because `groups` cannot nest it, so the verbs must
+/// refuse too — and say the parent is a Subtask, not that it was deleted.
+#[test]
+fn every_write_verb_refuses_on_a_depth_two_task() {
+    for verb in ['o', '>', '<', 'J', 'K'] {
+        let mut m = model_with(vec![
+            task("A", None),
+            task("a1", Some("A")),
+            task("deep", Some("a1")),
+        ]);
+        m.selected_task = Some(2);
+        assert!(
+            !renders_as_subtask(&m.top_level_ids(), &m.tasks[2]),
+            "the pane draws it flush-left",
+        );
+
+        let cmds = update(&mut m, ch(verb));
+
+        assert!(cmds.is_empty(), "{verb} must not write to it");
+        assert_eq!(
+            m.status_line.as_deref(),
+            Some("its parent is a subtask — refresh (r)"),
+            "{verb} must name the real reason, not \"already a subtask\"",
+        );
+    }
+}
+
+/// A genuine Subtask is untouched by the detached rule: the verbs still work.
+#[test]
+fn a_real_subtask_is_not_treated_as_detached() {
+    let mut m = model_with(vec![task("A", None), task("a1", Some("A"))]);
+    m.selected_task = Some(1);
+    assert!(renders_as_subtask(&m.top_level_ids(), &m.tasks[1]));
+
+    let cmds = update(&mut m, ch('<')); // outdent works
+
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(m.tasks[1].parent, None);
 }
 
 /// The pane still shows it at top level — the refusal is about writing, not about

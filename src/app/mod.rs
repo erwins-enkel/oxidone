@@ -332,22 +332,33 @@ impl Model {
     }
 }
 
-/// Shown when a verb is refused because the selected row is orphaned.
+/// The parent was deleted locally and a Refresh has not caught up.
 const ORPHANED: &str = "its parent was deleted — refresh (r)";
+/// The parent is itself a Subtask — deeper than Google's one-level cap allows.
+const NESTED_TOO_DEEP: &str = "its parent is a subtask — refresh (r)";
 
-/// Whether `task` is orphaned: its `parent` names a Task no longer in the set,
-/// because the parent was deleted locally and a Refresh has not caught up.
+/// Why the verbs must refuse to write to `task`, if they must.
 ///
-/// Such a row draws flush-left (see [`renders_as_subtask`]) and groups as its own
-/// row, but it is *not* an ordinary top-level Task and no verb may write to it:
-/// Google deletes Subtasks along with their parent, so the row is very likely
-/// already gone server-side and any Move or insert we emit would race that. The
-/// verbs refuse with [`ORPHANED`] rather than nest a child under a row that is
-/// about to vanish, or Move against a `previous` id the server has dropped.
-fn is_orphaned(model: &Model, task: &Task) -> bool {
-    task.parent
-        .as_ref()
-        .is_some_and(|p| !model.tasks.iter().any(|t| &t.id == p))
+/// A row is *detached* when it carries a `parent` that the pane does not draw it
+/// under — which is exactly when [`renders_as_subtask`] is false while `parent`
+/// is set, and exactly the rows [`Model::groups`] emits as their own group. Both
+/// cases are transient or malformed, and writing to either is unsafe:
+///
+/// - the parent is **gone**: Google deletes Subtasks along with their parent, so
+///   the row is very likely already deleted server-side and any Move or insert
+///   would race that;
+/// - the parent is **itself a Subtask**: depth-2 data Google's one-level cap
+///   should make impossible, so there is nothing sound to nest or reorder under.
+///
+/// Keeping this on the same rule the display uses is the point: a row drawn
+/// flush-left must never be told it is "already a subtask", and one drawn
+/// indented must never be refused as detached.
+fn detached_reason(model: &Model, task: &Task) -> Option<&'static str> {
+    let parent = task.parent.as_ref()?;
+    if !model.tasks.iter().any(|t| &t.id == parent) {
+        return Some(ORPHANED);
+    }
+    (!renders_as_subtask(&model.top_level_ids(), task)).then_some(NESTED_TOO_DEEP)
 }
 
 /// Whether `task` should render indented, given `top_level` from the same Model
@@ -954,8 +965,8 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    if is_orphaned(model, task) {
-        model.status_line = Some(ORPHANED.to_string());
+    if let Some(reason) = detached_reason(model, task) {
+        model.status_line = Some(reason.to_string());
         return;
     }
     // A Subtask adds a sibling under its own parent; a top-level Task parents it.
@@ -1078,8 +1089,8 @@ fn indent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    if is_orphaned(model, &model.tasks[idx]) {
-        model.status_line = Some(ORPHANED.to_string());
+    if let Some(reason) = detached_reason(model, &model.tasks[idx]) {
+        model.status_line = Some(reason.to_string());
         return Vec::new();
     }
     if model.tasks[idx].parent.is_some() {
@@ -1124,8 +1135,8 @@ fn outdent(model: &mut Model) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    if is_orphaned(model, &model.tasks[idx]) {
-        model.status_line = Some(ORPHANED.to_string());
+    if let Some(reason) = detached_reason(model, &model.tasks[idx]) {
+        model.status_line = Some(reason.to_string());
         return Vec::new();
     }
     let Some(parent_id) = model.tasks[idx].parent.clone() else {
@@ -1153,8 +1164,8 @@ fn reorder(model: &mut Model, dir: isize) -> Vec<Command> {
     let Some((list, idx)) = move_preconditions(model) else {
         return Vec::new();
     };
-    if is_orphaned(model, &model.tasks[idx]) {
-        model.status_line = Some(ORPHANED.to_string());
+    if let Some(reason) = detached_reason(model, &model.tasks[idx]) {
+        model.status_line = Some(reason.to_string());
         return Vec::new();
     }
     let parent = model.tasks[idx].parent.clone();

@@ -19,7 +19,8 @@ a Tasks costume.
 ## Features (target v1)
 
 - Multiple lists in a two-pane layout (list sidebar + task pane)
-- Modeless single-key keybindings (`lazygit`-style), with a `?` cheatsheet
+- Modeless single-key keybindings (`lazygit`-style), with a `?` cheatsheet and
+  an always-visible legend of the most common keys for the focused pane
 - Create / complete / edit / delete tasks; un-complete; clear completed
 - Subtasks (one level, matching Google), indent/outdent, manual reorder
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown

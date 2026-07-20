@@ -4,7 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Focus, Message, Model, Overlay};
-use oxidone::keymap::{self, Action};
+use oxidone::keymap::{self, Action, LegendContext, LegendKeys};
 
 fn press(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -200,4 +200,95 @@ fn help_overlay_is_generated_from_the_binding_table() {
 
 fn key_ev(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::empty())
+}
+
+// --- The always-visible legend -------------------------------------------
+//
+// A second, curated view of the same binding table. These cover the tables and
+// their key derivation; the fitting and rendering live in `ui` (private, tested
+// inline) and `tests/legend_render.rs`.
+
+/// Every context, so a new one can't skip the guards below.
+const CONTEXTS: [LegendContext; 4] = [
+    LegendContext::Tasks,
+    LegendContext::Sidebar,
+    LegendContext::TextInput,
+    LegendContext::Confirm,
+];
+
+#[test]
+fn every_derived_legend_action_is_bound() {
+    // Without this, deleting a binding leaves a legend cell rendering a bare
+    // label with no key — a silent lie rather than a build error.
+    let cells = CONTEXTS
+        .iter()
+        .flat_map(|c| keymap::legend(*c))
+        .chain(std::iter::once(&keymap::HELP));
+    for cell in cells {
+        if let LegendKeys::Derived(actions) = cell.keys {
+            for action in actions {
+                assert!(
+                    keymap::bindings().iter().any(|b| b.action == *action),
+                    "legend cell {:?} names unbound {action:?}",
+                    cell.label
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn derived_keys_take_the_first_binding_in_slice_order() {
+    // Three shapes, each load-bearing. The pairs must read letter-then-letter
+    // (the arrow aliases are bound second), and in the slice's order — spelling
+    // the navigation cell `[SelectPrev, SelectNext]` would render "k/j".
+    let cell = |actions: &'static [Action]| keymap::LegendEntry {
+        keys: LegendKeys::Derived(actions),
+        label: "x",
+    };
+    assert_eq!(
+        cell(&[Action::SelectNext, Action::SelectPrev]).key_text(),
+        "j/k"
+    );
+    assert_eq!(
+        cell(&[Action::FocusLeft, Action::FocusRight]).key_text(),
+        "h/l"
+    );
+    // `Enter` aliases `e` (a second binding for the same Action); first wins.
+    assert_eq!(cell(&[Action::EditTitle]).key_text(), "e");
+}
+
+#[test]
+fn each_pane_legend_carries_its_own_exclusive_verb() {
+    let tasks = keymap::legend(LegendContext::Tasks);
+    let sidebar = keymap::legend(LegendContext::Sidebar);
+
+    let names = |cells: &'static [keymap::LegendEntry], action: Action| {
+        cells.iter().any(|c| match c.keys {
+            LegendKeys::Derived(actions) => actions.contains(&action),
+            LegendKeys::Literal(_) => false,
+        })
+    };
+
+    assert!(names(tasks, Action::ToggleComplete));
+    assert!(!names(tasks, Action::AddList));
+    assert!(names(sidebar, Action::AddList));
+    assert!(!names(sidebar, Action::ToggleComplete));
+}
+
+#[test]
+fn overlay_legends_advertise_only_keys_the_overlay_handles() {
+    // While an overlay is up the reducer routes keys to `overlay_key` before
+    // the keymap, so a pane verb here would be false.
+    let text: Vec<String> = keymap::legend(LegendContext::TextInput)
+        .iter()
+        .map(|c| c.text())
+        .collect();
+    assert_eq!(text, ["Enter save", "Esc cancel"]);
+
+    let confirm: Vec<String> = keymap::legend(LegendContext::Confirm)
+        .iter()
+        .map(|c| c.text())
+        .collect();
+    assert_eq!(confirm, ["y yes", "n no", "Esc cancel"]);
 }

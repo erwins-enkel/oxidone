@@ -1,7 +1,8 @@
 //! Rendering. A pure `view(&Model)` over ratatui. btop structural language
 //! (rounded panels) with a Catppuccin palette (ADR-0006). Two-pane: List
-//! sidebar + task pane, with a one-line status bar. The `?` overlay is drawn
-//! straight from the keymap table.
+//! sidebar + task pane, a one-line status bar, and an always-visible hotkey
+//! legend below it. Both the `?` overlay and the legend are drawn straight from
+//! the keymap table — the legend as a curated, priority-ordered subset.
 
 pub mod theme;
 pub mod widgets;
@@ -31,9 +32,15 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::new().bg(theme.base)), area);
 
-    // Content row + a single status line at the bottom.
-    let [content, status] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    // Content row, a status line, then the always-visible hotkey legend. The
+    // legend gets its own row rather than sharing the status line so a transient
+    // message never hides it.
+    let [content, status, legend] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -42,6 +49,7 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     render_sidebar(frame, panes[0], model, theme);
     render_task_pane(frame, panes[1], model, ascii, theme);
     render_status(frame, status, model, theme);
+    render_legend(frame, legend, model, theme);
 
     if model.show_help {
         render_help(frame, area, theme);
@@ -270,6 +278,126 @@ fn render_status(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
+/// Columns between adjacent legend cells, and between the last cell and the
+/// pinned help. Matches the `"  "` joins the pane header uses.
+const LEGEND_GAP: usize = 2;
+
+/// Rendered width of the pinned help cell. A function, not a `const`, because
+/// `str::chars` is not a const fn — and deriving it beats writing `6`, which
+/// would drift the moment the label changes.
+fn help_width() -> usize {
+    keymap::HELP.text().chars().count()
+}
+
+/// Which legend the model's state calls for. An open overlay wins over pane
+/// focus: `update` routes keys to `overlay_key` before the keymap, so every
+/// pane verb is false while one is up.
+///
+/// `show_help` is deliberately not consulted — it is a plain flag that does not
+/// gate `keymap::resolve`, so the pane's verbs keep firing underneath the
+/// cheatsheet and the legend stays true.
+fn legend_context(model: &Model) -> keymap::LegendContext {
+    match &model.overlay {
+        Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
+        Some(_) => keymap::LegendContext::TextInput,
+        None => match model.focus {
+            Focus::Tasks => keymap::LegendContext::Tasks,
+            Focus::Sidebar => keymap::LegendContext::Sidebar,
+        },
+    }
+}
+
+/// The leading cells that fit in `width` once `reserved` columns are spoken
+/// for, and the columns they occupy. Cells are taken left to right — their
+/// order is their priority — and the first that does not fit stops the run, so
+/// the tail drops whole rather than truncating mid-word or back-filling with a
+/// shorter cell further down.
+///
+/// The width comes back with the slice so the caller never re-derives it: two
+/// copies of this arithmetic would be two things to keep in step.
+///
+/// `reserved` covers the pinned help *and* the gap before it; overlay contexts
+/// pass 0, so they are charged for neither.
+fn fit_legend(
+    cells: &[keymap::LegendEntry],
+    reserved: usize,
+    width: usize,
+) -> (&[keymap::LegendEntry], usize) {
+    // Saturating: a bare subtraction underflows for any width below `reserved`,
+    // which in release would wrap to a budget large enough to "fit" everything.
+    let budget = width.saturating_sub(reserved);
+    let mut used = 0;
+    let mut taken = 0;
+    for cell in cells {
+        let cost = cell.text().chars().count() + if taken == 0 { 0 } else { LEGEND_GAP };
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        taken += 1;
+    }
+    (&cells[..taken], used)
+}
+
+/// A cell as two spans: the keys in the accent colour, the label dimmer, so the
+/// row scans as keys first.
+fn legend_cell_spans(cell: &keymap::LegendEntry, theme: &Theme) -> [Span<'static>; 2] {
+    [
+        Span::styled(cell.key_text(), Style::new().fg(theme.accent)),
+        Span::styled(format!(" {}", cell.label), Style::new().fg(theme.subtext)),
+    ]
+}
+
+/// The legend row: the cells that fit, then — in pane contexts — the help cell
+/// pushed flush against the right edge, which keeps it in one place as the
+/// terminal resizes and cells drop away.
+///
+/// No leading space: `render_status` draws flush at column 0 and the panels
+/// above start there too, so an indent here would sit visibly out of line.
+fn legend_spans(
+    cells: &[keymap::LegendEntry],
+    pinned: bool,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let reserved = if pinned { help_width() + LEGEND_GAP } else { 0 };
+    let (fitted, used) = fit_legend(cells, reserved, width);
+
+    let mut spans = Vec::new();
+    for cell in fitted {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" ".repeat(LEGEND_GAP)));
+        }
+        spans.extend(legend_cell_spans(cell, theme));
+    }
+
+    // Below the help cell's own width there is nowhere to put it; the row then
+    // carries whatever cells fit, or nothing at all.
+    if !pinned || width < help_width() {
+        return spans;
+    }
+    let pad = width.saturating_sub(help_width() + used);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(legend_cell_spans(&keymap::HELP, theme));
+    spans
+}
+
+/// The always-visible hotkey legend.
+fn render_legend(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
+    let context = legend_context(model);
+    // Overlays get no pinned help: `?` would type a literal `?` into the buffer
+    // rather than opening the cheatsheet.
+    let pinned = matches!(
+        context,
+        keymap::LegendContext::Tasks | keymap::LegendContext::Sidebar
+    );
+    let spans = legend_spans(keymap::legend(context), pinned, area.width as usize, theme);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.base).fg(theme.subtext)),
+        area,
+    );
+}
+
 fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     let rows: Vec<Line> = keymap::bindings()
         .iter()
@@ -375,5 +503,138 @@ mod tests {
             &theme,
         );
         assert_eq!(style.fg, Some(theme.subtext));
+    }
+
+    // --- Legend: fitting, row assembly, and context ----------------------
+
+    /// The row as the terminal would show it, assembled the same way
+    /// `render_legend` assembles it — one path, so a test can't drift from
+    /// what renders.
+    fn legend_text(context: keymap::LegendContext, pinned: bool, width: usize) -> String {
+        let theme = Theme::from_flavor("mocha");
+        legend_spans(keymap::legend(context), pinned, width, &theme)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    fn tasks_cells() -> &'static [keymap::LegendEntry] {
+        keymap::legend(keymap::LegendContext::Tasks)
+    }
+
+    #[test]
+    fn a_wide_terminal_fits_every_cell() {
+        let cells = tasks_cells();
+        assert_eq!(fit_legend(cells, 0, 500).0.len(), cells.len());
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_from_the_right() {
+        let cells = tasks_cells();
+        let (fitted, _) = fit_legend(cells, help_width() + LEGEND_GAP, 40);
+        assert!(fitted.len() < cells.len(), "expected cells to drop");
+        // Whatever survives is the priority prefix, never a reshuffle.
+        for (kept, original) in fitted.iter().zip(cells) {
+            assert_eq!(kept.text(), original.text());
+        }
+    }
+
+    #[test]
+    fn widths_below_the_reserve_yield_no_cells_and_do_not_panic() {
+        // This range is exactly where an unsaturated `width - reserved` would
+        // underflow: a panic in debug, and in release a wrap to a budget large
+        // enough to "fit" the whole table into a handful of columns.
+        let reserved = help_width() + LEGEND_GAP;
+        for width in 0..=reserved {
+            assert!(
+                fit_legend(tasks_cells(), reserved, width).0.is_empty(),
+                "width {width} should fit nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpinned_context_is_charged_for_no_help_gap() {
+        // Overlay rows draw no help cell, so they must not pay for the gap
+        // before one. At this width the reserve is the only difference.
+        let cells = keymap::legend(keymap::LegendContext::Confirm);
+        let width = cells[0].text().chars().count();
+        assert_eq!(fit_legend(cells, 0, width).0.len(), 1);
+        assert!(fit_legend(cells, help_width() + LEGEND_GAP, width)
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_help_is_empty() {
+        for width in 0..help_width() {
+            assert_eq!(
+                legend_text(keymap::LegendContext::Tasks, true, width),
+                "",
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_that_fits_only_help_carries_it_alone() {
+        // No cell fits yet, so the row is help and nothing else — still flush
+        // right, which at widths above its own is padding, not an indent.
+        for width in help_width()..=help_width() + LEGEND_GAP {
+            let row = legend_text(keymap::LegendContext::Tasks, true, width);
+            assert_eq!(row.chars().count(), width, "width {width}");
+            assert_eq!(row.trim_start(), keymap::HELP.text(), "width {width}");
+        }
+    }
+
+    #[test]
+    fn help_is_pinned_flush_against_the_right_edge() {
+        let row = legend_text(keymap::LegendContext::Tasks, true, 80);
+        assert_eq!(row.chars().count(), 80);
+        assert!(row.ends_with(&keymap::HELP.text()));
+        assert!(!row.starts_with(' '), "no leading space");
+    }
+
+    #[test]
+    fn an_overlay_context_maps_from_the_overlay_not_the_focus() {
+        let mut model = Model::new();
+        model.focus = Focus::Tasks;
+
+        model.overlay = Some(Overlay::AddTask {
+            buffer: String::new(),
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::TextInput);
+
+        model.overlay = Some(Overlay::Confirm(crate::app::Confirm {
+            prompt: "sure?".into(),
+            action: crate::app::ConfirmAction::DeleteList {
+                list: ListId("l".into()),
+            },
+        }));
+        assert_eq!(legend_context(&model), keymap::LegendContext::Confirm);
+    }
+
+    #[test]
+    fn without_an_overlay_the_context_follows_the_focused_pane() {
+        let mut model = Model::new();
+        model.overlay = None;
+
+        model.focus = Focus::Tasks;
+        assert_eq!(legend_context(&model), keymap::LegendContext::Tasks);
+
+        model.focus = Focus::Sidebar;
+        assert_eq!(legend_context(&model), keymap::LegendContext::Sidebar);
+    }
+
+    #[test]
+    fn the_cheatsheet_being_open_does_not_change_the_legend() {
+        // `show_help` is a plain flag, not an Overlay: it does not gate
+        // `keymap::resolve`, so the pane's verbs keep firing underneath it and
+        // the legend must keep telling the truth.
+        let mut model = Model::new();
+        model.focus = Focus::Tasks;
+        let before = legend_context(&model);
+        model.show_help = true;
+        assert_eq!(legend_context(&model), before);
     }
 }

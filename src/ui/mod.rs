@@ -1772,6 +1772,21 @@ mod tests {
         model
     }
 
+    /// `model_with`, plus a selected List — so `list_meter` takes its live
+    /// branch instead of falling through to the cached counts.
+    fn model_with_active_list(tasks: Vec<Task>) -> (Model, ListId) {
+        let id = ListId("l".into());
+        let mut model = model_with(tasks);
+        model.lists = vec![crate::domain::List {
+            id: id.clone(),
+            title: "L".into(),
+            etag: String::new(),
+            updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }];
+        model.selected_list = Some(0);
+        (model, id)
+    }
+
     #[test]
     fn every_signifier_occupies_the_same_cell() {
         // Derived, not a magic constant: whatever width `Task`'s blank is, the
@@ -1848,5 +1863,58 @@ mod tests {
         );
         // Task + Event, not the Note.
         assert_eq!(counts[0], 2, "{counts:?}");
+    }
+
+    #[test]
+    fn the_header_and_sidebar_meters_agree_for_the_active_list() {
+        // `Model::list_meter` promises the two meters for the active List always
+        // agree. Entry types can break that promise from one side: the header
+        // counts only Task-typed entries, so a sidebar row counting Events
+        // beside it would contradict the row it sits next to — two numbers for
+        // one List, on screen at once.
+        let (model, list) = model_with_active_list(vec![
+            titled("alpha", None, Status::NeedsAction),
+            titled("beta", None, Status::Completed),
+            titled(
+                &EntryType::Event.apply("standup"),
+                None,
+                Status::NeedsAction,
+            ),
+            titled(&EntryType::Note.apply("jotting"), None, Status::Completed),
+        ]);
+
+        let (done, total) = model.list_meter(&list).expect("an active-List meter");
+        assert_eq!(
+            (done, total),
+            (1, 2),
+            "the sidebar must skip the Event and the Note"
+        );
+        assert!(
+            header_title("Tasks", &model, 200, true).contains(&format!(" {done}/{total}")),
+            "header and sidebar disagree for the same List"
+        );
+    }
+
+    #[test]
+    fn a_subtask_meter_skips_typed_children() {
+        // Same argument one level down: a Note nested under a parent is a
+        // jotting about it, not a step toward it.
+        let parent = titled("parent", None, Status::NeedsAction);
+        let mut done_child = titled("step", None, Status::Completed);
+        done_child.id = TaskId("c1".into());
+        done_child.parent = Some(parent.id.clone());
+        let mut note_child = titled(&EntryType::Note.apply("aside"), None, Status::NeedsAction);
+        note_child.id = TaskId("c2".into());
+        note_child.parent = Some(parent.id.clone());
+
+        let model = model_with(vec![parent.clone(), done_child, note_child]);
+        let top_level = model.top_level_ids();
+        let counts = model.subtask_counts(&top_level);
+
+        assert_eq!(
+            counts.get(&parent.id).copied(),
+            Some((1, 1)),
+            "the Note child should not be counted"
+        );
     }
 }

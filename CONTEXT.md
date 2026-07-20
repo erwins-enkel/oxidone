@@ -113,7 +113,9 @@ The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, bl
 _Avoid_: bullet, icon, marker (that is the link `⧉`).
 
 **Completion meter**:
-A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown today in the task-pane header for the active List; per-List sidebar meters and per-parent Subtask meters are follow-ups. Braille gives 8× horizontal resolution over a block bar.
+A braille-cell progress bar of done ÷ total over **Task**-typed entries only — Events and Notes are not work you finish, and counting them would make the meter permanently under-report. Shown in the task-pane header, per List in the sidebar, and per parent Task for its Subtasks. Braille gives 8× horizontal resolution over a block bar.
+
+The three agree for the **active** List, which derives its counts live from the loaded pane. A List you have not selected is counted in SQL over the mirror, which does not read the type prefix — so a background List holding Events or Notes reads high until you select it. Known seam, not a rounding error: teaching the query the encoding would be a second definition of it, free to drift from `EntryType::parse`.
 
 **Due-load**:
 A braille histogram of counts per upcoming day — the "workload ahead" strip. Counts Tasks and Events, not Notes. Deliberately narrower than the per-row due gutter, which shows a date for *any* dated entry: the gutter answers "does this carry a date?", the strip answers "how much is coming?".

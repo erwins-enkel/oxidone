@@ -89,6 +89,15 @@ documented precondition. (An empty title is reachable: `WireTask.title` is
   human-readable history (ADR-0007), not a mirror. `INSERT OR IGNORE` on
   `(task_id, completed_at)` means first observation wins, so a later retype or
   rename never reaches the logged row.
+- **Type-aware counting stops at the SQL boundary.** The task-pane header, the
+  active List's sidebar meter and the Subtask meters all count Task-typed entries
+  only, and agree because all three derive from the loaded pane. Sidebar counts
+  for *other* Lists come from a `GROUP BY` over the mirror (#64), which does not
+  read the prefix, so a background List holding Events or Notes reads high until
+  you select it. Teaching that query the encoding would put a second definition
+  of it in SQL — and a `LIKE '○ %'` would not even agree with `parse`, which
+  rejects a glyph with an empty remainder. Recounting every List in Rust instead
+  would undo the indexed scan #64 chose deliberately. Left as a seam.
 - **Nothing fails the build if a new `.title` read site is added.** The rule is:
   a `.title` site is raw unless it renders, sorts, prompts, or logs. Today that
   is enforced by a test per known site plus review. If a missed site ever ships,

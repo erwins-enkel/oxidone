@@ -356,14 +356,20 @@ impl Model {
     /// the active List shows its pre-delete count until the recount lands.
     pub fn list_meter(&self, list: &ListId) -> Option<(usize, usize)> {
         let (done, total) = if self.selected_list_id() == Some(list) && !self.tasks.is_empty() {
-            // Counted the same way the task-pane header counts, Subtasks
-            // included, so the two meters for this List always agree.
-            let done = self
-                .tasks
-                .iter()
+            // Counted the same way the task-pane header counts — Subtasks
+            // included, Events and Notes excluded — so the two meters for this
+            // List always agree. The type filter is what keeps that true: the
+            // header counts only actionable entries, and a sidebar row that
+            // counted Events beside it would contradict the row it sits next to.
+            let actionable = || {
+                self.tasks
+                    .iter()
+                    .filter(|t| t.entry_type() == EntryType::Task)
+            };
+            let done = actionable()
                 .filter(|t| t.status == Status::Completed)
                 .count();
-            (done, self.tasks.len())
+            (done, actionable().count())
         } else {
             *self.list_counts.get(list)?
         };
@@ -381,13 +387,17 @@ impl Model {
     /// Takes the caller's `top_level` set so the meter and the indent decision
     /// read the same data and cannot disagree — and so this stays one pass over
     /// `tasks` rather than a scan per row.
+    ///
+    /// Counts only Task-typed Subtasks, as the header and sidebar meters do: a
+    /// Note nested under a parent is a jotting about it, not a step toward it,
+    /// and counting it would hold the parent's meter below full forever.
     pub fn subtask_counts<'a>(
         &'a self,
         top_level: &HashSet<&'a TaskId>,
     ) -> HashMap<&'a TaskId, (usize, usize)> {
         let mut counts: HashMap<&TaskId, (usize, usize)> = HashMap::new();
         for task in &self.tasks {
-            if !renders_as_subtask(top_level, task) {
+            if !renders_as_subtask(top_level, task) || task.entry_type() != EntryType::Task {
                 continue;
             }
             let parent = task

@@ -216,12 +216,30 @@ fn key_ev(code: KeyCode) -> KeyEvent {
 // inline) and `tests/legend_render.rs`.
 
 /// Every context, so a new one can't skip the guards below.
-const CONTEXTS: [LegendContext; 4] = [
+const CONTEXTS: [LegendContext; 5] = [
     LegendContext::Tasks,
     LegendContext::Sidebar,
     LegendContext::TextInput,
     LegendContext::Confirm,
+    LegendContext::LinkPicker,
 ];
+
+#[test]
+fn contexts_covers_every_legend_context() {
+    // `CONTEXTS` is a fixed-size literal, so a new variant compiles fine here
+    // and silently shrinks every guard that iterates it — which is exactly what
+    // adding `LinkPicker` did. The match is what makes the array's claim true:
+    // a new variant now stops the build, right next to the array it belongs in.
+    for context in CONTEXTS {
+        match context {
+            LegendContext::Tasks
+            | LegendContext::Sidebar
+            | LegendContext::TextInput
+            | LegendContext::Confirm
+            | LegendContext::LinkPicker => {}
+        }
+    }
+}
 
 #[test]
 fn every_derived_legend_action_is_bound() {

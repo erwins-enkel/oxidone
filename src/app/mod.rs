@@ -106,6 +106,18 @@ pub struct Model {
     /// is reachable — with the network down it still reads `true` and the
     /// Refresh fails at the worker, landing on the status line.
     pub api_available: bool,
+    /// `(done, total)` per List, re-derived from the cache whenever it changes
+    /// (see the recount at the runtime's event edge). The sidebar reads this for
+    /// every List but the active one, which derives live from `tasks` so a
+    /// completion moves its meter in the same frame.
+    ///
+    /// May hold entries for Lists no longer in `lists` — they are unreachable,
+    /// since the sidebar only ever looks up Lists it is drawing, and the map is
+    /// replaced wholesale on the next recount.
+    ///
+    /// Private like the other reducer-owned bookkeeping: the view reads it
+    /// through [`Model::list_meter`], which decides live-versus-cached.
+    list_counts: HashMap<ListId, (usize, usize)>,
 }
 
 /// A modal overlay drawn over the panes.
@@ -199,6 +211,9 @@ impl Default for Model {
             editor_available: false,
             // Defaults to offline; the runtime stamps the real value.
             api_available: false,
+            // Seeded from the cache aggregate at startup, then re-derived on
+            // every cache change; empty until then means "no meters yet".
+            list_counts: HashMap::new(),
         }
     }
 }
@@ -322,6 +337,77 @@ impl Model {
             .collect()
     }
 
+    /// `(done, total)` for a List's sidebar meter, or `None` when there is
+    /// nothing honest to draw — the List is empty, or its Tasks have never been
+    /// cached. Both render as *absent*, because neither is "0% done".
+    ///
+    /// The active List derives **live** from `tasks`, so completing a Task moves
+    /// its meter in the same frame and a rolled-back write moves it back; the
+    /// cache cannot do that, since write-through only mirrors after Google
+    /// confirms. Every other List reads the recount map, which holds confirmed
+    /// state — so a failed write can never leave a wrong count behind.
+    ///
+    /// An empty pane falls through to the map rather than deriving `(0, 0)`:
+    /// between a List change and its `TasksLoaded` the pane is empty because
+    /// nothing has arrived, not because the List is. The cost is that emptying
+    /// the active List shows its pre-delete count until the recount lands.
+    pub fn list_meter(&self, list: &ListId) -> Option<(usize, usize)> {
+        let (done, total) = if self.selected_list_id() == Some(list) && !self.tasks.is_empty() {
+            // Counted the same way the task-pane header counts, Subtasks
+            // included, so the two meters for this List always agree.
+            let done = self
+                .tasks
+                .iter()
+                .filter(|t| t.status == Status::Completed)
+                .count();
+            (done, self.tasks.len())
+        } else {
+            *self.list_counts.get(list)?
+        };
+        (total > 0).then_some((done, total))
+    }
+
+    /// `(done, total)` of every row the pane draws **nested under** each parent.
+    ///
+    /// Keyed off `renders_as_subtask`, never a raw `parent`: a Task parented to a
+    /// Subtask, or to a parent absent from the List, draws flush-left as its own
+    /// group, so it is nobody's Subtask here either. Counting `parent` directly
+    /// would give such a row's parent a meter and credit it a child drawn
+    /// elsewhere.
+    ///
+    /// Takes the caller's `top_level` set so the meter and the indent decision
+    /// read the same data and cannot disagree — and so this stays one pass over
+    /// `tasks` rather than a scan per row.
+    pub fn subtask_counts<'a>(
+        &'a self,
+        top_level: &HashSet<&'a TaskId>,
+    ) -> HashMap<&'a TaskId, (usize, usize)> {
+        let mut counts: HashMap<&TaskId, (usize, usize)> = HashMap::new();
+        for task in &self.tasks {
+            if !renders_as_subtask(top_level, task) {
+                continue;
+            }
+            let parent = task
+                .parent
+                .as_ref()
+                .expect("renders_as_subtask implies a parent");
+            let entry = counts.entry(parent).or_insert((0, 0));
+            entry.1 += 1;
+            if task.status == Status::Completed {
+                entry.0 += 1;
+            }
+        }
+        counts
+    }
+
+    /// One parent's Subtask counts, or `None` if the pane nests nothing under it.
+    /// Builds its own `top_level` set — for single lookups, where clarity beats
+    /// sharing. The render path uses [`subtask_counts`](Self::subtask_counts).
+    pub fn subtask_meter(&self, parent: &TaskId) -> Option<(usize, usize)> {
+        let top_level = self.top_level_ids();
+        self.subtask_counts(&top_level).get(parent).copied()
+    }
+
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
     /// with Completed Tasks filtered out unless `show_completed` reveals them.
     /// The view renders this; the completion meter still counts over all `tasks`.
@@ -442,6 +528,10 @@ pub enum Message {
     Key(crossterm::event::KeyEvent),
     /// The current set of Lists (from cache at startup, or a refresh).
     ListsLoaded(Vec<List>),
+    /// Per-List `(done, total)` re-derived from the cache. Emitted at startup and
+    /// after every cache change, so it carries the whole picture rather than a
+    /// delta — the arm replaces `list_counts` outright.
+    CountsLoaded(HashMap<ListId, (usize, usize)>),
     /// The Tasks of a specific List. Ignored if that List is no longer active.
     TasksLoaded(ListId, Vec<Task>),
     /// A write succeeded; reconcile the Model with the server's Task.
@@ -613,6 +703,15 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             }
         }
         Message::ListsLoaded(lists) => set_lists(model, lists),
+        Message::CountsLoaded(counts) => {
+            // Replaced wholesale, and deliberately *not* filtered against
+            // `lists`: an entry for a List we no longer show is unreachable —
+            // the sidebar only looks up Lists it draws — so filtering would buy
+            // nothing while making this arm care whether it ran before or after
+            // `ListsLoaded`. Emits no Commands; the runtime relies on that.
+            model.list_counts = counts;
+            Vec::new()
+        }
         Message::TasksLoaded(list, tasks) => {
             set_tasks(model, &list, tasks);
             Vec::new()

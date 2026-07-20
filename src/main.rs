@@ -139,6 +139,8 @@ async fn run(
     model.api_available = api.is_some();
     let seed = update(&mut model, Message::ListsLoaded(initial_lists));
     seed_tasks_from_cache(&mut model, seed, &cache);
+    // Sidebar meters for every cached List, before anything touches the network.
+    recount(&cache, &mut model);
     if let Some(reason) = load_error {
         update(&mut model, Message::LoadFailed(reason));
     }
@@ -165,7 +167,19 @@ async fn run(
                 // reducer must not resolve "tomorrow" against the clock as it
                 // read when the frame was painted.
                 model.now = chrono::Local::now();
+                // Every worker mirrors into the cache *before* it sends, so one
+                // recount here sees every write, in order — no per-write-site
+                // list to keep in step. Keys are skipped because a keystroke
+                // never writes the cache: it may change the Model optimistically
+                // and emit a Command, but the write lands later in a worker,
+                // whose reply is not a Key and so recounts then. Some worker
+                // replies (a failure, say) wrote nothing either — recounting
+                // anyway costs one indexed query and keeps the rule simple.
+                let cache_may_have_changed = !matches!(msg, Message::Key(_));
                 let commands = update(&mut model, msg);
+                if cache_may_have_changed {
+                    recount(&cache, &mut model);
+                }
                 // `SpawnEditor` owns the terminal, so it runs here synchronously
                 // rather than in a background worker; its follow-up write joins the
                 // rest of the commands for the normal worker dispatch.
@@ -714,6 +728,27 @@ fn spawn_clear_completed(
         }
         let _ = tx.send(Message::ClearedCompleted(list));
     });
+}
+
+/// Re-derive the sidebar's per-List counts from the cache and fold them into the
+/// Model. The cache is their only source, so this runs wherever it may have
+/// changed — once, at the event edge, rather than at each write site.
+///
+/// Applied through `update`, never sent on the channel: a `CountsLoaded` arriving
+/// as an event would itself be an event worth recounting, and the two would feed
+/// each other forever. A read failure leaves the previous counts in place — stale
+/// meters beat blank ones, and the error is logged rather than swallowed.
+fn recount(cache: &SharedCache, model: &mut Model) {
+    match cache.lock().unwrap().list_counts() {
+        Ok(counts) => {
+            let commands = update(model, Message::CountsLoaded(counts));
+            debug_assert!(
+                commands.is_empty(),
+                "CountsLoaded must stay command-free; the recount drops its return"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to recount list totals"),
+    }
 }
 
 /// Seed the task pane from cache for the first frame. Each `LoadTasks` the seed

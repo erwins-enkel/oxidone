@@ -31,6 +31,17 @@ use widgets::{dueload, meter};
 const DUE_LOAD_DAYS: usize = 7;
 /// Braille/ASCII cells the header completion meter occupies.
 const HEADER_METER_WIDTH: u16 = 10;
+/// Cells a bordered pane spends on its own frame across the width: one per side.
+/// Anything budgeting a row's real text width must subtract it, along with
+/// [`LIST_CURSOR`]'s gutter.
+const PANEL_BORDERS: u16 = 2;
+/// Braille/ASCII cells a sidebar List row's completion meter occupies. Narrower
+/// than the header's: the sidebar is a 30% pane and the bar shares the row with
+/// the title it belongs to.
+const SIDEBAR_METER_WIDTH: u16 = 6;
+/// Braille/ASCII cells a parent Task row's Subtask meter occupies. Subtask counts
+/// are small, so a short bar reads them well enough — the ratio does the rest.
+const SUBTASK_METER_WIDTH: u16 = 4;
 
 /// Render the whole frame. Never mutates state. `ascii` reflects
 /// `config.ascii_fallback`: braille data widgets degrade to ASCII when set.
@@ -52,7 +63,7 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(content);
-    render_sidebar(frame, panes[0], model, theme);
+    render_sidebar(frame, panes[0], model, ascii, theme);
     render_task_pane(frame, panes[1], model, ascii, theme);
     render_status(frame, status, model, theme);
     render_legend(frame, legend, model, theme);
@@ -165,12 +176,19 @@ fn truncate(text: &str, width: usize) -> String {
     kept
 }
 
-fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
+fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Sidebar;
     let items: Vec<ListItem> = model
         .lists
         .iter()
-        .map(|l| ListItem::new(l.title.clone()))
+        .map(|l| {
+            ListItem::new(sidebar_row(
+                &l.title,
+                model.list_meter(&l.id),
+                area.width,
+                ascii,
+            ))
+        })
         .collect();
     render_selectable(
         frame,
@@ -183,10 +201,97 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     );
 }
 
+/// A sidebar row: the List title, then its completion meter flush right.
+///
+/// Degrades in two stages, braille before text (ADR-0006): the bar goes first,
+/// leaving the `done/total` that carries the actual number, and then that goes
+/// too. When nothing fits the title is returned **unchanged** — the sidebar has
+/// always let ratatui clip an over-long title, and right-aligning a meter is no
+/// reason to start truncating here.
+///
+/// `area_width` is the pane's full width; the borders and the cursor gutter come
+/// off inside, so callers cannot budget them wrongly.
+fn sidebar_row(
+    title: &str,
+    counts: Option<(usize, usize)>,
+    area_width: u16,
+    ascii: bool,
+) -> String {
+    let Some((done, total)) = counts else {
+        return title.to_string();
+    };
+    let usable =
+        (area_width.saturating_sub(PANEL_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
+    let title_width = title.width();
+
+    // Measured, not assumed: `103/247` is 7 columns where `3/8` is 3, and a
+    // hardcoded width would clip the bar on a busy List.
+    let ratio = format!("{done}/{total}");
+    let with_bar = 2 + SIDEBAR_METER_WIDTH as usize + 1 + ratio.width();
+    let text_only = 2 + ratio.width();
+
+    let segment = if title_width + with_bar <= usable {
+        format!(
+            "  {} {ratio}",
+            meter::render(done, total, SIDEBAR_METER_WIDTH, ascii)
+        )
+    } else if title_width + text_only <= usable {
+        format!("  {ratio}")
+    } else {
+        return title.to_string();
+    };
+
+    // Pad rather than truncate: `segment` is only ever appended when the title
+    // already fits alongside it.
+    let pad = usable - title_width - segment.width();
+    format!("{title}{}{segment}", " ".repeat(pad))
+}
+
 /// Width of the leading due-date column. Derived from the formatter's own
 /// contract rather than restated here, so the column can never be narrower than
 /// what `format_due_relative` may emit.
 const DUE_WIDTH: usize = crate::dateparse::MAX_RENDERED_WIDTH;
+
+/// The Subtask meter trailing a parent Task's row, or `""` when it will not fit.
+///
+/// Degrades in the same two stages as the sidebar's, braille before text
+/// (ADR-0006): the bar drops first, leaving `done/total`, then that drops too.
+///
+/// `area_width` is the whole pane; the borders, the cursor gutter and the due
+/// column come off inside. The gutter matters as much here as in the sidebar —
+/// the task pane goes through the same `render_selectable`, which spends it on
+/// every row — and leaving it out would clip the meter by two columns.
+fn subtask_segment(
+    counts: Option<(usize, usize)>,
+    area_width: u16,
+    due_gutter: bool,
+    title_width: usize,
+    marker_width: usize,
+    ascii: bool,
+) -> String {
+    let Some((done, total)) = counts else {
+        return String::new();
+    };
+    let gutter = if due_gutter { DUE_WIDTH + 2 } else { 0 };
+    let usable = (area_width.saturating_sub(PANEL_BORDERS) as usize)
+        .saturating_sub(LIST_CURSOR.width())
+        .saturating_sub(gutter);
+    let Some(room) = usable.checked_sub(title_width + marker_width) else {
+        return String::new();
+    };
+
+    let ratio = format!("{done}/{total}");
+    if 2 + SUBTASK_METER_WIDTH as usize + 1 + ratio.width() <= room {
+        format!(
+            "  {} {ratio}",
+            meter::render(done, total, SUBTASK_METER_WIDTH, ascii)
+        )
+    } else if 2 + ratio.width() <= room {
+        format!("  {ratio}")
+    } else {
+        String::new()
+    }
+}
 
 /// Indent prefix for a Subtask row (nesting is capped at one level).
 const SUBTASK_INDENT: &str = "  ";
@@ -226,6 +331,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Built once per render: the per-row indent check is then a hash lookup, not
     // a scan of every Task.
     let top_level = model.top_level_ids();
+    // Shares that set rather than deriving its own, so the meter counts exactly
+    // the rows the indent rule nests — and stays one pass over `tasks`.
+    let subtask_counts = model.subtask_counts(&top_level);
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -263,10 +371,32 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // aligned. Driven by the cheap predicate, not by collecting the
             // URLs: this runs for every visible row on every frame.
             let has_urls = links::has_openable_url(t.notes.as_deref().unwrap_or_default());
-            if let Some(marker) = link_marker(has_urls, ascii) {
+            let marker = link_marker(has_urls, ascii);
+            if let Some(marker) = marker {
                 // Inherits the row's style, so on a Completed Task it reads dim
                 // and struck-through with the title — its links still open.
                 spans.push(Span::styled(marker, style));
+            }
+            // The Subtask meter trails both, because the marker belongs to this
+            // Task's own text while the meter summarises the rows beneath it.
+            // The marker is never dropped for the meter's sake: it is not this
+            // widget's information to spend.
+            let segment = subtask_segment(
+                subtask_counts.get(&t.id).copied(),
+                area.width,
+                due_gutter,
+                t.title.width(),
+                marker.map_or(0, |m| m.width()),
+                ascii,
+            );
+            if !segment.is_empty() {
+                // The row's style *minus* the strike: braille struck through is
+                // unreadable, but dropping the style outright would leave the
+                // meter the brightest thing on a deliberately dimmed row.
+                spans.push(Span::styled(
+                    segment,
+                    style.remove_modifier(Modifier::CROSSED_OUT),
+                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -1398,5 +1528,163 @@ mod tests {
         let before = legend_context(&model);
         model.show_help = true;
         assert_eq!(legend_context(&model), before);
+    }
+
+    /// Usable row width for a sidebar of `area_width`, mirroring what
+    /// `sidebar_row` budgets against.
+    fn sidebar_usable(area_width: u16) -> usize {
+        (area_width.saturating_sub(PANEL_BORDERS) as usize) - LIST_CURSOR.width()
+    }
+
+    #[test]
+    fn a_sidebar_row_right_aligns_its_meter() {
+        let row = sidebar_row("Work", Some((3, 8)), 30, false);
+        assert_eq!(row.width(), sidebar_usable(30));
+        assert!(row.starts_with("Work"), "{row:?}");
+        assert!(row.ends_with(" 3/8"), "{row:?}");
+    }
+
+    #[test]
+    fn a_sidebar_row_without_counts_is_the_bare_title() {
+        assert_eq!(sidebar_row("Work", None, 30, false), "Work");
+    }
+
+    #[test]
+    fn a_sidebar_meter_drops_the_bar_before_the_numbers() {
+        // Braille degrades before text (ADR-0006): at a width that cannot hold
+        // both, the ratio is what survives — it carries the actual number.
+        let title = "A fairly long list";
+        let wide = sidebar_row(title, Some((3, 8)), 40, false);
+        assert!(
+            wide.contains('\u{2800}') || wide.contains('\u{28FF}'),
+            "{wide:?}"
+        );
+        assert!(wide.ends_with(" 3/8"));
+
+        let narrow = sidebar_row(title, Some((3, 8)), 28, false);
+        assert!(narrow.ends_with("3/8"), "{narrow:?}");
+        assert!(
+            !narrow.contains('\u{2800}') && !narrow.contains('\u{28FF}'),
+            "the bar should have gone first: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_meter_that_cannot_fit_leaves_the_title_untouched() {
+        // The sidebar has always let ratatui clip an over-long title; adding a
+        // meter must not turn that into truncation performed here.
+        let title = "A list whose name is far too long for this pane";
+        assert_eq!(sidebar_row(title, Some((3, 8)), 24, false), title);
+    }
+
+    #[test]
+    fn a_sidebar_meter_falls_back_to_ascii() {
+        let row = sidebar_row("Work", Some((4, 8)), 30, true);
+        assert!(row.contains('#') && row.contains('-'), "{row:?}");
+        assert!(
+            !row.contains('\u{2800}') && !row.contains('\u{28FF}'),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_meter_measures_wide_ratios() {
+        // `103/247` is seven cells where `3/8` is three; a hardcoded width would
+        // overrun the row here.
+        let row = sidebar_row("Work", Some((103, 247)), 40, false);
+        assert_eq!(row.width(), sidebar_usable(40));
+        assert!(row.ends_with(" 103/247"), "{row:?}");
+    }
+
+    #[test]
+    fn a_sidebar_row_never_exceeds_its_budget() {
+        for width in 0u16..=40 {
+            for counts in [None, Some((0, 0)), Some((3, 8)), Some((103, 247))] {
+                for ascii in [false, true] {
+                    let row = sidebar_row("Work", counts, width, ascii);
+                    // Either the bare title (ratatui clips it, as before) or a
+                    // composed row that fits exactly.
+                    assert!(
+                        row == "Work" || row.width() == sidebar_usable(width),
+                        "width {width}, counts {counts:?}, ascii {ascii}: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subtask_meter_degrades_bar_then_numbers_then_away() {
+        let full = subtask_segment(Some((2, 5)), 60, false, 10, 0, false);
+        assert!(
+            full.contains('\u{2800}') || full.contains('\u{28FF}'),
+            "{full:?}"
+        );
+        assert!(full.ends_with(" 2/5"));
+
+        let text_only = subtask_segment(Some((2, 5)), 22, false, 10, 0, false);
+        assert_eq!(text_only, "  2/5");
+
+        assert_eq!(subtask_segment(Some((2, 5)), 14, false, 10, 0, false), "");
+        assert_eq!(subtask_segment(None, 60, false, 10, 0, false), "");
+    }
+
+    #[test]
+    fn a_subtask_meter_yields_room_to_the_link_marker() {
+        // The marker is #57's information, not this widget's to spend, so the
+        // meter is what shrinks when both want the same columns. 25 is the width
+        // where the bar fits without a marker but not with one.
+        let width = 25;
+        let without = subtask_segment(Some((2, 5)), width, false, 10, 0, false);
+        let with = subtask_segment(Some((2, 5)), width, false, 10, 2, false);
+        assert!(without.width() > with.width(), "{without:?} vs {with:?}");
+    }
+
+    #[test]
+    fn a_subtask_meter_budgets_the_cursor_gutter_and_due_column() {
+        // The task pane goes through the same `render_selectable`, so it spends
+        // the cursor gutter on every row too. A segment that ignored it would
+        // clip by exactly that much.
+        let area = 40u16;
+        let title = 10;
+        let seg = subtask_segment(Some((2, 5)), area, true, title, 2, false);
+        let usable =
+            (area as usize - PANEL_BORDERS as usize) - LIST_CURSOR.width() - (DUE_WIDTH + 2);
+        assert!(
+            title + 2 + seg.width() <= usable,
+            "row overruns: title {title} + marker 2 + {seg:?} > {usable}"
+        );
+    }
+
+    #[test]
+    fn a_subtask_meter_never_exceeds_its_budget() {
+        for width in 0u16..=40 {
+            for due_gutter in [false, true] {
+                for marker in [0usize, 2] {
+                    for ascii in [false, true] {
+                        let title = 8usize;
+                        let seg = subtask_segment(
+                            Some((103, 247)),
+                            width,
+                            due_gutter,
+                            title,
+                            marker,
+                            ascii,
+                        );
+                        if seg.is_empty() {
+                            continue;
+                        }
+                        let gutter = if due_gutter { DUE_WIDTH + 2 } else { 0 };
+                        let usable = (width.saturating_sub(PANEL_BORDERS) as usize)
+                            .saturating_sub(LIST_CURSOR.width())
+                            .saturating_sub(gutter);
+                        assert!(
+                            title + marker + seg.width() <= usable,
+                            "width {width}, due {due_gutter}, marker {marker}: {seg:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

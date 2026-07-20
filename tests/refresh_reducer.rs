@@ -2,10 +2,15 @@
 //! refresh `Command`, the cascade reaches the active List's Tasks, and the pane
 //! survives it. `update` is pure — no terminal, no network.
 
+use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Focus, Message, Model, Overlay, OFFLINE};
 use oxidone::domain::{List, Task};
+
+fn titles(tasks: &[&Task]) -> Vec<String> {
+    tasks.iter().map(|t| t.title.clone()).collect()
+}
 
 fn press(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -135,4 +140,39 @@ async fn the_transient_status_clears_when_lists_arrive() {
     assert!(m.status_line.is_some());
     update(&mut m, Message::ListsLoaded(vec![list]));
     assert_eq!(m.status_line, None);
+}
+
+/// `r` is a modeless keypress, so the `set_tasks` fallback is reachable in one
+/// key: refresh, and Google no longer has the Task the cursor was on. The cursor
+/// must land on the first *displayed* row — under the default Due lens that is
+/// the soonest-due Task, not stored index 0.
+#[tokio::test]
+async fn a_refresh_that_drops_the_selected_task_anchors_the_first_displayed() {
+    let (list, mut tasks) = list_with_tasks(&["c", "a", "b"]).await;
+    // Dates make display order differ from stored order: the pane reads b, a, c.
+    tasks[1].due = NaiveDate::from_ymd_opt(2026, 8, 1);
+    tasks[2].due = NaiveDate::from_ymd_opt(2026, 7, 21);
+
+    let mut m = Model::new();
+    m.api_available = true;
+    update(&mut m, Message::ListsLoaded(vec![list.clone()]));
+    update(&mut m, Message::TasksLoaded(list.id.clone(), tasks.clone()));
+    m.focus = Focus::Tasks;
+    m.selected_task = Some(1); // "a"
+    assert_eq!(titles(&m.visible_tasks()), vec!["b", "a", "c"]);
+
+    update(&mut m, press('r'));
+    // The refresh comes back without "a".
+    let remaining: Vec<Task> = tasks.into_iter().filter(|t| t.title != "a").collect();
+    update(&mut m, Message::TasksLoaded(list.id, remaining));
+
+    let selected = m
+        .selected_task
+        .and_then(|i| m.tasks.get(i))
+        .map(|t| &t.title);
+    assert_eq!(
+        selected.map(String::as_str),
+        Some("b"),
+        "first displayed row, not stored index 0 (\"c\")",
+    );
 }

@@ -3,10 +3,10 @@
 //! run with no terminal and no network. The optimistic Move manipulates `tasks`
 //! and reconciles via a refetch (`MoveSucceeded`); failure rolls back.
 
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use oxidone::app::{update, Command, Message, Model, Overlay};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::app::{renders_as_subtask, update, Command, Message, Model, Overlay};
+use oxidone::domain::{List, ListId, SortView, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -51,14 +51,30 @@ fn task(id: &str, parent: Option<&str>) -> Task {
     }
 }
 
-/// A focused task pane (Manual sort) seeded with `tasks` in the given Vec order.
+/// A focused task pane seeded with `tasks` in the given Vec order, pinned to
+/// Manual sort — Moves are the subject here, and only Manual displays Tasks in
+/// the stored order these fixtures are written against.
 fn model_with(tasks: Vec<Task>) -> Model {
     let l = list();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab)); // focus task pane
+    m.sort = SortView::Manual;
     m
+}
+
+fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, m, d).unwrap()
+}
+
+/// A top-level Task carrying a due date — for the lens tests, where display order
+/// must differ from stored order.
+fn task_due(id: &str, parent: Option<&str>, due: Option<NaiveDate>) -> Task {
+    Task {
+        due,
+        ..task(id, parent)
+    }
 }
 
 fn titles(tasks: &[&Task]) -> Vec<String> {
@@ -411,14 +427,258 @@ fn a_successful_move_reconciles_to_the_authoritative_order() {
     assert_eq!(titles(&m.visible_tasks()), vec!["b", "a"]);
 }
 
-// ---- sort views are read-only ------------------------------------------------
+// ---- a Move from a sort view switches the lens first -------------------------
 
+/// A Move pressed in a Sort view must not reorder anything: the verbs compute
+/// over stored order, so from Due the Task would land against rows the user
+/// cannot see. The first press switches the lens and says so; the second moves.
 #[test]
-fn moves_are_rejected_under_a_sort_view() {
+fn the_first_move_press_from_a_sort_view_only_switches_the_lens() {
+    for lens in [SortView::Due, SortView::Title] {
+        for verb in ['J', 'K', '>', '<'] {
+            let mut m = model_with(vec![task("a", None), task("b", None)]);
+            m.sort = lens;
+            m.selected_task = Some(1); // on "b"
+            let before: Vec<TaskId> = m.tasks.iter().map(|t| t.id.clone()).collect();
+
+            let cmds = update(&mut m, ch(verb));
+
+            assert!(cmds.is_empty(), "{verb} in {lens:?} must emit no Command");
+            assert_eq!(m.sort, SortView::Manual, "{verb} must switch the lens");
+            let after: Vec<TaskId> = m.tasks.iter().map(|t| t.id.clone()).collect();
+            assert_eq!(after, before, "{verb} must not reorder tasks");
+            // The second press acts on the Task the user was looking at, so the
+            // selection must survive the switch untouched — index and identity.
+            assert_eq!(m.selected_task, Some(1), "{verb} must not move the cursor");
+            assert_eq!(m.tasks[1].id, tid("b"));
+            assert!(m.status_line.is_some(), "{verb} must report the switch");
+        }
+    }
+}
+
+/// The case that motivated the two-press design. Stored order is c, a, b; under
+/// Due the pane shows b, a, c — so `>` on "b" looks like indenting the top row
+/// under nothing. After the switch the user sees c, a, b, and the second press
+/// correctly nests "b" under its now-visible predecessor "a".
+#[test]
+fn the_second_press_moves_against_visible_adjacency() {
+    let mut m = model_with(vec![
+        task_due("c", None, None),
+        task_due("a", None, Some(ymd(2026, 8, 1))),
+        task_due("b", None, Some(ymd(2026, 7, 21))),
+    ]);
+    m.sort = SortView::Due;
+    m.selected_task = Some(2); // "b" — first row under Due, last in stored order
+
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["b", "a", "c"],
+        "Due shows b first; nothing is above it"
+    );
+
+    let cmds = update(&mut m, ch('>'));
+    assert!(cmds.is_empty());
+    assert_eq!(m.sort, SortView::Manual);
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["c", "a", "b"],
+        "the switch reveals the rows the Move will act on"
+    );
+
+    let cmds = update(&mut m, ch('>'));
+    assert_eq!(
+        m.tasks[2].parent,
+        Some(tid("a")),
+        "nested under the row above"
+    );
+    assert_eq!(cmds.len(), 1, "the second press performs the Move");
+}
+
+/// The refusal case, with a fixture whose target really is first in stored order.
+#[test]
+fn the_second_press_can_still_be_refused_on_its_own_terms() {
     let mut m = model_with(vec![task("a", None), task("b", None)]);
-    update(&mut m, ch('s')); // Manual -> Due
+    m.sort = SortView::Due;
+    m.selected_task = Some(0); // "a" — first in stored order, nothing above it
+
+    update(&mut m, ch('>')); // switches the lens
+    let cmds = update(&mut m, ch('>'));
+
+    assert!(cmds.is_empty());
+    assert_eq!(m.tasks[0].parent, None, "nothing to indent under");
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("no previous task to indent under"),
+    );
+}
+
+/// A Move refused for any *other* reason must leave the lens alone — the switch
+/// is last in the guard chain precisely so a rejection cannot disturb the view.
+#[test]
+fn a_move_refused_for_another_reason_does_not_switch_the_lens() {
+    // A Move already in flight.
+    let mut m = model_with(vec![task("a", None), task("b", None)]);
+    m.sort = SortView::Due;
+    m.selected_task = Some(0);
+    update(&mut m, ch('J')); // switch
+    update(&mut m, ch('J')); // real Move — now in flight
+    m.sort = SortView::Due; // back to a sort view while it is pending
+
     let cmds = update(&mut m, ch('J'));
     assert!(cmds.is_empty());
-    assert!(m.status_line.is_some());
-    assert_eq!(m.tasks[0].id, tid("a")); // Manual order untouched
+    assert_eq!(
+        m.sort,
+        SortView::Due,
+        "a pending Move must not flip the lens"
+    );
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("a move is already in progress"),
+    );
+}
+
+/// With no selection there is nothing to move, so the press is a silent no-op —
+/// no switch, no Command, no message about sort order the user did not ask for.
+#[test]
+fn a_move_with_no_selection_is_silent_and_leaves_the_lens_alone() {
+    let mut m = model_with(vec![task("a", None)]);
+    m.sort = SortView::Due;
+    m.selected_task = None;
+    m.status_line = None;
+
+    let cmds = update(&mut m, ch('J'));
+
+    assert!(cmds.is_empty());
+    assert_eq!(m.sort, SortView::Due);
+    assert_eq!(m.status_line, None);
+}
+
+/// An ordinary Move already in Manual must not mention the lens at all.
+#[test]
+fn an_ordinary_manual_move_reports_nothing() {
+    let mut m = model_with(vec![task("a", None), task("b", None)]);
+    m.selected_task = Some(0);
+    m.status_line = None;
+
+    let cmds = update(&mut m, ch('J'));
+
+    assert_eq!(cmds.len(), 1, "the Move happens");
+    assert_eq!(m.status_line, None, "a Manual Move reports nothing");
+}
+
+/// The optimistic reorder parks the cursor on the moved Task's new index; the
+/// rollback restores the prior order, so that index now holds the *other*
+/// sibling. The cursor must follow the Task it was on, not the slot.
+#[test]
+fn a_failed_move_leaves_the_cursor_on_the_moved_task() {
+    let mut m = model_with(vec![task("a", None), task("b", None), task("c", None)]);
+    m.selected_task = Some(0); // on "a"
+    update(&mut m, ch('J')); // optimistic: b, a, c — cursor follows "a"
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.clone()),
+        Some(tid("a")),
+    );
+
+    update(
+        &mut m,
+        Message::MoveFailed {
+            list: lid(),
+            reason: "boom".to_string(),
+        },
+    );
+
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.clone()),
+        Some(tid("a")),
+        "the cursor stays on the Task, not the index it was parked at",
+    );
+}
+
+// ---- an orphan is drawn top-level but is never written to ---------------------
+
+/// Deleting a parent orphans its children locally, and Google deletes Subtasks
+/// with their parent — so the row is probably already gone server-side. It draws
+/// flush-left (grouping treats it as its own row), but every verb that would
+/// write refuses with one reason, rather than nesting a child under a vanishing
+/// row or Moving against a `previous` id the server has dropped.
+#[test]
+fn every_write_verb_refuses_on_an_orphan_with_the_same_reason() {
+    for verb in ['o', '>', '<', 'J', 'K'] {
+        let mut m = model_with(vec![
+            task("A", None),
+            task("orphan", Some("gone")),
+            task("B", None),
+        ]);
+        m.selected_task = Some(1);
+        assert!(!renders_as_subtask(&m.top_level_ids(), &m.tasks[1]));
+        let before: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
+
+        let cmds = update(&mut m, ch(verb));
+
+        assert!(cmds.is_empty(), "{verb} must not write to an orphan");
+        assert_eq!(
+            m.status_line.as_deref(),
+            Some("its parent was deleted — refresh (r)"),
+            "{verb} must say why",
+        );
+        let after: Vec<Option<TaskId>> = m.tasks.iter().map(|t| t.parent.clone()).collect();
+        assert_eq!(after, before, "{verb} must not reparent anything");
+    }
+}
+
+/// Depth-2 data (Google caps nesting at one level, so this is malformed): the
+/// pane draws it flush-left because `groups` cannot nest it, so the verbs must
+/// refuse too — and say the parent is a Subtask, not that it was deleted.
+#[test]
+fn every_write_verb_refuses_on_a_depth_two_task() {
+    for verb in ['o', '>', '<', 'J', 'K'] {
+        let mut m = model_with(vec![
+            task("A", None),
+            task("a1", Some("A")),
+            task("deep", Some("a1")),
+        ]);
+        m.selected_task = Some(2);
+        assert!(
+            !renders_as_subtask(&m.top_level_ids(), &m.tasks[2]),
+            "the pane draws it flush-left",
+        );
+
+        let cmds = update(&mut m, ch(verb));
+
+        assert!(cmds.is_empty(), "{verb} must not write to it");
+        assert_eq!(
+            m.status_line.as_deref(),
+            Some("its parent is a subtask — refresh (r)"),
+            "{verb} must name the real reason, not \"already a subtask\"",
+        );
+    }
+}
+
+/// A genuine Subtask is untouched by the detached rule: the verbs still work.
+#[test]
+fn a_real_subtask_is_not_treated_as_detached() {
+    let mut m = model_with(vec![task("A", None), task("a1", Some("A"))]);
+    m.selected_task = Some(1);
+    assert!(renders_as_subtask(&m.top_level_ids(), &m.tasks[1]));
+
+    let cmds = update(&mut m, ch('<')); // outdent works
+
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(m.tasks[1].parent, None);
+}
+
+/// The pane still shows it at top level — the refusal is about writing, not about
+/// pretending it is nested.
+#[test]
+fn an_orphan_still_renders_at_top_level() {
+    let m = model_with(vec![
+        task("A", None),
+        task("orphan", Some("gone")),
+        task("B", None),
+    ]);
+    assert_eq!(titles(&m.visible_tasks()), vec!["A", "B", "orphan"]);
+    assert!(!renders_as_subtask(
+        &m.top_level_ids(),
+        m.tasks.iter().find(|t| t.id == tid("orphan")).unwrap(),
+    ));
 }

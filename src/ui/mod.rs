@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{Focus, Model, Overlay};
+use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::format_due_relative;
 use crate::domain::{Status, Task};
 use crate::keymap;
@@ -223,6 +223,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Overdue is a property of the date against today, decided here in the view
     // — `model.now` keeps that testable rather than reading the wall clock.
     let today = model.now.date_naive();
+    // Built once per render: the per-row indent check is then a hash lookup, not
+    // a scan of every Task.
+    let top_level = model.top_level_ids();
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -250,7 +253,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 ));
             }
             // Subtasks sit indented under their parent so the hierarchy reads.
-            if t.is_subtask() {
+            // An orphan (parent gone) draws flush-left rather than claiming the
+            // row above it as its parent.
+            if renders_as_subtask(&top_level, t) {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
             spans.push(Span::styled(t.title.clone(), style));
@@ -274,10 +279,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         .and_then(|i| model.tasks.get(i))
         .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
 
-    let base = match model.sort.label() {
-        Some(label) => format!("Tasks — {label}"),
-        None => "Tasks".to_string(),
-    };
+    let base = format!("Tasks — {}", model.sort.label());
     // Inline btop-style data widgets in the header: a completion meter for the
     // active List and a due-load strip. Both drop out (never the text) when the
     // pane is too narrow — braille degrades before the title (ADR-0006).

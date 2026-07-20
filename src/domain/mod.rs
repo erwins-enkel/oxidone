@@ -47,19 +47,25 @@ pub enum Status {
     Completed,
 }
 
-/// A local, read-only reordering of the visible Tasks. Never writes Manual order.
+/// A local, read-only regrouping of the visible Tasks. Every view keeps Subtasks
+/// under their parent and only reorders the groups; none of them writes Manual
+/// order or a Task's `parent` — only a Move does. Attempting a Move from a Sort
+/// view switches the pane back to `Manual` first (see `move_preconditions`), so
+/// the reorder lands against the adjacency the user can actually see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortView {
-    /// Google's `position` order ("My order"). The home state.
+    /// Google's `position` order ("My order").
     Manual,
     /// By due date; Tasks with no due date sink to the bottom deterministically.
+    /// The home state — a daily driver opens on what is due.
     Due,
     /// Case-insensitive by title.
     Title,
 }
 
 impl SortView {
-    /// The next view in the triage cycle: Manual → Due → Title → Manual.
+    /// The next view in the triage cycle, starting from the `Due` home state:
+    /// Due → Title → Manual → Due.
     pub fn next(self) -> Self {
         match self {
             SortView::Manual => SortView::Due,
@@ -68,12 +74,14 @@ impl SortView {
         }
     }
 
-    /// A short lower-case label for the pane title (`None` for the home state).
-    pub fn label(self) -> Option<&'static str> {
+    /// A short lower-case label for the pane title. Every view names itself, so
+    /// the header always says which lens is active — with `Due` the home state,
+    /// an unlabelled pane would make Manual the silent one.
+    pub fn label(self) -> &'static str {
         match self {
-            SortView::Manual => None,
-            SortView::Due => Some("due"),
-            SortView::Title => Some("title"),
+            SortView::Manual => "my order",
+            SortView::Due => "due",
+            SortView::Title => "title",
         }
     }
 }

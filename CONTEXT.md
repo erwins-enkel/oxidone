@@ -35,11 +35,11 @@ The user's hand-arranged sequence of Tasks (Google's `position`), shown as "My o
 _Avoid_: sort order, custom order.
 
 **Sort view**:
-A *local, read-only* reordering of the visible Tasks (by due date, by title). Never mutates Manual order, never writes to Google.
+A *local, read-only* regrouping of the visible Tasks (by due date, by title). Subtasks stay under their parent in every view; only the order of and within groups changes. Never mutates Manual order, never writes `position` or `parent`. (Ordinary edits — completing, retitling, deleting — write from any view; the *lens* is what writes nothing.) **Due** is the home state the app opens in.
 _Avoid_: sort order.
 
 **Move**:
-Repositioning or reparenting a Task (Google's `move` operation). The only action that writes Manual order or changes a Task's `parent`.
+Repositioning or reparenting a Task (Google's `move` operation). The only action that writes Manual order or changes an existing Task's `parent`. Moves compute against stored order, so a Move pressed from a Sort view switches the pane back to Manual and stops — the next press performs the Move, against the adjacency now on screen.
 
 ### The four exits
 

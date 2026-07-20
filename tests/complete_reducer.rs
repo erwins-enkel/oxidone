@@ -57,6 +57,7 @@ async fn space_completes_the_selected_task_optimistically_and_emits_a_command() 
 #[tokio::test]
 async fn space_toggles_a_completed_task_back_to_needs_action() {
     let (mut m, l, tasks) = model_with_tasks().await;
+    m.show_completed = true; // keep the completed Task visible + selected to toggle it back
     update(&mut m, space()); // complete
                              // The write resolves (clears the single-flight guard) before the next toggle.
     let mut done = tasks[0].clone();
@@ -106,6 +107,7 @@ async fn write_failure_rolls_back_the_optimistic_change_and_shows_status() {
 #[tokio::test]
 async fn a_second_toggle_is_ignored_while_a_write_is_in_flight() {
     let (mut m, l, tasks) = model_with_tasks().await;
+    m.show_completed = true; // stay on the just-completed Task to retry its toggle
     let first = update(&mut m, space()); // completes, write in flight
     assert_eq!(m.tasks[0].status, Status::Completed);
     assert_eq!(first.len(), 1);

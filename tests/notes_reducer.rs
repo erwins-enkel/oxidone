@@ -227,6 +227,7 @@ async fn n_is_refused_while_a_write_is_in_flight() {
     // the guard refuses up front (for both the external and inline paths).
     let (mut m, _l, _t) = model_with_tasks().await;
     m.editor_available = true;
+    m.show_completed = true; // keep the cursor on "alpha" after completing it
     update(&mut m, ch(' ')); // toggle complete on "alpha" => write in flight
     let cmds = update(&mut m, ch('n'));
     assert!(cmds.is_empty()); // no SpawnEditor

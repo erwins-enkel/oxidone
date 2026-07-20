@@ -1,0 +1,274 @@
+//! Reducer tests for Completed handling (ticket #13): hide-by-default + reveal,
+//! cursor skipping hidden rows, and the optimistic Clear with rollback. `update`
+//! is pure, so these run with no terminal and no network.
+
+use chrono::{TimeZone, Utc};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use oxidone::app::{update, Command, ConfirmAction, Message, Model, Overlay};
+use oxidone::domain::{List, ListId, Status, Task, TaskId};
+
+fn key(code: KeyCode) -> Message {
+    Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
+}
+
+fn ch(c: char) -> Message {
+    key(KeyCode::Char(c))
+}
+
+fn list() -> List {
+    List {
+        id: ListId("L".to_string()),
+        title: "L".to_string(),
+        etag: "e".to_string(),
+        updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+    }
+}
+
+fn task(id: &str, status: Status) -> Task {
+    Task {
+        id: TaskId(id.to_string()),
+        list: ListId("L".to_string()),
+        parent: None,
+        title: id.to_string(),
+        notes: None,
+        status,
+        due: None,
+        completed_at: match status {
+            Status::Completed => Some(Utc.timestamp_opt(1_700_000_100, 0).unwrap()),
+            Status::NeedsAction => None,
+        },
+        position: format!("{id:0>20}"),
+        etag: "e".to_string(),
+        updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+    }
+}
+
+/// A focused task pane seeded with `tasks` in the given order.
+fn model_with(tasks: Vec<Task>) -> Model {
+    let l = list();
+    let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
+    update(&mut m, key(KeyCode::Tab)); // focus task pane
+    m
+}
+
+fn titles(tasks: &[&Task]) -> Vec<String> {
+    tasks.iter().map(|t| t.title.clone()).collect()
+}
+
+#[test]
+fn completed_tasks_are_hidden_by_default() {
+    let m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+    ]);
+    assert!(!m.show_completed);
+    assert_eq!(titles(&m.visible_tasks()), vec!["a", "c"]);
+}
+
+#[test]
+fn c_reveals_and_hides_completed() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('c'));
+    assert!(m.show_completed);
+    assert_eq!(titles(&m.visible_tasks()), vec!["a", "b"]);
+    update(&mut m, ch('c'));
+    assert!(!m.show_completed);
+    assert_eq!(titles(&m.visible_tasks()), vec!["a"]);
+}
+
+#[test]
+fn the_cursor_skips_hidden_completed_rows() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+    ]);
+    assert_eq!(m.selected_task, Some(0)); // "a"
+    update(&mut m, key(KeyCode::Down)); // skip hidden "b"
+    assert_eq!(m.selected_task, Some(2)); // "c"
+    update(&mut m, key(KeyCode::Up)); // skip hidden "b" again
+    assert_eq!(m.selected_task, Some(0)); // "a"
+}
+
+#[test]
+fn a_load_never_anchors_the_cursor_on_a_hidden_task() {
+    // "a" is Completed and hidden, so the initial cursor lands on the first
+    // visible Task, not index 0.
+    let m = model_with(vec![
+        task("a", Status::Completed),
+        task("b", Status::NeedsAction),
+    ]);
+    assert_eq!(m.selected_task, Some(1)); // "b"
+}
+
+#[test]
+fn completing_a_task_moves_the_cursor_off_it_while_hidden() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::NeedsAction),
+    ]);
+    assert_eq!(m.selected_task, Some(0)); // "a"
+    let cmds = update(&mut m, ch(' ')); // complete "a"
+    assert!(matches!(cmds.as_slice(), [Command::SetCompleted { .. }]));
+    assert_eq!(m.selected_task, Some(1)); // cursor moved to visible "b"
+    assert_eq!(titles(&m.visible_tasks()), vec!["b"]);
+}
+
+#[test]
+fn revealing_then_hiding_reanchors_the_cursor() {
+    let mut m = model_with(vec![
+        task("a", Status::Completed),
+        task("b", Status::NeedsAction),
+    ]);
+    update(&mut m, ch('c')); // reveal
+    update(&mut m, key(KeyCode::Up)); // move onto "a" (index 0), now visible
+    assert_eq!(m.selected_task, Some(0));
+    update(&mut m, ch('c')); // hide again => "a" hidden
+    assert_eq!(m.selected_task, Some(1)); // reanchored onto visible "b"
+}
+
+#[test]
+fn capital_c_with_no_completed_is_a_noop_with_a_notice() {
+    let mut m = model_with(vec![task("a", Status::NeedsAction)]);
+    let cmds = update(&mut m, ch('C'));
+    assert!(cmds.is_empty());
+    assert!(m.overlay.is_none());
+    assert!(m.status_line.is_some());
+}
+
+#[test]
+fn capital_c_opens_the_clear_confirm_when_completed_present() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    match &m.overlay {
+        Some(Overlay::Confirm(c)) => {
+            assert!(matches!(c.action, ConfirmAction::ClearCompleted { .. }));
+            assert!(c.prompt.contains('1')); // one completed task
+        }
+        other => panic!("expected a Clear confirm, got {other:?}"),
+    }
+}
+
+#[test]
+fn confirming_clear_optimistically_removes_completed_and_emits_the_command() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    let cmds = update(&mut m, ch('y'));
+    assert_eq!(
+        cmds,
+        vec![Command::ClearCompleted {
+            list: ListId("L".to_string())
+        }]
+    );
+    // Completed Tasks are gone from the model immediately.
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+}
+
+#[test]
+fn a_failed_clear_rolls_the_completed_tasks_back() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // optimistic sweep
+    assert_eq!(m.tasks.len(), 1);
+
+    update(
+        &mut m,
+        Message::ClearCompletedFailed {
+            list: ListId("L".to_string()),
+            reason: "boom".to_string(),
+        },
+    );
+    // "b" is back.
+    assert_eq!(m.tasks.len(), 2);
+    assert!(m.tasks.iter().any(|t| t.title == "b"));
+    assert_eq!(m.status_line.as_deref(), Some("boom"));
+}
+
+#[test]
+fn a_failed_clear_restores_interleaved_completed_in_original_order() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+        task("c", Status::NeedsAction),
+        task("d", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y')); // sweep b, d
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+    update(
+        &mut m,
+        Message::ClearCompletedFailed {
+            list: ListId("L".to_string()),
+            reason: "boom".to_string(),
+        },
+    );
+    // b and d land back at their original positions.
+    assert_eq!(
+        m.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        vec!["a", "b", "c", "d"]
+    );
+}
+
+#[test]
+fn a_confirmed_clear_drops_the_snapshot_so_a_late_failure_cannot_restore() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    update(&mut m, ch('y'));
+    update(
+        &mut m,
+        Message::ClearedCompleted(ListId("L".to_string())), // success
+    );
+    // A stray failure afterwards must not resurrect the swept Task.
+    update(
+        &mut m,
+        Message::ClearCompletedFailed {
+            list: ListId("L".to_string()),
+            reason: "late".to_string(),
+        },
+    );
+    assert_eq!(m.tasks.len(), 1);
+}
+
+#[test]
+fn clear_is_single_flight() {
+    let mut m = model_with(vec![
+        task("a", Status::NeedsAction),
+        task("b", Status::Completed),
+    ]);
+    update(&mut m, ch('C'));
+    let first = update(&mut m, ch('y')); // first clear in flight
+    assert_eq!(first.len(), 1);
+
+    // A new completed Task appears (say, from a refresh) and the user tries to
+    // Clear again before the first Clear has reported back.
+    m.tasks.push(task("d", Status::Completed));
+    update(&mut m, ch('C'));
+    let second = update(&mut m, ch('y'));
+    assert!(second.is_empty()); // guarded: a clear is already in flight
+    assert!(m.status_line.is_some());
+}

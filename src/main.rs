@@ -313,6 +313,15 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::ClearCompleted { list } => match api {
+                Some(api) => spawn_clear_completed(api.clone(), cache.clone(), tx.clone(), list),
+                None => {
+                    let _ = tx.send(Message::ClearCompletedFailed {
+                        list,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
         }
     }
 }
@@ -561,6 +570,40 @@ fn spawn_delete_list(
             },
         };
         let _ = tx.send(message);
+    });
+}
+
+/// Sweep a List's Completed Tasks on Google (`clear_completed`), then re-mirror
+/// the active view so the cache drops the now-hidden Tasks too. Reports success
+/// (drops the optimistic-Clear snapshot) or a rollback on failure. The log keeps
+/// the swept completions — the re-mirror only touches the pure `tasks` mirror.
+fn spawn_clear_completed(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = api.clear_completed(&list).await {
+            let _ = tx.send(Message::ClearCompletedFailed {
+                list,
+                reason: format!("failed to clear completed: {e}"),
+            });
+            return;
+        }
+        // Refresh the cache to match Google (the cleared Tasks are now hidden).
+        // Best-effort: the Clear itself already succeeded, so a cache-refresh
+        // failure is logged, not surfaced as a Clear failure (which would roll
+        // the optimistic removal back and mislead).
+        match sync::fetch_active_tasks(api.as_ref(), &list).await {
+            Ok(tasks) => {
+                if let Err(e) = sync::mirror_tasks(&cache.lock().unwrap(), &list, &tasks) {
+                    tracing::warn!(error = %e, "failed to re-mirror after clear");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to refetch after clear"),
+        }
+        let _ = tx.send(Message::ClearedCompleted(list));
     });
 }
 

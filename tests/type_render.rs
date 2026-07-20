@@ -4,7 +4,7 @@
 //! `link_render.rs`.
 
 use oxidone::app::{Focus, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{EntryType, List, ListId, Status, Task, TaskId};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -122,11 +122,24 @@ fn row_with<'a>(drawn: &'a [String], needle: &str) -> &'a str {
 
 #[test]
 fn a_typed_entry_draws_its_signifier_before_the_title() {
-    let model = model_with(vec![task("1", "○ standup"), task("2", "— jotting")]);
-    let drawn = rows(&model, false);
+    // Fixture *and* expectation both derived from `prefix()`. Spelling the glyph
+    // as a literal makes this vacuous: if the encoding changed, the fixture would
+    // no longer parse as typed, no signifier would be drawn, and the raw title
+    // rendered inline would still satisfy a `contains("○ standup")` check.
+    for (entry, title) in [(EntryType::Event, "standup"), (EntryType::Note, "jotting")] {
+        let model = model_with(vec![task("1", &entry.apply(title))]);
+        let drawn = rows(&model, false);
+        let row = row_with(&drawn, title);
 
-    assert!(row_with(&drawn, "standup").contains("○ standup"));
-    assert!(row_with(&drawn, "jotting").contains("— jotting"));
+        let expected = format!("{}{title}", entry.prefix());
+        assert!(row.contains(&expected), "{entry:?}: {row:?}");
+        // And the glyph is a cell of its own, not part of the title text.
+        assert_eq!(
+            column_where(row, title) - column_of(row, entry.prefix().chars().next().unwrap()),
+            entry.prefix().chars().count(),
+            "{entry:?} signifier should occupy its own cell: {row:?}"
+        );
+    }
 }
 
 #[test]
@@ -140,7 +153,10 @@ fn an_all_task_pane_draws_no_signifier_cell_at_all() {
     // hold while the bug shipped.
     let plain = rows(&model_with(vec![task("1", "alpha")]), false);
     let mixed = rows(
-        &model_with(vec![task("1", "alpha"), task("2", "○ standup")]),
+        &model_with(vec![
+            task("1", "alpha"),
+            task("2", &EntryType::Event.apply("standup")),
+        ]),
         false,
     );
 
@@ -166,15 +182,27 @@ fn an_all_task_pane_draws_no_signifier_cell_at_all() {
 /// The signifier cell's width, derived from a rendered pane rather than
 /// restated: the gap between a typed row's glyph and its title.
 fn signifier_width() -> usize {
-    let drawn = rows(&model_with(vec![task("1", "○ standup")]), false);
+    let drawn = rows(
+        &model_with(vec![task("1", &EntryType::Event.apply("standup"))]),
+        false,
+    );
     let row = row_with(&drawn, "standup");
-    column_where(row, "standup") - column_of(row, '○')
+    column_where(row, "standup") - column_of(row, event_glyph())
+}
+
+/// The Event glyph as drawn — taken from the encoding, never spelled out, so a
+/// change to `prefix()` moves the fixtures and the assertions together.
+fn event_glyph() -> char {
+    EntryType::Event.prefix().chars().next().expect("a glyph")
 }
 
 #[test]
 fn a_task_sharing_a_pane_with_a_typed_entry_is_padded_to_the_same_column() {
     // Both rows must start their title at the same x, or the pane staggers.
-    let model = model_with(vec![task("1", "○ standup"), task("2", "alpha")]);
+    let model = model_with(vec![
+        task("1", &EntryType::Event.apply("standup")),
+        task("2", "alpha"),
+    ]);
     let drawn = rows(&model, false);
 
     let typed = row_with(&drawn, "standup");
@@ -188,7 +216,10 @@ fn a_task_sharing_a_pane_with_a_typed_entry_is_padded_to_the_same_column() {
 
 #[test]
 fn signifiers_degrade_with_the_braille_widgets() {
-    let model = model_with(vec![task("1", "○ standup"), task("2", "— jotting")]);
+    let model = model_with(vec![
+        task("1", &EntryType::Event.apply("standup")),
+        task("2", &EntryType::Note.apply("jotting")),
+    ]);
     let drawn = rows(&model, true);
 
     let standup = row_with(&drawn, "standup");
@@ -199,7 +230,10 @@ fn signifiers_degrade_with_the_braille_widgets() {
     // Scoped to the rows, not the frame: the pane title carries its own em-dash
     // ("Tasks — due"), which is chrome and not a signifier.
     for row in [standup, jotting] {
-        assert!(!row.contains('○'), "circle survived ascii mode: {row:?}");
+        assert!(
+            !row.contains(event_glyph()),
+            "the unicode glyph survived ascii mode: {row:?}"
+        );
         assert!(!row.contains('—'), "em dash survived ascii mode: {row:?}");
     }
 }
@@ -208,15 +242,15 @@ fn signifiers_degrade_with_the_braille_widgets() {
 fn a_subtasks_signifier_is_indented_with_it_not_hoisted_out() {
     // Hoisted outside the indent, a Subtask's glyph would share a column with
     // its parent's and flatten the only cue telling them apart.
-    let mut child = task("2", "○ child");
+    let mut child = task("2", &EntryType::Event.apply("child"));
     child.parent = Some(TaskId("1".into()));
-    let model = model_with(vec![task("1", "○ parent"), child]);
+    let model = model_with(vec![task("1", &EntryType::Event.apply("parent")), child]);
     let drawn = rows(&model, false);
 
     let parent = row_with(&drawn, "parent");
     let kid = row_with(&drawn, "child");
     assert!(
-        column_of(kid, '○') > column_of(parent, '○'),
+        column_of(kid, event_glyph()) > column_of(parent, event_glyph()),
         "the subtask's signifier should sit further right:\n{parent:?}\n{kid:?}"
     );
 }
@@ -228,13 +262,13 @@ fn a_completed_entrys_signifier_is_styled_like_its_title() {
     // together. Pushing the span with `Style::new()` instead of the row's style
     // would leave every other test green while the glyph rendered bright beside
     // its struck-out title.
-    let mut done = task("1", "○ standup");
+    let mut done = task("1", &EntryType::Event.apply("standup"));
     done.status = Status::Completed;
     let mut model = model_with(vec![done]);
     model.show_completed = true; // Completed are hidden by default
 
     let buffer = buffer_of(&model);
-    let (gx, row) = cell_at(&buffer, "○");
+    let (gx, row) = cell_at(&buffer, &event_glyph().to_string());
     let tx = cell_on_row(&buffer, row, "s"); // first letter of "standup"
 
     assert_eq!(
@@ -267,7 +301,7 @@ fn a_dated_note_still_shows_its_date_in_the_due_gutter() {
         .with_ymd_and_hms(2026, 3, 10, 9, 0, 0)
         .single()
         .expect("a valid local time");
-    let mut note = task("1", "— jotting");
+    let mut note = task("1", &EntryType::Note.apply("jotting"));
     note.due = chrono::NaiveDate::from_ymd_opt(2026, 3, 11); // tomorrow
     let mut model = model_with(vec![note]);
     model.now = now;

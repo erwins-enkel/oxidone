@@ -329,11 +329,15 @@ fn link_marker(has_urls: bool, ascii: bool) -> Option<&'static str> {
 /// is the remedy: `o` and `-` are unambiguously single-width.
 fn signifier(entry: EntryType, ascii: bool) -> &'static str {
     match (entry, ascii) {
+        // A Task's blank is a *rendering* fact — `prefix()` is "" for a Task,
+        // because it writes nothing — so it is the one arm stated here.
         (EntryType::Task, _) => "  ",
-        (EntryType::Event, false) => "○ ",
         (EntryType::Event, true) => "o ",
-        (EntryType::Note, false) => "— ",
         (EntryType::Note, true) => "- ",
+        // Derived, never restated: the glyph drawn is the glyph written, so the
+        // two cannot drift into a state where a typed entry renders its raw
+        // title inline with no signifier beside it.
+        (typed, false) => typed.prefix(),
     }
 }
 

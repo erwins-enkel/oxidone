@@ -104,6 +104,8 @@ A local change not yet confirmed by Google. Dormant in v1 (failed writes roll ba
 **Completion log**:
 A local, append-only record of completion events (`task_id`, `list_id`, `title`, `completed_at`), kept *separately* from the pure-mirror cache. Feeds future activity views. It is **per-machine and non-authoritative** — it does not sync across machines and is never Google's truth.
 
+`title` holds the **Display title**, not the raw one: the log is human-readable history, not a mirror, so it records what an entry was called rather than the type encoding. Rows are keyed `(task_id, completed_at)` and written `INSERT OR IGNORE`, so first observation wins — a later retype or rename never reaches an already-logged row.
+
 ### Visual vocabulary
 
 **Signifier**:

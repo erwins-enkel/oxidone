@@ -55,6 +55,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
     let (title, body): (&str, String) = match overlay {
         Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
         Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
+        Overlay::AddSubtask { buffer, .. } => ("Add subtask", format!("{buffer}▏")),
         Overlay::EditDue { buffer, .. } => ("Edit due date (blank clears)", format!("{buffer}▏")),
         Overlay::EditNotes { buffer, .. } => ("Edit notes (blank clears)", format!("{buffer}▏")),
         Overlay::AddList { buffer } => ("Add list", format!("{buffer}▏")),
@@ -88,6 +89,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
 /// contract rather than restated here, so the column can never be narrower than
 /// what `format_due_relative` may emit.
 const DUE_WIDTH: usize = crate::dateparse::MAX_RENDERED_WIDTH;
+
+/// Indent prefix for a Subtask row (nesting is capped at one level).
+const SUBTASK_INDENT: &str = "  ";
 
 /// Style for a Task's due-date cell. Overdue reads in the palette's red so it
 /// catches the eye when scanning the column — but Completed wins: a done Task
@@ -139,6 +143,10 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                     format!("{due:<DUE_WIDTH$}  "),
                     due_style(t, today, theme),
                 ));
+            }
+            // Subtasks sit indented under their parent so the hierarchy reads.
+            if t.is_subtask() {
+                spans.push(Span::raw(SUBTASK_INDENT));
             }
             spans.push(Span::styled(t.title.clone(), style));
             ListItem::new(Line::from(spans))

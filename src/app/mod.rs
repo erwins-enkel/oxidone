@@ -72,6 +72,14 @@ pub struct Model {
     /// per-item snapshot — like `pending_deletes` — so a failed Clear re-inserts
     /// only the swept Tasks, never clobbering a concurrent edit or a reload.
     pending_clears: HashMap<ListId, Vec<(usize, Task)>>,
+    /// A Move (indent/outdent/reorder) in flight, with the List and the pre-Move
+    /// `tasks` snapshot for rollback. A Move renumbers many positions, so it is
+    /// single-flight (one at a time) and reconciled by a whole-pane refetch on
+    /// success. Because that reconcile replaces `tasks` wholesale, a Move is also
+    /// blocked while the moved Task has a field write in flight (see
+    /// `move_preconditions`); a field edit to *another* Task during the window is
+    /// transiently overwritten but re-converges via its own by-id reconciliation.
+    pending_move: Option<(ListId, Vec<Task>)>,
     /// Counter for minting placeholder ids for optimistically-added Tasks, before
     /// the server assigns the real id.
     next_temp: u64,
@@ -93,6 +101,8 @@ pub enum Overlay {
     EditTitle { task: TaskId, buffer: String },
     /// Capture a new Task's title.
     AddTask { buffer: String },
+    /// Capture a new Subtask's title, to be inserted under `parent`.
+    AddSubtask { parent: TaskId, buffer: String },
     /// Due-date entry for a Task: natural language or ISO, or empty to clear.
     EditDue { task: TaskId, buffer: String },
     /// Inline single-line notes editor — the fallback used when no external
@@ -112,6 +122,7 @@ impl Overlay {
         match self {
             Overlay::EditTitle { buffer, .. }
             | Overlay::AddTask { buffer }
+            | Overlay::AddSubtask { buffer, .. }
             | Overlay::EditDue { buffer, .. }
             | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
@@ -155,6 +166,7 @@ impl Default for Model {
             pending_list_writes: HashMap::new(),
             pending_list_deletes: HashMap::new(),
             pending_clears: HashMap::new(),
+            pending_move: None,
             next_temp: 0,
             // A fixed placeholder, deliberately not the real clock: `Default`
             // stays pure so tests construct a deterministic Model and set `now`
@@ -185,18 +197,23 @@ impl Model {
     /// lens: it borrows `tasks` and never mutates Manual order (`position`) nor
     /// emits any Command — the view renders this, the model is untouched.
     ///
-    /// - `Manual`: stored order (by `position`, i.e. the current Vec order).
+    /// - `Manual`: the parent/Subtask hierarchy — each top-level Task followed by
+    ///   its Subtasks. Derived from `parent` + Vec order, so it is correct whether
+    ///   `position` strings are global (the fake) or per-sibling-group (Google).
     /// - `Due`: due date ascending; Tasks with no due date sink to the bottom,
-    ///   stable within that no-due group (a deterministic tail).
-    /// - `Title`: case-insensitive by title, stable on ties.
+    ///   stable within that no-due group (a deterministic tail). Flat — a triage
+    ///   lens ignores the hierarchy.
+    /// - `Title`: case-insensitive by title, stable on ties. Flat, as `Due`.
     ///
-    /// Known limitation: `j`/`k` still move `selected_task` in stored order, so
-    /// under `Due`/`Title` the highlight can jump between non-adjacent rows.
-    /// Making navigation follow the display order is a follow-up.
+    /// Navigation (`j`/`k`) follows this order, so the cursor never jumps between
+    /// non-adjacent rows.
     pub fn sorted_tasks(&self) -> Vec<&Task> {
+        // Manual is the hierarchy; the flat triage lenses share one collect+sort.
+        if self.sort == SortView::Manual {
+            return self.hierarchical();
+        }
         let mut ordered: Vec<&Task> = self.tasks.iter().collect();
         match self.sort {
-            SortView::Manual => {}
             // Stable sort keeps the stored order as the tie-breaker, so the
             // no-due tail (and same-day Tasks) stay in Manual order.
             SortView::Due => ordered.sort_by(|a, b| match (a.due, b.due) {
@@ -206,8 +223,34 @@ impl Model {
                 (None, None) => std::cmp::Ordering::Equal,
             }),
             SortView::Title => ordered.sort_by_cached_key(|t| t.title.to_lowercase()),
+            SortView::Manual => unreachable!("handled by the early return above"),
         }
         ordered
+    }
+
+    /// Flatten `tasks` into parent-then-Subtasks order: each top-level Task in Vec
+    /// order, immediately followed by its Subtasks (also in Vec order). Any Task
+    /// whose parent is absent (an orphaned Subtask, e.g. after its parent was
+    /// deleted) is appended rather than dropped, so nothing ever vanishes.
+    fn hierarchical(&self) -> Vec<&Task> {
+        let mut out: Vec<&Task> = Vec::with_capacity(self.tasks.len());
+        for parent in self.tasks.iter().filter(|t| t.parent.is_none()) {
+            out.push(parent);
+            for child in self
+                .tasks
+                .iter()
+                .filter(|c| c.parent.as_ref() == Some(&parent.id))
+            {
+                out.push(child);
+            }
+        }
+        // Orphans: Subtasks whose parent isn't in the set — keep them visible.
+        for task in &self.tasks {
+            if !out.iter().any(|t| t.id == task.id) {
+                out.push(task);
+            }
+        }
+        out
     }
 
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
@@ -290,6 +333,17 @@ pub enum Message {
         list: ListId,
         reason: String,
     },
+    /// A Move (indent/outdent/reorder) succeeded; drop the snapshot and reconcile
+    /// the pane to the authoritative post-Move order.
+    MoveSucceeded {
+        list: ListId,
+        tasks: Vec<Task>,
+    },
+    /// A Move failed; restore the pre-Move Tasks.
+    MoveFailed {
+        list: ListId,
+        reason: String,
+    },
     /// The external notes editor returned changed text; write it through. `notes`
     /// is `None` when the user emptied the buffer (clears the notes). The runtime
     /// emits this only on an actual change — an unchanged buffer emits nothing.
@@ -337,11 +391,21 @@ pub enum Command {
     /// Delete a Task.
     DeleteTask { list: ListId, task: TaskId },
     /// Insert a new Task into a List; `temp` echoes back so the placeholder can
-    /// be reconciled with the server Task.
+    /// be reconciled with the server Task. `parent` is `Some` for a Subtask.
     AddTask {
         list: ListId,
         temp: TaskId,
         title: String,
+        parent: Option<TaskId>,
+    },
+    /// Reposition / reparent a Task (indent, outdent, or reorder). `parent` sets
+    /// the new parent (`None` = top-level); `previous` is the sibling to place it
+    /// after (`None` = first among its new siblings).
+    Move {
+        list: ListId,
+        task: TaskId,
+        parent: Option<TaskId>,
+        previous: Option<TaskId>,
     },
     /// Insert a new List; `temp` echoes back so the placeholder can be
     /// reconciled with the server List.
@@ -514,6 +578,24 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             model.status_line = Some(reason);
             Vec::new()
         }
+        Message::MoveSucceeded { list, tasks } => {
+            // Drop the snapshot and reconcile to the authoritative post-Move order.
+            model.pending_move = None;
+            set_tasks(model, &list, tasks);
+            Vec::new()
+        }
+        Message::MoveFailed { list, reason } => {
+            if let Some((snap_list, snapshot)) = model.pending_move.take() {
+                // Restore only if that List is still active — a switch during the
+                // Move left a different pane in place.
+                if snap_list == list && model.selected_list_id() == Some(&list) {
+                    model.tasks = snapshot;
+                    reselect_visible(model);
+                }
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
         Message::NotesEdited { task, notes } => finish_edit_notes(model, task, notes),
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
@@ -625,6 +707,11 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             reselect_visible(model);
         }
         Action::ClearCompleted => open_clear_completed_confirm(model),
+        Action::AddSubtask => open_add_subtask(model),
+        Action::Indent => return indent(model),
+        Action::Outdent => return outdent(model),
+        Action::MoveDown => return reorder(model, 1),
+        Action::MoveUp => return reorder(model, -1),
     }
     Vec::new()
 }
@@ -667,14 +754,63 @@ fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
     let Some(list) = model.selected_list_id().cloned() else {
         return Vec::new();
     };
+    add_task_placeholder(model, list, title, None, 0)
+}
+
+/// Open the capture overlay for a new Subtask under the selected Task. A Subtask
+/// must hang off a top-level Task (one-level cap), so if a Subtask is selected the
+/// new one is added under *its* parent (a sibling), not under the Subtask.
+fn open_add_subtask(model: &mut Model) {
+    let Some(task) = focused_task(model) else {
+        return;
+    };
+    let parent = match &task.parent {
+        Some(p) => p.clone(),
+        None => task.id.clone(),
+    };
+    model.overlay = Some(Overlay::AddSubtask {
+        parent,
+        buffer: String::new(),
+    });
+}
+
+/// Optimistically insert a placeholder Subtask under `parent` (as its first
+/// child, matching Google's top-of-list insert) and request the insert.
+fn finish_add_subtask(model: &mut Model, parent: TaskId, buffer: String) -> Vec<Command> {
+    let title = buffer.trim().to_string();
+    if title.is_empty() {
+        return Vec::new();
+    }
+    let Some(list) = model.selected_list_id().cloned() else {
+        return Vec::new();
+    };
+    let Some(pidx) = model.tasks.iter().position(|t| t.id == parent) else {
+        return Vec::new(); // parent vanished (e.g. a refresh dropped it)
+    };
+    if model.tasks[pidx].parent.is_some() {
+        model.status_line = Some("subtasks can't have subtasks (one level max)".to_string());
+        return Vec::new();
+    }
+    add_task_placeholder(model, list, title, Some(parent), pidx + 1)
+}
+
+/// Insert an optimistic placeholder Task at `index`, move the cursor onto it, and
+/// emit its `AddTask`. Shared by the top-level and Subtask add paths.
+fn add_task_placeholder(
+    model: &mut Model,
+    list: ListId,
+    title: String,
+    parent: Option<TaskId>,
+    index: usize,
+) -> Vec<Command> {
     let temp = TaskId(format!("temp-{}", model.next_temp));
     model.next_temp += 1;
     model.tasks.insert(
-        0,
+        index,
         Task {
             id: temp.clone(),
             list: list.clone(),
-            parent: None,
+            parent: parent.clone(),
             title: title.clone(),
             notes: None,
             status: Status::NeedsAction,
@@ -685,8 +821,161 @@ fn finish_add_task(model: &mut Model, buffer: String) -> Vec<Command> {
             updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
         },
     );
-    model.selected_task = Some(0); // cursor moves to the new Task
-    vec![Command::AddTask { list, temp, title }]
+    model.selected_task = Some(index);
+    vec![Command::AddTask {
+        list,
+        temp,
+        title,
+        parent,
+    }]
+}
+
+/// Preconditions shared by every Move: the task pane focused, Manual sort (Sort
+/// views are read-only — a Move writes `position`), an active List, a selection,
+/// and no Move already in flight. Returns `(list, selected index)` when allowed.
+fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
+    if model.focus != Focus::Tasks {
+        return None;
+    }
+    if model.sort != SortView::Manual {
+        model.status_line = Some("reordering is only available in manual order (s)".to_string());
+        return None;
+    }
+    let list = model.selected_list_id().cloned()?;
+    let idx = model.selected_task?;
+    if model.pending_move.is_some() {
+        model.status_line = Some("a move is already in progress".to_string());
+        return None;
+    }
+    // Don't move a Task whose field write is still in flight: the Move's whole-pane
+    // reconcile would clobber that optimistic edit before it lands.
+    if model.pending_writes.contains_key(&model.tasks[idx].id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return None;
+    }
+    Some((list, idx))
+}
+
+/// Indent the selected top-level Task into a Subtask of the top-level Task above
+/// it (a Move). Rejected if it is already a Subtask (one-level cap) or has its own
+/// Subtasks, or if there is no previous top-level Task to nest under.
+fn indent(model: &mut Model) -> Vec<Command> {
+    let Some((list, idx)) = move_preconditions(model) else {
+        return Vec::new();
+    };
+    if model.tasks[idx].parent.is_some() {
+        model.status_line = Some("already a subtask (one level max)".to_string());
+        return Vec::new();
+    }
+    let task_id = model.tasks[idx].id.clone();
+    if model
+        .tasks
+        .iter()
+        .any(|t| t.parent.as_ref() == Some(&task_id))
+    {
+        model.status_line = Some("can't indent a task that has subtasks".to_string());
+        return Vec::new();
+    }
+    let Some(parent_pos) = (0..idx).rev().find(|&j| model.tasks[j].parent.is_none()) else {
+        model.status_line = Some("no previous task to indent under".to_string());
+        return Vec::new();
+    };
+    let parent_id = model.tasks[parent_pos].id.clone();
+    // Land after the parent's current last child (else as its first child).
+    let previous = model
+        .tasks
+        .iter()
+        .rev()
+        .find(|t| t.parent.as_ref() == Some(&parent_id))
+        .map(|t| t.id.clone());
+    let snapshot = model.tasks.clone();
+    model.tasks[idx].parent = Some(parent_id.clone());
+    model.pending_move = Some((list.clone(), snapshot));
+    vec![Command::Move {
+        list,
+        task: task_id,
+        parent: Some(parent_id),
+        previous,
+    }]
+}
+
+/// Outdent the selected Subtask back to top-level (a Move), placed right after
+/// its former parent. A no-op on a Task that is already top-level.
+fn outdent(model: &mut Model) -> Vec<Command> {
+    let Some((list, idx)) = move_preconditions(model) else {
+        return Vec::new();
+    };
+    let Some(parent_id) = model.tasks[idx].parent.clone() else {
+        model.status_line = Some("not a subtask".to_string());
+        return Vec::new();
+    };
+    let task_id = model.tasks[idx].id.clone();
+    let snapshot = model.tasks.clone();
+    model.tasks[idx].parent = None;
+    model.pending_move = Some((list.clone(), snapshot));
+    vec![Command::Move {
+        list,
+        task: task_id,
+        parent: None,
+        previous: Some(parent_id),
+    }]
+}
+
+/// Reorder the selected Task among its siblings (same parent) by `dir` (+1 down,
+/// -1 up) — a Move. Swapping the Task's Vec slot with the adjacent sibling's
+/// reorders their whole subtrees, since the display regroups children by parent.
+fn reorder(model: &mut Model, dir: isize) -> Vec<Command> {
+    // `dir` is a single step; the `previous`-sibling arithmetic below assumes it.
+    debug_assert!(dir == 1 || dir == -1, "reorder steps one sibling at a time");
+    let Some((list, idx)) = move_preconditions(model) else {
+        return Vec::new();
+    };
+    let parent = model.tasks[idx].parent.clone();
+    let sibs: Vec<usize> = model
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.parent == parent)
+        .map(|(i, _)| i)
+        .collect();
+    let pos = sibs
+        .iter()
+        .position(|&i| i == idx)
+        .expect("selection is a sibling");
+    let target = pos as isize + dir;
+    if target < 0 || target as usize >= sibs.len() {
+        model.status_line = Some(
+            if dir > 0 {
+                "already last"
+            } else {
+                "already first"
+            }
+            .to_string(),
+        );
+        return Vec::new();
+    }
+    let target = target as usize;
+    let task_id = model.tasks[idx].id.clone();
+    let sib_ids: Vec<TaskId> = sibs.iter().map(|&i| model.tasks[i].id.clone()).collect();
+    // The sibling to land after: for a down move, the next sibling; for an up
+    // move, the one before our previous sibling (`None` => first among siblings).
+    let previous = if dir > 0 {
+        Some(sib_ids[pos + 1].clone())
+    } else if pos >= 2 {
+        Some(sib_ids[pos - 2].clone())
+    } else {
+        None
+    };
+    let snapshot = model.tasks.clone();
+    model.tasks.swap(idx, sibs[target]);
+    model.selected_task = Some(sibs[target]); // follow the moved Task
+    model.pending_move = Some((list.clone(), snapshot));
+    vec![Command::Move {
+        list,
+        task: task_id,
+        parent,
+        previous,
+    }]
 }
 
 /// Open the due-date editor, prefilled with the current due (ISO) or empty.
@@ -910,6 +1199,7 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
     match model.overlay.take() {
         Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
         Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
+        Some(Overlay::AddSubtask { parent, buffer }) => finish_add_subtask(model, parent, buffer),
         Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
         Some(Overlay::EditNotes { task, buffer }) => finish_edit_notes(model, task, Some(buffer)),
         Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),
@@ -1099,26 +1389,28 @@ fn move_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     }
 }
 
-/// Move the task cursor by `delta`, skipping Tasks hidden by the completed
-/// filter so it never lands on an invisible row. Clamps at the visible ends.
+/// Move the task cursor by `delta` through the **displayed** order
+/// ([`visible_tasks`](Model::visible_tasks)) — the hierarchy under Manual, the
+/// sorted list otherwise, hidden rows already excluded — then map back to the
+/// Task's index in `tasks`. Clamps at the visible ends.
 fn move_task_cursor(model: &mut Model, delta: isize) {
-    let Some(current) = model.selected_task else {
+    let visible = model.visible_tasks();
+    if visible.is_empty() {
         return;
-    };
-    let step = if delta >= 0 { 1isize } else { -1 };
-    let n = model.tasks.len() as isize;
-    let mut i = current as isize;
-    loop {
-        let next = i + step;
-        if next < 0 || next >= n {
-            return; // no further visible Task in that direction; stay put
-        }
-        i = next;
-        if model.is_visible(&model.tasks[i as usize]) {
-            model.selected_task = Some(i as usize);
-            return;
-        }
     }
+    let current_id = model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .map(|t| t.id.clone());
+    let current_pos = current_id
+        .as_ref()
+        .and_then(|id| visible.iter().position(|t| &t.id == id));
+    let new_pos = match current_pos {
+        Some(p) => (p as isize + delta).clamp(0, visible.len() as isize - 1) as usize,
+        None => 0,
+    };
+    let target = visible[new_pos].id.clone();
+    model.selected_task = model.tasks.iter().position(|t| t.id == target);
 }
 
 /// Ensure `selected_task` points at a visible Task. Keeps the current selection

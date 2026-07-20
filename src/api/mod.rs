@@ -17,6 +17,11 @@ use async_trait::async_trait; // NOTE: add `async-trait` to Cargo.toml, or use R
 pub trait TasksApi: Send + Sync {
     // Lists
     async fn list_lists(&self) -> Result<Vec<List>, ApiError>;
+    /// The user's default List (`@default`). Resolved once to its concrete
+    /// `ListId`; the alias itself is never stored (ADR-0003) — storing it would
+    /// put two keys for one List in the cache. Used to target the Today `a`
+    /// capture so a new entry lands on the page it was created on.
+    async fn default_list(&self) -> Result<List, ApiError>;
     async fn insert_list(&self, title: &str) -> Result<List, ApiError>;
     async fn patch_list(&self, id: &ListId, title: &str) -> Result<List, ApiError>;
     async fn delete_list(&self, id: &ListId) -> Result<(), ApiError>;

@@ -5,7 +5,7 @@
 
 use chrono::{TimeZone, Utc};
 use oxidone::app::{update, Focus, Message, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -92,6 +92,7 @@ fn model_with(tasks: Vec<Task>, counts: &[(&str, (usize, usize))]) -> Model {
     };
     let mut model = Model::new();
     update(&mut model, Message::ListsLoaded(vec![list]));
+    model.selected = Selection::List(0);
     let seeded: HashMap<ListId, (usize, usize)> = counts
         .iter()
         .map(|(id, c)| (ListId((*id).to_string()), *c))
@@ -102,9 +103,10 @@ fn model_with(tasks: Vec<Task>, counts: &[(&str, (usize, usize))]) -> Model {
     model
 }
 
-/// The sidebar row for List `L` — the first row inside the panel border.
+/// The sidebar row for List `L`. Row 0 is the panel's top border, row 1 the
+/// pinned "Today" row, so the first real List sits on row 2.
 fn sidebar_row(rows: &[String]) -> String {
-    rows[1].clone()
+    rows[2].clone()
 }
 
 /// Just the task pane's columns of a row. A terminal row spans *both* panes, so

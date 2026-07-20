@@ -11,7 +11,7 @@
 
 use chrono::{TimeZone, Utc};
 use oxidone::app::{update, Focus, Message, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -110,6 +110,7 @@ fn model_with(tasks: Vec<Task>) -> Model {
     };
     let mut model = Model::new();
     update(&mut model, Message::ListsLoaded(vec![list]));
+    model.selected = Selection::List(0);
     update(&mut model, Message::CountsLoaded(HashMap::new()));
     update(&mut model, Message::TasksLoaded(ListId("l".into()), tasks));
     model.focus = Focus::Tasks;

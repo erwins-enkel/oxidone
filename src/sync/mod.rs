@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 
 use crate::api::{ApiError, TaskPatch, TasksApi};
 use crate::cache::Cache;
-use crate::domain::{List, ListId, Task, TaskId};
+use crate::domain::{due_on_or_before, List, ListId, Task, TaskId};
 
 /// Refresh Lists: fetch from Google, mirror into the cache (dropping Lists that
 /// no longer exist), and return the cached Lists for the Model.
@@ -43,6 +43,21 @@ pub fn mirror_lists(cache: &Cache, lists: &[List]) -> Result<Vec<List>> {
 pub fn mirror_tasks(cache: &Cache, list: &ListId, tasks: &[Task]) -> Result<Vec<Task>> {
     cache.replace_tasks(list, tasks)?;
     cache.tasks(list)
+}
+
+/// The **Today** aggregate straight from the cache: every cached Task due on or
+/// before `today`, across all Lists (each carrying its own `list`).
+///
+/// Borrow-based and **spawn-free** — the concurrent live fan-out lives in
+/// `main.rs`'s `spawn_load_today`, keeping the "all `tokio::spawn` in `main.rs`"
+/// convention. This serves the Today pane's *instant paint* (and the offline
+/// path): the same cache read the fan-out worker finishes with, minus the network.
+pub fn today_from_cache(cache: &Cache, today: NaiveDate) -> Result<Vec<Task>> {
+    Ok(cache
+        .all_tasks()?
+        .into_iter()
+        .filter(|t| due_on_or_before(t.due, today))
+        .collect())
 }
 
 /// Set a Task's completed state on Google and return the updated Task from the
@@ -227,4 +242,73 @@ pub async fn delete_task(
     api.delete_task(list, task).await?;
     cache.delete_task(task)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Status;
+    use chrono::{DateTime, NaiveDate};
+
+    fn list(id: &str) -> List {
+        List {
+            id: ListId(id.into()),
+            title: id.into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
+
+    fn dated(id: &str, list: &str, due: Option<NaiveDate>) -> Task {
+        Task {
+            id: TaskId(id.into()),
+            list: ListId(list.into()),
+            parent: None,
+            title: id.into(),
+            notes: None,
+            status: Status::NeedsAction,
+            due,
+            completed_at: None,
+            links: Vec::new(),
+            position: "1".into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
+    #[test]
+    fn today_from_cache_keeps_due_on_or_before_today_across_lists_and_drops_the_rest() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache.replace_lists(&[list("a"), list("b")]).unwrap();
+        let today = ymd(2026, 7, 20);
+        cache
+            .replace_tasks(
+                &ListId("a".into()),
+                &[
+                    dated("overdue", "a", Some(ymd(2026, 7, 19))),
+                    dated("today", "a", Some(today)),
+                    dated("undated", "a", None), // excluded: None is not <= today
+                ],
+            )
+            .unwrap();
+        cache
+            .replace_tasks(
+                &ListId("b".into()),
+                &[dated("future", "b", Some(ymd(2026, 7, 21)))], // excluded
+            )
+            .unwrap();
+
+        let got: Vec<String> = today_from_cache(&cache, today)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id.0)
+            .collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.contains(&"overdue".to_string()));
+        assert!(got.contains(&"today".to_string()));
+    }
 }

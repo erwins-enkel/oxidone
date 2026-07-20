@@ -4,7 +4,7 @@
 //! `legend_render.rs`.
 
 use oxidone::app::{Focus, Message, Model};
-use oxidone::domain::{List, ListId, Status, Task, TaskId, TaskLink};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId, TaskLink};
 use oxidone::ui::{self, theme::Theme};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -94,6 +94,7 @@ fn model_with(tasks: Vec<Task>) -> Model {
     };
     let mut model = Model::new();
     ui_update(&mut model, Message::ListsLoaded(vec![list]));
+    model.selected = Selection::List(0);
     ui_update(&mut model, Message::TasksLoaded(ListId("l".into()), tasks));
     model.focus = Focus::Tasks;
     model

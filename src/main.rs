@@ -27,7 +27,7 @@ use oxidone::app::{update, Command, Message, Model, OFFLINE};
 use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config};
-use oxidone::domain::{List, ListId, TaskId};
+use oxidone::domain::{List, ListId, Task, TaskId};
 use oxidone::links::OpenableUrl;
 use oxidone::sync;
 use oxidone::ui::{self, theme::Theme};
@@ -182,6 +182,11 @@ async fn run(
     // Seed the distant-due view filter from config; `w` toggles it thereafter.
     model.hide_distant = config.hide_distant;
     model.horizon_days = config.horizon_days;
+    // Stamp the real clock before the seed: the startup selection is Today, whose
+    // `LoadToday` carries `model.now.date_naive()` as its membership date. Without
+    // this the seed would resolve "today" against the epoch placeholder and paint
+    // an empty pane. The loop re-stamps before every draw/event thereafter.
+    model.now = chrono::Local::now();
     // Sidebar meters for every cached List, *before* the seed `ListsLoaded`:
     // `set_lists`'s lazy fan-out reads `list_counts` to decide which Lists still
     // need fetching, so an empty map here would make it treat every List as
@@ -211,6 +216,8 @@ async fn run(
     }
     if let Some(api) = &api {
         spawn_refresh_lists(api.clone(), cache.clone(), tx.clone());
+        // Resolve @default once for the Today `a` capture target (ADR-0003).
+        spawn_resolve_default(api.clone(), tx.clone());
     }
 
     loop {
@@ -290,6 +297,24 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     let _ = tx.send(message);
                 }
             },
+            Command::LoadToday { lists, today } => {
+                // Instant paint from the cache (borrow-based, spawn-free), then —
+                // online — the concurrent per-List fan-out for fresh data.
+                let cached = sync::today_from_cache(&cache.lock().unwrap(), today);
+                let _ = tx.send(match cached {
+                    Ok(tasks) => Message::TodayLoaded {
+                        tasks,
+                        failed: Vec::new(),
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read today from cache");
+                        Message::LoadFailed(format!("failed to read today: {e}"))
+                    }
+                });
+                if let Some(api) = api {
+                    spawn_load_today(api.clone(), cache.clone(), tx.clone(), lists, today);
+                }
+            }
             Command::SetCompleted {
                 list,
                 task,
@@ -819,14 +844,31 @@ fn recount(cache: &SharedCache, model: &mut Model) {
 /// network — the live refresh, dispatched later, does the network round-trip.
 fn seed_tasks_from_cache(model: &mut Model, commands: Vec<Command>, cache: &SharedCache) {
     for command in commands {
-        // The seed only emits LoadTasks (from ListsLoaded); ignore anything else.
-        if let Command::LoadTasks(list) = command {
-            match cache.lock().unwrap().tasks(&list) {
+        // The seed emits a single LoadTasks or LoadToday (from ListsLoaded via the
+        // active selection); serve it from cache for the first frame, and ignore
+        // anything else.
+        match command {
+            Command::LoadTasks(list) => match cache.lock().unwrap().tasks(&list) {
                 Ok(tasks) => {
                     update(model, Message::TasksLoaded(list, tasks));
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to read cached tasks"),
+            },
+            Command::LoadToday { today, .. } => {
+                match sync::today_from_cache(&cache.lock().unwrap(), today) {
+                    Ok(tasks) => {
+                        update(
+                            model,
+                            Message::TodayLoaded {
+                                tasks,
+                                failed: Vec::new(),
+                            },
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to seed today from cache"),
+                }
             }
+            _ => {}
         }
     }
 }
@@ -869,6 +911,74 @@ fn spawn_load_tasks(
             },
         };
         let _ = tx.send(message);
+    });
+}
+
+/// Load the **Today** aggregate live: a concurrent per-List fan-out (fetch-only,
+/// no cache lock across the await), then a single sequential mirror pass under one
+/// cache lock, then the `due <= today` aggregate read back. Reports the aggregate
+/// plus the ListIds whose fetch *or* mirror failed, so a failed List is named on
+/// the status line rather than silently shortening the day (fail closed).
+fn spawn_load_today(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    lists: Vec<List>,
+    today: NaiveDate,
+) {
+    tokio::spawn(async move {
+        // Fan out fetches concurrently; each returns its List's id + result so the
+        // mirror and failure-attribution below know which List each came from.
+        let mut set = tokio::task::JoinSet::new();
+        for list in lists {
+            let api = api.clone();
+            set.spawn(async move {
+                let res = sync::fetch_active_tasks(api.as_ref(), &list.id).await;
+                (list.id, res)
+            });
+        }
+        let mut fetched: Vec<(ListId, Vec<Task>)> = Vec::new();
+        let mut failed: Vec<ListId> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((id, Ok(tasks))) => fetched.push((id, tasks)),
+                Ok((id, Err(e))) => {
+                    tracing::warn!(error = %e, list = %id.0, "today fan-out: list fetch failed");
+                    failed.push(id);
+                }
+                Err(e) => tracing::error!(error = %e, "today fan-out: worker join failed"),
+            }
+        }
+        // Mirror sequentially under one lock, then read the aggregate back — the
+        // same cache read `today_from_cache` serves for the instant paint.
+        let message = {
+            let cache = cache.lock().unwrap();
+            for (id, tasks) in &fetched {
+                if let Err(e) = cache.replace_tasks(id, tasks) {
+                    tracing::warn!(error = %e, list = %id.0, "today fan-out: mirror failed");
+                    failed.push(id.clone());
+                }
+            }
+            match sync::today_from_cache(&cache, today) {
+                Ok(tasks) => Message::TodayLoaded { tasks, failed },
+                Err(e) => Message::LoadFailed(format!("failed to build today: {e}")),
+            }
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Resolve Google's `@default` alias to its concrete `ListId` once (startup,
+/// online). Best-effort: a failure leaves `default_list` unresolved, and a Today
+/// capture fails closed until a later run resolves it (never on this happy path).
+fn spawn_resolve_default(api: Arc<dyn TasksApi>, tx: UnboundedSender<Message>) {
+    tokio::spawn(async move {
+        match api.default_list().await {
+            Ok(list) => {
+                let _ = tx.send(Message::DefaultListResolved(list.id));
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to resolve @default list"),
+        }
     });
 }
 

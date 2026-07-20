@@ -4,7 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Message, Model, Overlay};
-use oxidone::domain::{List, Status, Task, TaskId};
+use oxidone::domain::{List, Selection, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -36,6 +36,7 @@ async fn model_with_one_task() -> (Model, List, Task) {
     let tasks = api.list_tasks(&l.id, true, false, None).await.unwrap();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab));
     (m, l, t)

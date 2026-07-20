@@ -18,9 +18,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use std::collections::HashMap;
+
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::{format_due_relative, split_title_and_due};
-use crate::domain::{EntryType, Status, Task};
+use crate::domain::{due_on_or_before, EntryType, ListId, Selection, Status, Task};
 use crate::keymap;
 use crate::links::{self, Link};
 use theme::Theme;
@@ -215,27 +217,24 @@ fn truncate(text: &str, width: usize, ellipsis: &str) -> String {
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Sidebar;
-    let items: Vec<ListItem> = model
-        .lists
-        .iter()
-        .map(|l| {
-            ListItem::new(sidebar_row(
-                &l.title,
-                model.list_meter(&l.id),
-                area.width,
-                ascii,
-            ))
-        })
-        .collect();
-    render_selectable(
-        frame,
-        area,
-        "Lists",
-        items,
-        model.selected_list,
-        focused,
-        theme,
-    );
+    // The pinned Today row sits above the real Lists (no meter — its cross-List
+    // completion is only known while it is the active pane). The cursor spans
+    // `[Today, …lists]`, so the highlight index is offset by the one pinned row.
+    let mut items: Vec<ListItem> = Vec::with_capacity(model.lists.len() + 1);
+    items.push(ListItem::new("Today"));
+    for l in &model.lists {
+        items.push(ListItem::new(sidebar_row(
+            &l.title,
+            model.list_meter(&l.id),
+            area.width,
+            ascii,
+        )));
+    }
+    let selected = match model.selected {
+        Selection::Today => Some(0),
+        Selection::List(i) => Some(i + 1),
+    };
+    render_selectable(frame, area, "Lists", items, selected, focused, theme);
 }
 
 /// A sidebar row: the List title, then its completion meter flush right.
@@ -575,6 +574,19 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Shares that set rather than deriving its own, so the meter counts exactly
     // the rows the indent rule nests — and stays one pass over `tasks`.
     let subtask_counts = model.subtask_counts(&top_level);
+    // Today is a flat cross-List pane: no Subtask indent or meters (per-List
+    // hierarchy concepts), and each row carries a dimmed List name so its home is
+    // visible where rows from different Lists sit together.
+    let today_view = model.today_active();
+    let list_titles: HashMap<&ListId, &str> = if today_view {
+        model
+            .lists
+            .iter()
+            .map(|l| (&l.id, l.title.as_str()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -603,8 +615,8 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             }
             // Subtasks sit indented under their parent so the hierarchy reads.
             // An orphan (parent gone) draws flush-left rather than claiming the
-            // row above it as its parent.
-            let is_subtask = renders_as_subtask(&top_level, t);
+            // row above it as its parent. Never in Today — that pane is flat.
+            let is_subtask = !today_view && renders_as_subtask(&top_level, t);
             if is_subtask {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
@@ -652,14 +664,19 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // Neither marker is dropped for the meter's sake: they are not this
             // widget's information to spend — so both widths come off its budget,
             // or it would lay itself out over cells the row has already spent.
-            let segment = subtask_segment(
-                subtask_counts.get(&t.id).copied(),
-                area.width,
-                due_gutter,
-                drawn_width,
-                marker_width,
-                ascii,
-            );
+            // Today has no Subtask meter (flat pane), so it is skipped there.
+            let segment = if today_view {
+                String::new()
+            } else {
+                subtask_segment(
+                    subtask_counts.get(&t.id).copied(),
+                    area.width,
+                    due_gutter,
+                    drawn_width,
+                    marker_width,
+                    ascii,
+                )
+            };
             let meter_width = segment.width();
             if !segment.is_empty() {
                 // The row's style *minus* the strike: braille struck through is
@@ -668,6 +685,20 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 spans.push(Span::styled(
                     segment,
                     style.remove_modifier(Modifier::CROSSED_OUT),
+                ));
+            }
+            // Today only: the dimmed List name, trailing the markers/meter. Its
+            // width comes off the notes-preview budget below (like the meter's), so
+            // the variable-length preview tail can never clip it. Strike removed —
+            // it is stable context, not the Task's own struck-through text.
+            let list_seg = list_titles.get(&t.list).map(|name| format!("  {name}"));
+            let list_seg_width = list_seg.as_ref().map_or(0, |s| s.width());
+            if let Some(seg) = list_seg {
+                spans.push(Span::styled(
+                    seg,
+                    style
+                        .remove_modifier(Modifier::CROSSED_OUT)
+                        .fg(theme.subtext),
                 ));
             }
             // Last of all, after the meter, so this variable-length tail can never
@@ -680,7 +711,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                     area.width,
                     due_gutter,
                     is_subtask,
-                    drawn_width + marker_width + meter_width,
+                    drawn_width + marker_width + meter_width + list_seg_width,
                     ascii,
                 ) {
                     spans.push(Span::styled(preview, style.fg(theme.subtext)));
@@ -713,19 +744,23 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     let inner = inner_width as usize;
     let mut title = base.to_string();
 
-    // Completion meter for the active List, over Task-typed entries only:
-    // Events and Notes are not work you complete, so counting them would make
-    // the meter permanently under-report. Numerator and denominator come from
-    // the *same* set — a completed Note counts in neither — or the label could
-    // read "4/3" while the bar clamped to full.
+    // Completion meter over Task-typed entries only: Events and Notes are not work
+    // you complete, so counting them would make the meter permanently under-report.
+    // Numerator and denominator come from the *same* set — a completed Note counts
+    // in neither — or the label could read "4/3" while the bar clamped to full.
     //
-    // A List holding only Events and Notes therefore shows no meter at all,
-    // via the `total > 0` guard: there is no completion to report.
+    // A pane holding only Events and Notes therefore shows no meter at all, via the
+    // `total > 0` guard: there is no completion to report. In Today the count also
+    // honours membership (`due <= today`), so a row optimistically migrated past
+    // today leaves the meter in the same frame it leaves the pane.
+    let today = model.now.date_naive();
+    let today_active = model.today_active();
     let actionable = || {
         model
             .tasks
             .iter()
             .filter(|t| t.entry_type() == EntryType::Task)
+            .filter(move |t| !today_active || due_on_or_before(t.due, today))
     };
     let total = actionable().count();
     if total > 0 {
@@ -739,8 +774,15 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
         }
     }
 
-    // Due-load strip: workload ahead over the next `DUE_LOAD_DAYS` days.
-    let counts = due_load_counts(&model.tasks, model.now, DUE_LOAD_DAYS);
+    // Due-load strip: workload ahead over the next `DUE_LOAD_DAYS` days. Dropped
+    // in Today — every row there is due<=today, so the strip would fold the whole
+    // pane into a single "today" bucket and forecast nothing. The completion meter
+    // above stays: it reports today's actionable completion from the aggregate.
+    let counts = if model.today_active() {
+        vec![0; DUE_LOAD_DAYS]
+    } else {
+        due_load_counts(&model.tasks, model.now, DUE_LOAD_DAYS)
+    };
     if counts.iter().any(|&c| c > 0) {
         let strip = dueload::render(&counts, ascii);
         let segment = format!("  {strip}");
@@ -2227,24 +2269,27 @@ mod tests {
 
     // --- Entry-type signifiers and counters ------------------------------
 
+    /// A Model with `tasks` on a selected List `L` — the ordinary (non-Today)
+    /// task pane these render tests exercise. A real List selection matters now
+    /// that the default landing is Today, whose flat pane and `due <= today`
+    /// membership would otherwise change what the pane draws and counts.
     fn model_with(tasks: Vec<Task>) -> Model {
-        let mut model = Model::new();
-        model.tasks = tasks;
-        model
+        model_with_active_list(tasks).0
     }
 
-    /// `model_with`, plus a selected List — so `list_meter` takes its live
-    /// branch instead of falling through to the cached counts.
+    /// `model_with`, also returning the active `ListId` — for tests asserting on
+    /// `list_meter`'s live branch.
     fn model_with_active_list(tasks: Vec<Task>) -> (Model, ListId) {
         let id = ListId("l".into());
-        let mut model = model_with(tasks);
+        let mut model = Model::new();
+        model.tasks = tasks;
         model.lists = vec![crate::domain::List {
             id: id.clone(),
             title: "L".into(),
             etag: String::new(),
             updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
         }];
-        model.selected_list = Some(0);
+        model.selected = Selection::List(0);
         (model, id)
     }
 

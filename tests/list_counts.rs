@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, TasksApi};
 use oxidone::app::{update, Focus, Message, Model};
 use oxidone::cache::Cache;
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 use std::collections::HashMap;
 
 fn ts(secs: i64) -> DateTime<Utc> {
@@ -264,6 +264,7 @@ async fn completing_a_task_moves_the_active_meter_in_the_same_pass() {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists));
+    m.selected = Selection::List(0);
     update(&mut m, Message::CountsLoaded(counts(&[(&id.0, (0, 2))])));
     update(
         &mut m,
@@ -309,6 +310,7 @@ async fn emptying_the_active_list_falls_back_until_the_recount_lands() {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists));
+    m.selected = Selection::List(0);
     update(&mut m, Message::CountsLoaded(counts(&[(&id.0, (0, 1))])));
     update(
         &mut m,
@@ -353,6 +355,7 @@ fn subtask_meter(m: &Model, parent: &str) -> Option<(usize, usize)> {
 fn model_with(tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![list("L")]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(ListId("L".to_string()), tasks));
     m
 }

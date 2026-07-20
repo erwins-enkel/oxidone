@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Focus, Message, Model, Overlay, OFFLINE};
-use oxidone::domain::{List, Task};
+use oxidone::domain::{List, Selection, Task};
 
 fn titles(tasks: &[&Task]) -> Vec<String> {
     tasks.iter().map(|t| t.title.clone()).collect()
@@ -40,6 +40,7 @@ async fn seeded(titles: &[&str]) -> (Model, List) {
     let mut m = Model::new();
     m.api_available = true;
     update(&mut m, Message::ListsLoaded(vec![list.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(list.id.clone(), tasks));
     (m, list)
 }
@@ -156,6 +157,7 @@ async fn a_refresh_that_drops_the_selected_task_anchors_the_first_displayed() {
     let mut m = Model::new();
     m.api_available = true;
     update(&mut m, Message::ListsLoaded(vec![list.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(list.id.clone(), tasks.clone()));
     m.focus = Focus::Tasks;
     m.selected_task = Some(1); // "a"

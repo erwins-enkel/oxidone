@@ -5,7 +5,7 @@
 use chrono::{TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{update, Command, ConfirmAction, Message, Model, Overlay};
-use oxidone::domain::{List, ListId, Status, Task, TaskId};
+use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 
 fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
@@ -49,6 +49,7 @@ fn model_with(tasks: Vec<Task>) -> Model {
     let l = list();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     update(&mut m, key(KeyCode::Tab)); // focus task pane
     m
@@ -343,6 +344,7 @@ fn a_tombstone_survives_a_fetch_of_another_list() {
     };
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![list(), other.clone()]));
+    m.selected = Selection::List(0);
     update(
         &mut m,
         Message::TasksLoaded(
@@ -485,6 +487,7 @@ fn a_confirmed_clear_for_an_inactive_list_touches_nothing() {
     };
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![list(), other.clone()]));
+    m.selected = Selection::List(0);
     update(
         &mut m,
         Message::TasksLoaded(

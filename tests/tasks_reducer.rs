@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
 use oxidone::app::{update, Command, Message, Model};
-use oxidone::domain::{List, ListId, Task};
+use oxidone::domain::{List, ListId, Selection, Task};
 use std::collections::HashMap;
 
 fn press(c: char) -> Message {
@@ -34,10 +34,26 @@ async fn list_with_tasks(titles: &[&str]) -> (List, Vec<Task>) {
     (l, tasks)
 }
 
-/// The startup cascade is a **lazy** fan-out: with an empty aggregate (nothing
-/// mirrored yet) every List is uncovered, so `set_lists` requests Tasks for all of
-/// them — the active List first (via `request_selected_tasks`), then the rest — so
-/// a List never opened on this machine still gets a sidebar meter.
+/// Startup lands on the pinned Today view (#61): loading Lists emits a single
+/// `LoadToday` (which itself fans out every List in its worker), not the per-List
+/// meter cascade — so the reducer does not double-fetch.
+#[tokio::test]
+async fn loading_lists_on_today_emits_load_today_only() {
+    let api = FakeTasksApi::new();
+    api.insert_list("Work").await.unwrap();
+    api.insert_list("Home").await.unwrap();
+    let lists = api.list_lists().await.unwrap();
+
+    let mut m = Model::new();
+    let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
+    assert_eq!(m.selected, Selection::Today);
+    assert!(matches!(cmds.as_slice(), [Command::LoadToday { .. }]));
+}
+
+/// With a **List** active, the lazy fan-out fills the sidebar meters: an empty
+/// aggregate leaves every List uncovered, so `set_lists` requests Tasks for all of
+/// them — the active List first (via `request_selected`), then the rest — so a
+/// List never opened on this machine still gets a meter.
 #[tokio::test]
 async fn loading_lists_fans_out_to_uncovered_lists_active_first() {
     let api = FakeTasksApi::new();
@@ -46,6 +62,8 @@ async fn loading_lists_fans_out_to_uncovered_lists_active_first() {
     let lists = api.list_lists().await.unwrap();
 
     let mut m = Model::new();
+    update(&mut m, Message::ListsLoaded(lists.clone())); // lands on Today
+    update(&mut m, press('j')); // select Work (List 0), leaving Today
     let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
     assert_eq!(
         cmds,
@@ -56,11 +74,10 @@ async fn loading_lists_fans_out_to_uncovered_lists_active_first() {
     );
 }
 
-/// A List the cache aggregate already covers is left alone at startup — its meter
-/// is already drawable, and re-fetching it would be the network churn the lazy
-/// policy exists to avoid.
+/// A List the cache aggregate already covers is left alone — its meter is already
+/// drawable, and re-fetching it would be the network churn the lazy policy avoids.
 #[tokio::test]
-async fn startup_fan_out_skips_lists_the_aggregate_covers() {
+async fn list_fan_out_skips_lists_the_aggregate_covers() {
     let api = FakeTasksApi::new();
     api.insert_list("Work").await.unwrap();
     api.insert_list("Home").await.unwrap();
@@ -68,7 +85,9 @@ async fn startup_fan_out_skips_lists_the_aggregate_covers() {
     let (work, home) = (lists[0].id.clone(), lists[1].id.clone());
 
     let mut m = Model::new();
-    // Recount runs before the seed; stand in for it by covering Home.
+    update(&mut m, Message::ListsLoaded(lists.clone()));
+    update(&mut m, press('j')); // Work active
+                                // Cover Home so only an uncovered List is fetched.
     let mut counts = HashMap::new();
     counts.insert(home, (1usize, 2usize));
     update(&mut m, Message::CountsLoaded(counts));
@@ -97,7 +116,8 @@ async fn a_full_refresh_fans_out_to_every_list_active_first() {
     let mut m = Model::new();
     m.api_available = true;
     update(&mut m, Message::ListsLoaded(lists.clone()));
-    // Work is active. Cover every List, so only a *full* refresh re-fetches them.
+    update(&mut m, press('j')); // Work active
+                                // Cover every List, so only a *full* refresh re-fetches them.
     let mut counts = HashMap::new();
     counts.insert(work.clone(), (0usize, 1usize));
     counts.insert(home.clone(), (0usize, 1usize));
@@ -128,7 +148,8 @@ async fn the_full_refresh_flag_is_consumed_after_one_cascade() {
 
     let mut m = Model::new();
     m.api_available = true;
-    update(&mut m, Message::ListsLoaded(lists.clone())); // Work active
+    update(&mut m, Message::ListsLoaded(lists.clone()));
+    update(&mut m, press('j')); // Work active
     let mut counts = HashMap::new();
     counts.insert(work.clone(), (0usize, 1usize));
     counts.insert(home, (0usize, 1usize));
@@ -158,7 +179,8 @@ async fn an_offline_refresh_does_not_latch_the_full_flag() {
     counts.insert(work.clone(), (0usize, 1usize));
     counts.insert(home, (0usize, 1usize));
     update(&mut m, Message::CountsLoaded(counts));
-    update(&mut m, Message::ListsLoaded(lists.clone())); // Work active
+    update(&mut m, Message::ListsLoaded(lists.clone()));
+    update(&mut m, press('j')); // Work active
 
     assert!(
         update(&mut m, press('r')).is_empty(),
@@ -177,6 +199,7 @@ async fn a_background_lists_load_failure_is_dropped() {
     let (l, tasks) = list_with_tasks(&["a"]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
 
     update(
@@ -198,6 +221,7 @@ async fn the_active_lists_load_failure_reaches_the_status_line() {
     let (l, tasks) = list_with_tasks(&["a"]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
 
     update(
@@ -215,6 +239,7 @@ async fn tasks_loaded_fills_the_pane_and_selects_first() {
     let (l, tasks) = list_with_tasks(&["a", "b"]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
     assert_eq!(m.tasks.len(), 2);
     assert_eq!(m.selected_task, Some(0));
@@ -227,13 +252,14 @@ async fn changing_list_requests_new_tasks_and_clears_the_pane() {
     let home = api.insert_list("Home").await.unwrap();
     let lists = api.list_lists().await.unwrap();
     let mut m = Model::new();
-    update(&mut m, Message::ListsLoaded(lists.clone()));
+    update(&mut m, Message::ListsLoaded(lists.clone())); // lands on Today
+    update(&mut m, press('j')); // select Work (List 0)
     let wtasks = api.list_tasks(&work.id, true, false, None).await.unwrap();
     update(&mut m, Message::TasksLoaded(work.id.clone(), wtasks));
 
     // Sidebar-focused `j` moves to Home and asks for its Tasks.
     let cmds = update(&mut m, press('j'));
-    assert_eq!(m.selected_list, Some(1));
+    assert_eq!(m.selected, Selection::List(1));
     assert!(m.tasks.is_empty());
     assert_eq!(cmds, vec![Command::LoadTasks(home.id.clone())]);
 }
@@ -243,13 +269,14 @@ async fn cursor_moves_in_the_task_pane_when_it_is_focused() {
     let (l, tasks) = list_with_tasks(&["a", "b", "c"]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks));
 
     update(&mut m, tab()); // focus the task pane
     let cmds = update(&mut m, press('j'));
     assert!(cmds.is_empty());
     assert_eq!(m.selected_task, Some(1));
-    assert_eq!(m.selected_list, Some(0)); // list selection unchanged
+    assert_eq!(m.selected, Selection::List(0)); // list selection unchanged
 }
 
 #[tokio::test]
@@ -262,8 +289,9 @@ async fn stale_tasks_loaded_for_another_list_is_ignored() {
     let _ = &work;
 
     let mut m = Model::new();
-    update(&mut m, Message::ListsLoaded(lists)); // Work selected
-    update(&mut m, Message::TasksLoaded(home.id.clone(), htasks)); // stale
+    update(&mut m, Message::ListsLoaded(lists)); // lands on Today
+    update(&mut m, press('j')); // select Work (List 0)
+    update(&mut m, Message::TasksLoaded(home.id.clone(), htasks)); // stale (Home not active)
     assert!(m.tasks.is_empty());
 }
 
@@ -279,6 +307,7 @@ async fn model_with_one(title: &str) -> (Model, List, Vec<Task>) {
     let (l, tasks) = list_with_tasks(&[title]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     update(&mut m, Message::TasksLoaded(l.id.clone(), tasks.clone()));
     update(&mut m, tab());
     (m, l, tasks)
@@ -364,6 +393,7 @@ async fn typing_a_subtask_works_the_same_as_a_top_level_task() {
     let (l, tasks) = list_with_tasks(&["parent", "child"]).await;
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(vec![l.clone()]));
+    m.selected = Selection::List(0);
     let mut child = tasks[1].clone();
     child.parent = Some(tasks[0].id.clone());
     update(

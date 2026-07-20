@@ -349,7 +349,10 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     let focused = model.focus == Focus::Tasks;
     // The displayed rows are a read-only lens over `tasks`: the current sort's
     // order with Completed Tasks filtered out unless revealed. `tasks` (Manual
-    // order) stays untouched, and the header meter still counts over all of it.
+    // order) stays untouched, and the header meter counts over all of it —
+    // hiding Completed Tasks never moves the meter. It is narrowed on the other
+    // axis though: only Task-typed entries count, so its `total` is *not*
+    // `model.tasks.len()` on a pane holding Events or Notes (see `header_title`).
     let ordered = model.visible_tasks();
     // Due dates lead the row in a fixed-width gutter so they scan vertically.
     // The gutter only exists when something in view has a due date — otherwise

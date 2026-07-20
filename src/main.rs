@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use chrono::NaiveDate;
 use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing_subscriber::EnvFilter;
@@ -104,6 +105,9 @@ async fn run(
         terminal.draw(|frame| ui::view(&model, theme, frame))?;
         match rx.recv().await {
             Some(msg) => {
+                // Stamp the clock at the impure edge so the reducer stays pure
+                // yet can resolve relative due dates (ADR-0005).
+                model.now = chrono::Local::now();
                 dispatch(update(&mut model, msg), &api, &cache, &tx);
                 if model.should_quit {
                     break;
@@ -159,6 +163,17 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
             Command::SetTitle { list, task, title } => match api {
                 Some(api) => {
                     spawn_write_title(api.clone(), cache.clone(), tx.clone(), list, task, title)
+                }
+                None => {
+                    let _ = tx.send(Message::TaskWriteFailed {
+                        task,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::SetDue { list, task, due } => match api {
+                Some(api) => {
+                    spawn_write_due(api.clone(), cache.clone(), tx.clone(), list, task, due)
                 }
                 None => {
                     let _ = tx.send(Message::TaskWriteFailed {
@@ -274,6 +289,33 @@ fn spawn_add_task(
             Err(e) => Message::TaskAddFailed {
                 temp,
                 reason: format!("failed to add task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Write-through a due-date change: patch on Google, mirror into the cache,
+/// report the server Task back (or a rollback on failure). `due = None` clears.
+fn spawn_write_due(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    task: TaskId,
+    due: Option<NaiveDate>,
+) {
+    tokio::spawn(async move {
+        let message = match sync::patch_due(api.as_ref(), &list, &task, due).await {
+            Ok(updated) => {
+                if let Err(e) = cache.lock().unwrap().upsert_task(&updated) {
+                    tracing::warn!(error = %e, "failed to cache task write");
+                }
+                Message::TaskUpdated(updated)
+            }
+            Err(e) => Message::TaskWriteFailed {
+                task,
+                reason: format!("failed to update task: {e}"),
             },
         };
         let _ = tx.send(message);

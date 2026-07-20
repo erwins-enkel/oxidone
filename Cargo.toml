@@ -49,7 +49,7 @@ toml = "1"
 
 # Dates — natural-language due entry + ISO fallback (local TZ)
 chrono = { version = "0.4", features = ["serde"] }
-interim = "0.2"
+interim = { version = "0.2", features = ["chrono_0_4"] }
 
 # Platform dirs (config / data / log)
 directories = "6"

@@ -5,6 +5,7 @@
 //! the cached view. Write-through and the offline queue land in later slices.
 
 use anyhow::Result;
+use chrono::NaiveDate;
 
 use crate::api::{ApiError, TaskPatch, TasksApi};
 use crate::cache::Cache;
@@ -119,6 +120,36 @@ pub async fn insert_task(
     let task = api.insert_task(list, new).await?;
     cache.upsert_task(&task)?;
     Ok(task)
+}
+
+/// Patch a Task's due date on Google and return the updated Task (no cache write
+/// — see [`patch_completed`] for the split rationale). `due` is `Some(None)` to
+/// clear it, `Some(Some(date))` to set it; the outer `Some` marks the field as
+/// changed in the [`TaskPatch`].
+pub async fn patch_due(
+    api: &dyn TasksApi,
+    list: &ListId,
+    task: &TaskId,
+    due: Option<NaiveDate>,
+) -> std::result::Result<Task, ApiError> {
+    let patch = TaskPatch {
+        due: Some(due),
+        ..Default::default()
+    };
+    api.patch_task(list, task, patch).await
+}
+
+/// Write-through a due-date change: patch on Google, mirror into the cache.
+pub async fn write_due(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    list: &ListId,
+    task: &TaskId,
+    due: Option<NaiveDate>,
+) -> Result<Task> {
+    let updated = patch_due(api, list, task, due).await?;
+    cache.upsert_task(&updated)?;
+    Ok(updated)
 }
 
 /// Delete a Task on Google and mirror the removal into the cache.

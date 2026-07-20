@@ -46,6 +46,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Them
     let (title, body): (&str, String) = match overlay {
         Overlay::EditTitle { buffer, .. } => ("Edit title", format!("{buffer}▏")),
         Overlay::AddTask { buffer } => ("Add task", format!("{buffer}▏")),
+        Overlay::EditDue { buffer, .. } => ("Edit due date (blank clears)", format!("{buffer}▏")),
         Overlay::Confirm(confirm) => ("Confirm", confirm.prompt.clone()),
     };
     let popup = centered(area, 50, 3);
@@ -87,7 +88,15 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme)
             } else {
                 Style::new()
             };
-            ListItem::new(Line::styled(t.title.clone(), style))
+            let mut spans = vec![Span::styled(t.title.clone(), style)];
+            // A dim trailing ISO due date, when set.
+            if let Some(due) = t.due {
+                spans.push(Span::styled(
+                    format!("  {}", due.format("%Y-%m-%d")),
+                    Style::new().fg(theme.subtext),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 

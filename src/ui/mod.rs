@@ -6,6 +6,7 @@
 pub mod theme;
 pub mod widgets;
 
+use chrono::NaiveDate;
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -87,6 +88,18 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
 /// what `format_due_relative` may emit.
 const DUE_WIDTH: usize = crate::dateparse::MAX_RENDERED_WIDTH;
 
+/// Style for a Task's due-date cell. Overdue reads in the palette's red so it
+/// catches the eye when scanning the column — but Completed wins: a done Task
+/// is settled, so its date stays dim alongside the struck-through title.
+fn due_style(task: &Task, today: NaiveDate, theme: &Theme) -> Style {
+    let overdue = task.status != Status::Completed && task.due.is_some_and(|d| d < today);
+    Style::new().fg(if overdue {
+        theme.overdue
+    } else {
+        theme.subtext
+    })
+}
+
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
     // The current sort is a read-only lens over `tasks`: the display order comes
@@ -96,6 +109,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // The gutter only exists when something in view has a due date — otherwise
     // every title would sit behind a column of blanks.
     let due_gutter = ordered.iter().any(|t| t.due.is_some());
+    // Overdue is a property of the date against today, decided here in the view
+    // — `model.now` keeps that testable rather than reading the wall clock.
+    let today = model.now.date_naive();
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -114,12 +130,12 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 // forms are all shorter than the ISO fallback, so they pad
                 // rather than truncate and the titles stay aligned.
                 let due = match t.due {
-                    Some(d) => format_due_relative(d, model.now.date_naive()),
+                    Some(d) => format_due_relative(d, today),
                     None => String::new(),
                 };
                 spans.push(Span::styled(
                     format!("{due:<DUE_WIDTH$}  "),
-                    Style::new().fg(theme.subtext),
+                    due_style(t, today, theme),
                 ));
             }
             spans.push(Span::styled(t.title.clone(), style));
@@ -285,4 +301,69 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ListId, TaskId};
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn task(due: Option<NaiveDate>, status: Status) -> Task {
+        Task {
+            id: TaskId("t".into()),
+            list: ListId("l".into()),
+            parent: None,
+            title: "t".into(),
+            notes: None,
+            status,
+            due,
+            completed_at: None,
+            position: "0".into(),
+            etag: String::new(),
+            updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
+
+    #[test]
+    fn a_past_due_date_reads_overdue() {
+        let theme = Theme::from_flavor("mocha");
+        let style = due_style(
+            &task(Some(ymd(2026, 3, 9)), Status::NeedsAction),
+            ymd(2026, 3, 10),
+            &theme,
+        );
+        assert_eq!(style.fg, Some(theme.overdue));
+    }
+
+    #[test]
+    fn today_and_later_stay_dim() {
+        let theme = Theme::from_flavor("mocha");
+        let today = ymd(2026, 3, 10);
+        for due in [ymd(2026, 3, 10), ymd(2026, 3, 11)] {
+            let style = due_style(&task(Some(due), Status::NeedsAction), today, &theme);
+            assert_eq!(style.fg, Some(theme.subtext), "{due} should not be overdue");
+        }
+    }
+
+    #[test]
+    fn a_task_with_no_due_date_stays_dim() {
+        let theme = Theme::from_flavor("mocha");
+        let style = due_style(&task(None, Status::NeedsAction), ymd(2026, 3, 10), &theme);
+        assert_eq!(style.fg, Some(theme.subtext));
+    }
+
+    #[test]
+    fn completed_wins_over_overdue() {
+        let theme = Theme::from_flavor("mocha");
+        let style = due_style(
+            &task(Some(ymd(2026, 3, 9)), Status::Completed),
+            ymd(2026, 3, 10),
+            &theme,
+        );
+        assert_eq!(style.fg, Some(theme.subtext));
+    }
 }

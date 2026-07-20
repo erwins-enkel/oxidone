@@ -202,6 +202,33 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::AddList { temp, title } => match api {
+                Some(api) => spawn_add_list(api.clone(), cache.clone(), tx.clone(), temp, title),
+                None => {
+                    let _ = tx.send(Message::ListAddFailed {
+                        temp,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::RenameList { list, title } => match api {
+                Some(api) => spawn_rename_list(api.clone(), cache.clone(), tx.clone(), list, title),
+                None => {
+                    let _ = tx.send(Message::ListWriteFailed {
+                        list,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
+            Command::DeleteList { list } => match api {
+                Some(api) => spawn_delete_list(api.clone(), cache.clone(), tx.clone(), list),
+                None => {
+                    let _ = tx.send(Message::ListDeleteFailed {
+                        list,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
         }
     }
 }
@@ -342,6 +369,84 @@ fn spawn_delete_task(
             Err(e) => Message::TaskDeleteFailed {
                 task,
                 reason: format!("failed to delete task: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Insert a List on Google, mirror into the cache, and reconcile the optimistic
+/// placeholder (by `temp` id) with the server List — or drop it on failure.
+fn spawn_add_list(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    temp: ListId,
+    title: String,
+) {
+    tokio::spawn(async move {
+        let message = match api.insert_list(&title).await {
+            Ok(list) => {
+                if let Err(e) = cache.lock().unwrap().upsert_list(&list) {
+                    tracing::warn!(error = %e, "failed to cache inserted list");
+                }
+                Message::ListInserted { temp, list }
+            }
+            Err(e) => Message::ListAddFailed {
+                temp,
+                reason: format!("failed to add list: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Write-through a List rename: patch on Google, mirror into the cache, report
+/// the server List back (or a rollback on failure).
+fn spawn_rename_list(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+    title: String,
+) {
+    tokio::spawn(async move {
+        let message = match sync::patch_list_title(api.as_ref(), &list, &title).await {
+            Ok(updated) => {
+                if let Err(e) = cache.lock().unwrap().upsert_list(&updated) {
+                    tracing::warn!(error = %e, "failed to cache list rename");
+                }
+                Message::ListUpdated(updated)
+            }
+            Err(e) => Message::ListWriteFailed {
+                list,
+                reason: format!("failed to rename list: {e}"),
+            },
+        };
+        let _ = tx.send(message);
+    });
+}
+
+/// Delete a List on Google, mirror the removal into the cache, and report back
+/// (or roll the optimistic delete back on failure — e.g. Google refuses to
+/// delete the undeletable default List).
+fn spawn_delete_list(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    list: ListId,
+) {
+    tokio::spawn(async move {
+        let message = match api.delete_list(&list).await {
+            Ok(()) => {
+                if let Err(e) = cache.lock().unwrap().delete_list(&list) {
+                    tracing::warn!(error = %e, "failed to remove list from cache");
+                }
+                Message::ListDeleted(list)
+            }
+            Err(e) => Message::ListDeleteFailed {
+                list,
+                reason: format!("failed to delete list: {e}"),
             },
         };
         let _ = tx.send(message);

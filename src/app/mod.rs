@@ -55,6 +55,14 @@ pub struct Model {
     /// Optimistically-removed Tasks awaiting delete confirmation from the server,
     /// mapped to their prior (index, Task) for rollback on failure.
     pending_deletes: HashMap<TaskId, (usize, Task)>,
+    /// Lists with a rename in flight, mapped to their pre-write snapshot for
+    /// rollback. Single-flight guard, keyed by `ListId` (the Task analogue is
+    /// `pending_writes`).
+    pending_list_writes: HashMap<ListId, List>,
+    /// Optimistically-removed Lists awaiting delete confirmation, mapped to their
+    /// prior (index, List) for rollback on failure (e.g. Google's undeletable
+    /// default List).
+    pending_list_deletes: HashMap<ListId, (usize, List)>,
     /// Counter for minting placeholder ids for optimistically-added Tasks, before
     /// the server assigns the real id.
     next_temp: u64,
@@ -73,8 +81,11 @@ pub enum Overlay {
     AddTask { buffer: String },
     /// Due-date entry for a Task: natural language or ISO, or empty to clear.
     EditDue { task: TaskId, buffer: String },
-    /// A reusable destructive-action confirmation (delete Task now; Clear and
-    /// List delete later).
+    /// Capture a new List's title.
+    AddList { buffer: String },
+    /// In-place title editor for a List.
+    RenameList { list: ListId, buffer: String },
+    /// A reusable destructive-action confirmation (delete Task or List).
     Confirm(Confirm),
 }
 
@@ -84,7 +95,9 @@ impl Overlay {
         match self {
             Overlay::EditTitle { buffer, .. }
             | Overlay::AddTask { buffer }
-            | Overlay::EditDue { buffer, .. } => Some(buffer),
+            | Overlay::EditDue { buffer, .. }
+            | Overlay::AddList { buffer }
+            | Overlay::RenameList { buffer, .. } => Some(buffer),
             Overlay::Confirm(_) => None,
         }
     }
@@ -101,6 +114,7 @@ pub struct Confirm {
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteTask { list: ListId, task: TaskId },
+    DeleteList { list: ListId },
 }
 
 impl Default for Model {
@@ -118,6 +132,8 @@ impl Default for Model {
             overlay: None,
             pending_writes: HashMap::new(),
             pending_deletes: HashMap::new(),
+            pending_list_writes: HashMap::new(),
+            pending_list_deletes: HashMap::new(),
             next_temp: 0,
             // A fixed placeholder; the runtime overwrites it before each event.
             now: chrono::DateTime::from_timestamp(0, 0)
@@ -201,6 +217,30 @@ pub enum Message {
         temp: TaskId,
         reason: String,
     },
+    /// A List add succeeded; replace the placeholder (by temp id) with the server List.
+    ListInserted {
+        temp: ListId,
+        list: List,
+    },
+    /// A List add failed; drop the placeholder (by temp id).
+    ListAddFailed {
+        temp: ListId,
+        reason: String,
+    },
+    /// A List rename succeeded; reconcile the Model with the server's List.
+    ListUpdated(List),
+    /// A List rename failed; roll back to the pre-write snapshot.
+    ListWriteFailed {
+        list: ListId,
+        reason: String,
+    },
+    /// A List delete succeeded; drop the optimistic-delete bookkeeping.
+    ListDeleted(ListId),
+    /// A List delete failed; re-insert the List at its prior position.
+    ListDeleteFailed {
+        list: ListId,
+        reason: String,
+    },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
 }
@@ -237,6 +277,13 @@ pub enum Command {
         temp: TaskId,
         title: String,
     },
+    /// Insert a new List; `temp` echoes back so the placeholder can be
+    /// reconciled with the server List.
+    AddList { temp: ListId, title: String },
+    /// Write-through a title rename for a List.
+    RenameList { list: ListId, title: String },
+    /// Delete a List.
+    DeleteList { list: ListId },
 }
 
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
@@ -308,6 +355,70 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         Message::TaskAddFailed { temp, reason } => {
             model.tasks.retain(|t| t.id != temp);
             clamp_task_selection(model);
+            model.status_line = Some(reason);
+            Vec::new()
+        }
+        Message::ListInserted { temp, list } => {
+            // Reconcile the optimistic placeholder with the server's real List.
+            if let Some(slot) = model.lists.iter_mut().find(|l| l.id == temp) {
+                *slot = list.clone();
+                // If the placeholder was the active List, load the server List's
+                // Tasks now that it has a real id (a fresh List is empty, but this
+                // keeps the pane and cache consistent).
+                if model.selected_list_id() == Some(&list.id) {
+                    return request_selected_tasks(model, true);
+                }
+            } else if !model.lists.iter().any(|l| l.id == list.id) {
+                // A refresh wiped the placeholder before the reply; don't lose
+                // the confirmed List (and don't duplicate one a refresh added).
+                model.lists.push(list);
+            }
+            Vec::new()
+        }
+        Message::ListAddFailed { temp, reason } => {
+            let was_selected = model.selected_list_id() == Some(&temp);
+            model.lists.retain(|l| l.id != temp);
+            clamp_list_selection(model);
+            model.status_line = Some(reason);
+            if was_selected {
+                return request_selected_tasks(model, true);
+            }
+            Vec::new()
+        }
+        Message::ListUpdated(list) => {
+            model.pending_list_writes.remove(&list.id);
+            if let Some(slot) = model.lists.iter_mut().find(|l| l.id == list.id) {
+                *slot = list;
+            }
+            Vec::new()
+        }
+        Message::ListWriteFailed { list, reason } => {
+            if let Some(previous) = model.pending_list_writes.remove(&list) {
+                if let Some(slot) = model.lists.iter_mut().find(|l| l.id == previous.id) {
+                    *slot = previous;
+                }
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
+        Message::ListDeleted(list) => {
+            model.pending_list_deletes.remove(&list);
+            Vec::new()
+        }
+        Message::ListDeleteFailed { list, reason } => {
+            if let Some((index, previous)) = model.pending_list_deletes.remove(&list) {
+                // Guard against a refresh having already re-added it: only
+                // re-insert when it's genuinely absent, so we can't duplicate.
+                if !model.lists.iter().any(|l| l.id == previous.id) {
+                    let at = index.min(model.lists.len());
+                    model.lists.insert(at, previous);
+                    // Restore the selection to the recovered List and reload its
+                    // Tasks — the pane currently shows the List we fell back to.
+                    model.selected_list = Some(at);
+                    model.status_line = Some(reason);
+                    return request_selected_tasks(model, true);
+                }
+            }
             model.status_line = Some(reason);
             Vec::new()
         }
@@ -404,6 +515,9 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::EditTitle => open_edit_title(model),
         Action::EditDue => open_edit_due(model),
         Action::DeleteTask => open_delete_confirm(model),
+        Action::AddList => open_add_list(model),
+        Action::RenameList => open_rename_list(model),
+        Action::DeleteList => open_delete_list_confirm(model),
         // View-only: cycle the local lens. `tasks` (Manual order) is untouched
         // and `selected_task` keeps indexing it, so the cursor stays on the
         // same Task by id across the re-sort. Never emits a Command.
@@ -500,6 +614,91 @@ fn open_delete_confirm(model: &mut Model) {
     }));
 }
 
+/// The active List, if the sidebar is focused with a selection. List management
+/// is a sidebar action, so these verbs are inert while the task pane is focused
+/// (their capital keys can't clash with the task-pane `a`/`e`/`x`).
+fn focused_list(model: &Model) -> Option<&List> {
+    if model.focus != Focus::Sidebar {
+        return None;
+    }
+    model.selected_list.and_then(|i| model.lists.get(i))
+}
+
+/// Open the capture overlay for a new List (sidebar-focused only).
+fn open_add_list(model: &mut Model) {
+    if model.focus == Focus::Sidebar {
+        model.overlay = Some(Overlay::AddList {
+            buffer: String::new(),
+        });
+    }
+}
+
+/// Optimistically append a placeholder List (Google appends new Lists) and
+/// request the insert. The placeholder carries a `temp-list-N` id; the server
+/// List replaces it via `ListInserted`. Selecting it clears the task pane (a
+/// fresh List is empty); the server round-trip fills it once reconciled.
+fn finish_add_list(model: &mut Model, buffer: String) -> Vec<Command> {
+    let title = buffer.trim().to_string();
+    if title.is_empty() {
+        return Vec::new();
+    }
+    let temp = ListId(format!("temp-list-{}", model.next_temp));
+    model.next_temp += 1;
+    model.lists.push(List {
+        id: temp.clone(),
+        title: title.clone(),
+        etag: String::new(),
+        updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+    });
+    // Make the new List active. Don't emit LoadTasks for the placeholder id
+    // (Google has no such List yet); the pane is empty until `ListInserted`.
+    model.selected_list = Some(model.lists.len() - 1);
+    model.tasks.clear();
+    model.selected_task = None;
+    vec![Command::AddList { temp, title }]
+}
+
+/// Open the rename overlay, prefilled with the active List's title.
+fn open_rename_list(model: &mut Model) {
+    if let Some(list) = focused_list(model) {
+        model.overlay = Some(Overlay::RenameList {
+            list: list.id.clone(),
+            buffer: list.title.clone(),
+        });
+    }
+}
+
+fn finish_rename_list(model: &mut Model, list: ListId, buffer: String) -> Vec<Command> {
+    let title = buffer.trim().to_string();
+    if title.is_empty() {
+        return Vec::new(); // cancel silently on an empty title
+    }
+    // Single-flight: don't lose the edit silently if a write is already running.
+    if model.pending_list_writes.contains_key(&list) {
+        model.status_line = Some("a write is already in progress for this list".to_string());
+        return Vec::new();
+    }
+    let Some(index) = model.lists.iter().position(|l| l.id == list) else {
+        return Vec::new();
+    };
+    model
+        .pending_list_writes
+        .insert(list.clone(), model.lists[index].clone());
+    model.lists[index].title = title.clone();
+    vec![Command::RenameList { list, title }]
+}
+
+fn open_delete_list_confirm(model: &mut Model) {
+    let Some(list) = focused_list(model) else {
+        return;
+    };
+    let (id, title) = (list.id.clone(), list.title.clone());
+    model.overlay = Some(Overlay::Confirm(Confirm {
+        prompt: format!("Delete list \"{title}\"? (y/n)"),
+        action: ConfirmAction::DeleteList { list: id },
+    }));
+}
+
 /// Route a key to the active overlay: text editing for input overlays, yes/no
 /// for `Confirm`.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
@@ -534,6 +733,8 @@ fn submit_input(model: &mut Model) -> Vec<Command> {
         Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
         Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer),
         Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
+        Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),
+        Some(Overlay::RenameList { list, buffer }) => finish_rename_list(model, list, buffer),
         other => {
             model.overlay = other;
             Vec::new()
@@ -615,7 +816,32 @@ fn execute_confirm(model: &mut Model) -> Vec<Command> {
             clamp_task_selection(model);
             vec![Command::DeleteTask { list, task }]
         }
+        ConfirmAction::DeleteList { list } => {
+            let Some(index) = model.lists.iter().position(|l| l.id == list) else {
+                return Vec::new();
+            };
+            let removed = model.lists.remove(index); // optimistic delete
+            model
+                .pending_list_deletes
+                .insert(list.clone(), (index, removed));
+            // Re-point selection to the List now occupying (or nearest to) the
+            // freed slot and reload its Tasks. On failure (e.g. the undeletable
+            // default List), `ListDeleteFailed` restores everything.
+            let mut cmds = vec![Command::DeleteList { list }];
+            clamp_list_selection(model);
+            cmds.extend(request_selected_tasks(model, true));
+            cmds
+        }
     }
+}
+
+/// Keep `selected_list` in range after the List set shrinks.
+fn clamp_list_selection(model: &mut Model) {
+    model.selected_list = if model.lists.is_empty() {
+        None
+    } else {
+        Some(model.selected_list.unwrap_or(0).min(model.lists.len() - 1))
+    };
 }
 
 /// Keep `selected_task` in range after the Task set shrinks.

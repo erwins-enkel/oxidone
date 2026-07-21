@@ -3,6 +3,7 @@
 //! its one job that a fake can't verify (request-building + JSON) is covered by
 //! the `wiremock` suite in `tests/`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,11 +18,20 @@ use crate::domain::{List, ListId, Status, Task, TaskId, TaskLink};
 /// Base URL for the Tasks API v1.
 pub const BASE: &str = "https://tasks.googleapis.com/tasks/v1";
 
-/// A single `list_tasks` page cap. Google defaults to 20 and maxes at 100; we
-/// ask for 100 to keep each trait method to a single HTTP call (pagination is a
-/// deliberate non-goal here — see the ticket). A List with >100 live Tasks is
-/// out of scope for v1.
-const MAX_RESULTS: &str = "100";
+/// `tasks.list` page size. Google defaults to 20 and maxes at 100, so asking
+/// for 100 is what keeps a normal List to a single round trip; the pages beyond
+/// it are followed by [`RestClient::fetch_all_pages`]. `tasklists.list` sends no
+/// equivalent — there Google's default *is* its maximum (1000), so naming it
+/// would be a no-op parameter.
+const TASKS_PAGE_SIZE: &str = "100";
+
+/// Backstop for the pagination loop, above every documented ceiling: Google caps
+/// an account at 100,000 Tasks, and `show_hidden=true` can put all of one List's
+/// Cleared history in scope, so 1000 full pages is the real worst case — doubled
+/// here, because Google may return short pages and a tight bound would reject a
+/// legitimate account's data. `tasklists.list` needs 2 pages at its own ceiling
+/// of 2000 Lists, so one shared number covers both reads.
+const MAX_PAGES: usize = 2000;
 
 /// Hand-rolled Google Tasks client. Two seams keep it testable without a live
 /// Google account (ADR-0004):
@@ -106,6 +116,59 @@ impl RestClient {
         self.send(req).await?;
         Ok(())
     }
+
+    /// Follow `nextPageToken` until Google stops handing one out, concatenating
+    /// every page's `items` in order.
+    ///
+    /// `request` is called **once per page** and must rebuild the whole request
+    /// from scratch, cursor included. It is deliberately not a builder that gets
+    /// a `pageToken` appended: [`reqwest::RequestBuilder::query`] *merges* rather
+    /// than replaces, so reusing one builder across pages would send
+    /// `pageToken=P2&pageToken=P3` from the third page on. Rebuilding makes that
+    /// unrepresentable — and every other filter is re-sent for free, which
+    /// Google requires (it does not remember them across a cursor).
+    ///
+    /// Two guards keep the loop terminating, and both fail closed — an error,
+    /// never the pages gathered so far:
+    /// - a cursor Google has already handed out is a cycle, of any length;
+    /// - [`MAX_PAGES`] bounds any other way a chain could fail to end.
+    async fn fetch_all_pages<T>(
+        &self,
+        request: impl Fn(Option<&str>) -> reqwest::RequestBuilder,
+    ) -> Result<Vec<T>, ApiError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let mut out: Vec<T> = Vec::new();
+        // Every cursor seen so far, not just the last one: a cycle need not be
+        // tight. `P2 → P3 → P2 → …` never repeats *adjacent* cursors, so
+        // comparing against the previous one alone would let it run to
+        // `MAX_PAGES` — thousands of round trips, duplicating the cycle's items
+        // on every lap — before the backstop caught it.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut token: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let page: WirePage<T> = self.send_json(request(token.as_deref())).await?;
+            out.extend(page.items);
+            // An empty string is not a cursor; Google omits the field when done,
+            // but treating "" as absent costs nothing and avoids a pointless
+            // extra round trip if it ever does send one.
+            let Some(next) = page.next_page_token.filter(|t| !t.is_empty()) else {
+                return Ok(out);
+            };
+            // The cursor itself stays out of the message: it is an opaque Google
+            // blob of unbounded length, and this error is rendered in the
+            // one-line status bar.
+            if !seen.insert(next.clone()) {
+                return Err(ApiError::Pagination(format!(
+                    "google re-issued a page cursor after {} items",
+                    out.len()
+                )));
+            }
+            token = Some(next);
+        }
+        Err(ApiError::Pagination(format!("more than {MAX_PAGES} pages")))
+    }
 }
 
 /// Map an unsuccessful HTTP response to the right `ApiError`. `yup-oauth2`
@@ -163,10 +226,17 @@ fn ts_to_wire(ts: DateTime<Utc>) -> String {
 
 // ---- Wire types (Google's JSON), kept private to this module ----
 
+/// One page of a Google collection response: the items, plus the cursor to the
+/// next page if Google handed one out. `tasklists.list` and `tasks.list` share
+/// this envelope exactly, so one generic type serves both.
 #[derive(Deserialize)]
-struct WireLists {
-    #[serde(default)]
-    items: Vec<WireList>,
+struct WirePage<T> {
+    // `default = "Vec::new"`, not a bare `default`: the latter makes serde's
+    // derive demand `T: Default`, which no wire type has any reason to be.
+    #[serde(default = "Vec::new")]
+    items: Vec<T>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -188,12 +258,6 @@ impl WireList {
             updated: updated_or_now(self.updated.as_deref()),
         }
     }
-}
-
-#[derive(Deserialize)]
-struct WireTasks {
-    #[serde(default)]
-    items: Vec<WireTask>,
 }
 
 #[derive(Deserialize)]
@@ -322,8 +386,16 @@ struct TaskPatchBody {
 impl TasksApi for RestClient {
     async fn list_lists(&self) -> Result<Vec<List>, ApiError> {
         let url = format!("{}/users/@me/lists", self.base);
-        let body: WireLists = self.send_json(self.http.get(url)).await?;
-        Ok(body.items.into_iter().map(WireList::into_domain).collect())
+        let wire: Vec<WireList> = self
+            .fetch_all_pages(|token| {
+                let req = self.http.get(&url);
+                match token {
+                    Some(token) => req.query(&[("pageToken", token)]),
+                    None => req,
+                }
+            })
+            .await?;
+        Ok(wire.into_iter().map(WireList::into_domain).collect())
     }
 
     async fn default_list(&self) -> Result<List, ApiError> {
@@ -363,18 +435,28 @@ impl TasksApi for RestClient {
         updated_min: Option<DateTime<Utc>>,
     ) -> Result<Vec<Task>, ApiError> {
         let url = format!("{}/lists/{}/tasks", self.base, list.0);
+        // Built once and re-sent verbatim with every page: Google does not
+        // remember a request's filters across a `pageToken`, so dropping any of
+        // these mid-chain would silently change what the later pages contain.
         let mut query: Vec<(&str, String)> = vec![
             ("showCompleted", show_completed.to_string()),
             ("showHidden", show_hidden.to_string()),
-            ("maxResults", MAX_RESULTS.to_string()),
+            ("maxResults", TASKS_PAGE_SIZE.to_string()),
         ];
         if let Some(min) = updated_min {
             query.push(("updatedMin", ts_to_wire(min)));
         }
-        let body: WireTasks = self.send_json(self.http.get(url).query(&query)).await?;
+        let wire: Vec<WireTask> = self
+            .fetch_all_pages(|token| {
+                let req = self.http.get(&url).query(&query);
+                match token {
+                    Some(token) => req.query(&[("pageToken", token)]),
+                    None => req,
+                }
+            })
+            .await?;
         let list = list.clone();
-        Ok(body
-            .items
+        Ok(wire
             .into_iter()
             .map(|t| t.into_domain(list.clone()))
             .collect())

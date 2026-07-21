@@ -98,4 +98,10 @@ pub enum ApiError {
     NotFound,
     #[error("google rejected the request: {status} {message}")]
     Rejected { status: u16, message: String },
+    /// A paged read never reached its last page — Google kept handing out a
+    /// cursor that went nowhere, or handed out more pages than any account can
+    /// hold. Surfaced instead of the pages gathered so far: a short `Vec` here
+    /// is indistinguishable from a genuinely short List.
+    #[error("pagination did not terminate: {0}")]
+    Pagination(String),
 }

@@ -243,12 +243,13 @@ pub async fn delete_list(api: &dyn TasksApi, cache: &Cache, list: &ListId) -> Re
 /// The check must be **live**. A Cleared Subtask is in neither the pane nor the
 /// cache — the cache is filled by [`fetch_active_tasks`] with `show_hidden=false`
 /// and `replace_tasks` drops the List's rows wholesale first — so only a fetch
-/// with `show_hidden=true` can see one. Known limit: `list_tasks` asks for 100
-/// Tasks and ignores `nextPageToken` (a declared v1 non-goal), so in a List past
-/// that size a child can fall outside the page and the parent moves.
+/// with `show_hidden=true` can see one. The scan is exhaustive: `list_tasks`
+/// follows `nextPageToken`, so a child cannot hide past a page boundary.
 ///
-/// **Two API calls**, and `FakeTasksApi`'s injected error is one-shot and
-/// positional: the first is spent here, on the check.
+/// **Two `TasksApi` calls**, and `FakeTasksApi`'s injected error is one-shot and
+/// positional: the first is spent here, on the check. Two *trait* calls is not
+/// two HTTP requests — `RestClient` pages the check, and `show_hidden=true` is
+/// its worst case, since a long Cleared history counts against the page size.
 pub async fn move_task_to_list(
     api: &dyn TasksApi,
     source: &ListId,

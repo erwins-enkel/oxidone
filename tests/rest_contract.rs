@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use oxidone::api::{ApiError, NewTask, RestClient, TaskPatch, TasksApi};
 use oxidone::auth::StaticTokenProvider;
@@ -136,6 +136,7 @@ async fn list_tasks_sends_show_flags_and_updated_min() {
         .and(path("/lists/L1/tasks"))
         .and(query_param("showCompleted", "true"))
         .and(query_param("showHidden", "false"))
+        .and(query_param("maxResults", "100"))
         .and(query_param("updatedMin", "2023-11-14T22:13:20Z"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [
@@ -523,6 +524,247 @@ async fn other_error_maps_to_rejected_with_message() {
             message: "Invalid task".into()
         }
     );
+}
+
+// ---- Pagination (issue #87) ----
+//
+// Google caps `tasks.list` at 100 rows a page and hands back a `nextPageToken`;
+// a client that ignores it shows a truncated List that looks complete. Pages are
+// told apart with the `up_to_n_times(1)` + `with_priority` idiom used by the
+// 401-retry tests below: the earlier stub retires after one hit, so the next
+// request falls through to the stub that asserts the cursor.
+
+/// One `tasks.list` row, so a multi-page body stays readable.
+fn task_json(id: &str, position: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": id, "etag": "e1", "status": "needsAction",
+        "updated": "2023-11-14T22:13:20.000Z", "position": position
+    })
+}
+
+/// Every filter has to be re-sent with the cursor — Google does not remember a
+/// request's parameters across a `pageToken`. Each one asserted here is a
+/// distinct silent corruption if dropped: `updatedMin` would widen the
+/// incremental sync window so later pages carry Tasks the caller filtered out,
+/// and `maxResults` would fall back to Google's default of 20, quintupling the
+/// round trips on exactly the path the Move Subtask check walks.
+#[tokio::test]
+async fn list_tasks_follows_next_page_token() {
+    let server = MockServer::start().await;
+    let updated_min = Utc.with_ymd_and_hms(2023, 11, 14, 22, 13, 20).unwrap();
+    let filters = |mock: wiremock::MockBuilder| {
+        mock.and(query_param("showCompleted", "true"))
+            .and(query_param("showHidden", "true"))
+            .and(query_param("maxResults", "100"))
+            .and(query_param("updatedMin", "2023-11-14T22:13:20Z"))
+    };
+
+    filters(Mock::given(method("GET")).and(path("/lists/L1/tasks")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    filters(Mock::given(method("GET")).and(path("/lists/L1/tasks")))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T2", "00000000000000000001")]
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tasks = client(&server)
+        .list_tasks(&ListId("L1".into()), true, true, Some(updated_min))
+        .await
+        .unwrap();
+    // Both pages, concatenated in the order Google served them.
+    let ids: Vec<_> = tasks.iter().map(|t| t.id.0.as_str()).collect();
+    assert_eq!(ids, ["T1", "T2"]);
+}
+
+/// The regression test for cursor accumulation, which needs a *third* page to
+/// be visible at all: `reqwest`'s `RequestBuilder::query` merges rather than
+/// replaces, so a client that clones one builder and appends `pageToken` per
+/// page sends `pageToken=P2&pageToken=P3` from here on — and a plain
+/// `query_param("pageToken", "P3")` matcher is satisfied by that request. Only
+/// counting the pairs catches it.
+#[tokio::test]
+async fn list_tasks_sends_the_cursor_exactly_once_on_the_third_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T2", "00000000000000000001")],
+            "nextPageToken": "P3"
+        })))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(|req: &Request| {
+            let cursors: Vec<String> = req
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key == "pageToken")
+                .map(|(_, value)| value.into_owned())
+                .collect();
+            cursors == ["P3"]
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T3", "00000000000000000002")]
+        })))
+        .with_priority(3)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tasks = client(&server)
+        .list_tasks(&ListId("L1".into()), true, false, None)
+        .await
+        .unwrap();
+    let ids: Vec<_> = tasks.iter().map(|t| t.id.0.as_str()).collect();
+    assert_eq!(ids, ["T1", "T2", "T3"]);
+}
+
+/// A cycle need not be tight. `P2 → P3 → P2` never repeats an *adjacent*
+/// cursor, so a guard that only remembers the previous one would keep walking
+/// the loop — duplicating the cycle's Tasks on every lap — until `MAX_PAGES`
+/// finally stopped it thousands of requests later. Every cursor seen is
+/// remembered, so the second `P2` fails on the third round trip.
+#[tokio::test]
+async fn list_tasks_rejects_a_cycling_page_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T2", "00000000000000000001")],
+            "nextPageToken": "P3"
+        })))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Back to a cursor already spent — the cycle closes here.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T3", "00000000000000000002")],
+            "nextPageToken": "P2"
+        })))
+        .with_priority(3)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .list_tasks(&ListId("L1".into()), true, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Pagination(_)), "got {err:?}");
+}
+
+/// The tight case of the same cycle. Fail closed: the two Tasks already
+/// gathered are discarded rather than returned as if they were the whole List —
+/// a short `Vec` here is indistinguishable from a short List.
+#[tokio::test]
+async fn list_tasks_rejects_a_repeated_page_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Same cursor back again.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T2", "00000000000000000001")],
+            "nextPageToken": "P2"
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .list_tasks(&ListId("L1".into()), true, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Pagination(_)), "got {err:?}");
+}
+
+/// `tasklists.list` paginates too — Google's page default there is 1000 (which
+/// is also its maximum, so oxidone sends no `maxResults`), but an account may
+/// hold 2000 Lists.
+#[tokio::test]
+async fn list_lists_follows_next_page_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "id": "L1", "title": "Work", "etag": "e1",
+                  "updated": "2023-11-14T22:13:20.000Z" }
+            ],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "id": "L2", "title": "Home", "etag": "e2",
+                  "updated": "2023-11-14T22:13:21.000Z" }
+            ]
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let lists = client(&server).list_lists().await.unwrap();
+    let titles: Vec<_> = lists.iter().map(|l| l.title.as_str()).collect();
+    assert_eq!(titles, ["Work", "Home"]);
 }
 
 // ---- Auth-expiry retry (ADR-0002) ----

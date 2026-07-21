@@ -4,7 +4,7 @@
 //! from Google via `TasksApi`, mirrors the result into the cache, and returns
 //! the cached view. Write-through and the offline queue land in later slices.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 
 use crate::api::{ApiError, TaskPatch, TasksApi};
@@ -230,6 +230,62 @@ pub async fn delete_list(api: &dyn TasksApi, cache: &Cache, list: &ListId) -> Re
     api.delete_list(list).await?;
     cache.delete_list(list)?;
     Ok(())
+}
+
+/// Relocate a Task to another List, refusing first if it still has Subtasks.
+///
+/// The refusal is **oxidone's**, not Google's — whether Google rejects this is
+/// unverified — so it is an `anyhow` error rather than an [`ApiError`] variant:
+/// `Rejected` would render as "google rejected the request" for a call Google
+/// never received. Transport failures keep their cause under a context line;
+/// callers format with `{e:#}` to show the whole chain.
+///
+/// The check must be **live**. A Cleared Subtask is in neither the pane nor the
+/// cache — the cache is filled by [`fetch_active_tasks`] with `show_hidden=false`
+/// and `replace_tasks` drops the List's rows wholesale first — so only a fetch
+/// with `show_hidden=true` can see one. Known limit: `list_tasks` asks for 100
+/// Tasks and ignores `nextPageToken` (a declared v1 non-goal), so in a List past
+/// that size a child can fall outside the page and the parent moves.
+///
+/// **Two API calls**, and `FakeTasksApi`'s injected error is one-shot and
+/// positional: the first is spent here, on the check.
+pub async fn move_task_to_list(
+    api: &dyn TasksApi,
+    source: &ListId,
+    task: &TaskId,
+    destination: &ListId,
+) -> Result<Task> {
+    let siblings = api
+        .list_tasks(source, true, true, None)
+        .await
+        .context("failed to check for subtasks")?;
+    if siblings.iter().any(|t| t.parent.as_ref() == Some(task)) {
+        bail!("can't move a task with subtasks to another list");
+    }
+    api.move_task_to_list(source, task, destination)
+        .await
+        .context("failed to move task")
+}
+
+/// Relocate a Task to another List and mirror the result into the cache.
+///
+/// One `upsert_task` is the whole cache reconcile: `tasks` is keyed by `id`
+/// `PRIMARY KEY` and written `INSERT OR REPLACE`, so writing the moved Task
+/// *relocates* the row rather than duplicating it. A `delete_task` on the source
+/// would be a second, racier definition of the same effect.
+///
+/// The combined form for tests; the worker splits it so no lock is held across
+/// the await (see [`patch_completed`] for the rationale).
+pub async fn write_move_to_list(
+    api: &dyn TasksApi,
+    cache: &Cache,
+    source: &ListId,
+    task: &TaskId,
+    destination: &ListId,
+) -> Result<Task> {
+    let moved = move_task_to_list(api, source, task, destination).await?;
+    cache.upsert_task(&moved)?;
+    Ok(moved)
 }
 
 /// Delete a Task on Google and mirror the removal into the cache.

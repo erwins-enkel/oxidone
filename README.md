@@ -24,6 +24,7 @@ a Tasks costume.
 - Create / complete / edit / delete tasks; un-complete; clear completed
 - Subtasks (one level, matching Google), indent/outdent, manual reorder
   (from a sort view, the first reorder key switches back to "my order")
+- Move a task to another list (`M`), from a list or from Today
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
 - Bullet Journal entry types — Task, Event (`○`), Note (`—`) — flipped with

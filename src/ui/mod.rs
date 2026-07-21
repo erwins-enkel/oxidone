@@ -118,6 +118,9 @@ fn render_overlay(
         Overlay::OpenLink { links, selected } => {
             return render_link_picker(frame, area, links, *selected, theme)
         }
+        Overlay::MoveToList {
+            targets, selected, ..
+        } => return render_list_picker(frame, area, targets, *selected, theme),
     };
     let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
     let popup = centered(area, OVERLAY_WIDTH, height + OVERLAY_BORDERS);
@@ -183,6 +186,44 @@ fn render_link_picker(
         .collect();
     frame.render_widget(Clear, popup);
     render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
+}
+
+/// The move-to-List picker. Raised only when there is at least one candidate,
+/// so it always has rows.
+fn render_list_picker(
+    frame: &mut Frame,
+    area: Rect,
+    targets: &[crate::domain::List],
+    selected: usize,
+    theme: &Theme,
+) {
+    // Same reasoning as the link picker: keep it clear of the status line and the
+    // legend spelling out `j/k move  Enter move here  Esc cancel`.
+    let body = Rect {
+        height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
+        ..area
+    };
+    let popup = centered(
+        body,
+        OVERLAY_WIDTH,
+        picker_height(targets.len(), body.height),
+    );
+    let width =
+        (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
+    let items: Vec<ListItem> = targets
+        .iter()
+        .map(|list| ListItem::new(truncate(&list.title, width, "…")))
+        .collect();
+    frame.render_widget(Clear, popup);
+    render_selectable(
+        frame,
+        popup,
+        "Move to list",
+        items,
+        Some(selected),
+        true,
+        theme,
+    );
 }
 
 /// `text` cut to `width` *display cells*, the last spent on `ellipsis` so a
@@ -914,6 +955,7 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
     match &model.overlay {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
+        Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
         // The add-entry captures parse a trailing date and bind `Tab` for a
         // literal submit, so they get their own legend rather than `TextInput`'s.
         Some(Overlay::AddTask { .. } | Overlay::AddSubtask { .. }) => {
@@ -1863,6 +1905,16 @@ mod tests {
             selected: 0,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::LinkPicker);
+
+        // Same for the move-to-List picker: `Enter` moves rather than saves, and
+        // it has no buffer for `TextInput`'s legend to describe.
+        model.overlay = Some(Overlay::MoveToList {
+            task: TaskId("t".into()),
+            source: ListId("l".into()),
+            targets: Vec::new(),
+            selected: 0,
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::ListPicker);
     }
 
     #[test]

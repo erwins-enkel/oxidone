@@ -430,6 +430,26 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     });
                 }
             },
+            Command::MoveToList {
+                source,
+                task,
+                destination,
+            } => match api {
+                Some(api) => spawn_move_to_list(
+                    api.clone(),
+                    cache.clone(),
+                    tx.clone(),
+                    source,
+                    task,
+                    destination,
+                ),
+                None => {
+                    let _ = tx.send(Message::MoveToListFailed {
+                        task,
+                        reason: OFFLINE.to_string(),
+                    });
+                }
+            },
             Command::AddList { temp, title } => match api {
                 Some(api) => spawn_add_list(api.clone(), cache.clone(), tx.clone(), temp, title),
                 None => {
@@ -676,6 +696,44 @@ fn spawn_write_notes(
                 reason: format!("failed to update task: {e}"),
             },
         };
+        let _ = tx.send(message);
+    });
+}
+
+/// Relocate a Task to another List, mirror the move into the cache, and report
+/// back (or roll the optimistic removal back on failure).
+///
+/// The API call is awaited with no lock held, then the cache is taken — a
+/// combined `sync::write_move_to_list` would hold a `MutexGuard` across the
+/// await, which is not `Send`.
+///
+/// `{e:#}` on purpose: `anyhow`'s plain `Display` prints only the outermost
+/// context, so `{e}` would reduce a transport failure to "failed to move task"
+/// and drop Google's own message. The Subtask refusal carries no context, so it
+/// reads the same either way.
+fn spawn_move_to_list(
+    api: Arc<dyn TasksApi>,
+    cache: SharedCache,
+    tx: UnboundedSender<Message>,
+    source: ListId,
+    task: TaskId,
+    destination: ListId,
+) {
+    tokio::spawn(async move {
+        let message =
+            match sync::move_task_to_list(api.as_ref(), &source, &task, &destination).await {
+                Ok(moved) => {
+                    // One write relocates the row: `tasks` is keyed by id.
+                    if let Err(e) = cache.lock().unwrap().upsert_task(&moved) {
+                        tracing::warn!(error = %e, "failed to cache moved task");
+                    }
+                    Message::MovedToList(moved)
+                }
+                Err(e) => Message::MoveToListFailed {
+                    task,
+                    reason: format!("{e:#}"),
+                },
+            };
         let _ = tx.send(message);
     });
 }

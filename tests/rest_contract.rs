@@ -393,7 +393,7 @@ async fn move_task_sends_parent_and_previous_query_params() {
 }
 
 #[tokio::test]
-async fn move_task_to_list_sends_destination_tasklist_and_clears_the_echoed_parent() {
+async fn move_task_to_list_sends_destination_tasklist_and_clears_a_synthetically_echoed_parent() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/T3/move"))
@@ -402,8 +402,14 @@ async fn move_task_to_list_sends_destination_tasklist_and_clears_the_echoed_pare
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "T3", "title": "moved", "etag": "e5",
             "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
-            // Google echoing the *source* List's parent. Left as-is it would name
-            // a Task absent from L2, which `Model::groups` draws as an orphan.
+            // A *synthetic* input, deliberately kept. #86 (2026-07-21) observed
+            // this response only for a **top-level** Task, which has no parent
+            // to echo — so it never exercised the echo this guards against, and
+            // relocating a *Subtask* (the plausible way to provoke one) went
+            // untested. Untested is not disproven: an echoed source parent would
+            // name a Task absent from L2, which `Model::groups` draws as an
+            // orphan, so the defensive `task.parent = None` and this — its only
+            // coverage — both stay.
             "position": "00000000000000000000", "parent": "T1"
         })))
         .mount(&server)
@@ -420,6 +426,50 @@ async fn move_task_to_list_sends_destination_tasklist_and_clears_the_echoed_pare
     // The destination is stamped from the argument, not read off the wire…
     assert_eq!(task.list, ListId("L2".into()));
     // …and the stale parent is dropped: the move asked for top-level.
+    assert_eq!(task.parent, None);
+}
+
+/// The `id` survives a cross-List move, against the body Google actually
+/// returned on 2026-07-21 (#86) when relocating a **top-level** Task — no
+/// `parent` field, `id` unchanged.
+///
+/// Only the `id` assertion below tests anything: `move_task_to_list` stamps
+/// `list` from its argument and clears `parent` unconditionally, so those two
+/// hold for *any* response body and are kept as regression guards, not as
+/// evidence about the wire. The id is what carries weight —
+/// `sync::write_move_to_list` relocates the cache row with a single
+/// `INSERT OR REPLACE` keyed on it, which *relocates* rather than duplicates
+/// only while the id is stable.
+///
+/// Pinned alongside the synthetic case above, not in place of it: that one
+/// covers a synthetic parent echo, which this observation does not reach.
+#[tokio::test]
+async fn move_task_to_list_keeps_the_id_across_lists() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks/T3/move"))
+        .and(query_param("destinationTasklist", "L2"))
+        .and(header("content-length", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "tasks#task", "id": "T3", "title": "moved", "etag": "e5",
+            "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
+            "position": "00000000000000000000", "links": []
+        })))
+        .mount(&server)
+        .await;
+
+    let task = client(&server)
+        .move_task_to_list(
+            &ListId("L1".into()),
+            &TaskId("T3".into()),
+            &ListId("L2".into()),
+        )
+        .await
+        .unwrap();
+    // The one assertion this test exists for: the id came off the wire unchanged.
+    assert_eq!(task.id, TaskId("T3".into()));
+    // Both true by construction (stamped / cleared regardless of the body).
+    assert_eq!(task.list, ListId("L2".into()));
     assert_eq!(task.parent, None);
 }
 

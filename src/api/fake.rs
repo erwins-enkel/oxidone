@@ -378,12 +378,17 @@ impl TasksApi for FakeTasksApi {
         if !st.list_exists(destination) {
             return Err(ApiError::NotFound);
         }
-        // Deliberately *not* rejecting a Task that has Subtasks. That rule is
-        // oxidone's, adopted because Google's behaviour here is unverified, and
-        // this fake models Google. Encoding it would also mask the refusal it
-        // stands in for: `sync::move_task_to_list` checks first, so no caller
-        // reaches this with children, and the children left behind below are an
-        // arbitrary stand-in nothing asserts on.
+        // Deliberately *not* rejecting a Task that has Subtasks: Google accepts
+        // it (verified 2026-07-21, see #86), and this fake models Google.
+        // Encoding oxidone's refusal would also mask it: `sync::move_task_to_list`
+        // checks first, so no caller reaches this with children.
+        //
+        // KNOWN DIVERGENCE (#95): Google carries the subtree — the children
+        // follow their parent into the destination, still naming it. The code
+        // below leaves them behind instead, which is what this fake did while
+        // the real behaviour was unknown. Nothing asserts on it today, so it is
+        // recorded rather than changed here; correcting it is a test-infra
+        // change of its own.
 
         let (seq, ts) = st.tick();
 

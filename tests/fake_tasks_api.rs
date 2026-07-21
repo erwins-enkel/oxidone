@@ -390,9 +390,10 @@ async fn move_task_to_list_rejects_an_unknown_task() {
 }
 
 // Deliberately no test that the fake refuses a parent with Subtasks: it does not.
-// That rule is oxidone's (Google's behaviour here is unverified), it lives in
-// `sync::move_task_to_list`, and teaching it to the fake would mask the boundary
-// test that pins it — see `tests/move_to_list_boundary.rs`.
+// That rule is oxidone's — Google accepts the move and carries the subtree intact
+// (verified 2026-07-21, see #86) — it lives in `sync::move_task_to_list`, and
+// teaching it to the fake would mask the boundary test that pins it — see
+// `tests/move_to_list_boundary.rs`.
 
 // ---- Fault injection ----
 

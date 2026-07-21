@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use reqwest::header::CONTENT_LENGTH;
 use serde::{Deserialize, Serialize};
 
 use super::{ApiError, NewTask, TaskPatch, TasksApi};
@@ -46,6 +47,17 @@ impl RestClient {
             base: base.into(),
             auth,
         }
+    }
+
+    /// A POST with no body. reqwest omits `Content-Length` entirely for a
+    /// bodyless request, and Google's HTTP/1.1 frontend answers 411 without it —
+    /// the request never reaches the Tasks API, so the error body is the
+    /// frontend's HTML rather than Google's JSON. Set it explicitly.
+    ///
+    /// Every bodyless POST must go through here; `self.http.post` alone is wrong
+    /// for this API. Each such endpoint asserts the header in the contract suite.
+    fn post_no_body(&self, url: String) -> reqwest::RequestBuilder {
+        self.http.post(url).header(CONTENT_LENGTH, "0")
     }
 
     /// Inject a fresh bearer token, send, and map transport failures to
@@ -430,7 +442,7 @@ impl TasksApi for RestClient {
         if let Some(prev) = previous {
             query.push(("previous", &prev.0));
         }
-        let wire: WireTask = self.send_json(self.http.post(url).query(&query)).await?;
+        let wire: WireTask = self.send_json(self.post_no_body(url).query(&query)).await?;
         Ok(wire.into_domain(list.clone()))
     }
 
@@ -442,7 +454,7 @@ impl TasksApi for RestClient {
     ) -> Result<Task, ApiError> {
         let url = format!("{}/lists/{}/tasks/{}/move", self.base, list.0, id.0);
         let query = [("destinationTasklist", &destination.0)];
-        let wire: WireTask = self.send_json(self.http.post(url).query(&query)).await?;
+        let wire: WireTask = self.send_json(self.post_no_body(url).query(&query)).await?;
         // Stamp the destination, as `move_task` stamps `list` — and clear
         // `parent`, which the response may still echo from the source List. Such
         // an id names a Task that does not exist in `destination`, and
@@ -455,6 +467,6 @@ impl TasksApi for RestClient {
 
     async fn clear_completed(&self, list: &ListId) -> Result<(), ApiError> {
         let url = format!("{}/lists/{}/tasks/clear", self.base, list.0);
-        self.send_empty(self.http.post(url)).await
+        self.send_empty(self.post_no_body(url)).await
     }
 }

@@ -12,6 +12,9 @@ pub struct Theme {
     pub text: Color,
     /// Dimmed / secondary text.
     pub subtext: Color,
+    /// Recessive context — one step below `subtext`, for text that names a row's
+    /// surroundings rather than the row itself (the List name in Today).
+    pub muted: Color,
     /// Border of an unfocused panel.
     pub surface: Color,
     /// Focused panel border + highlights.
@@ -33,6 +36,7 @@ impl Theme {
             base: conv(&c.base),
             text: conv(&c.text),
             subtext: conv(&c.subtext0),
+            muted: conv(&c.overlay1),
             surface: conv(&c.surface1),
             accent: conv(&c.mauve),
             overdue: conv(&c.red),

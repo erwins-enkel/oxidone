@@ -50,6 +50,23 @@ pub trait TasksApi: Send + Sync {
         parent: Option<&TaskId>,
         previous: Option<&TaskId>,
     ) -> Result<Task, ApiError>;
+    /// Relocate a Task to another List (`move` with `destinationTasklist`).
+    ///
+    /// Separate from [`TasksApi::move_task`] rather than a fifth parameter on it:
+    /// this takes no `parent`/`previous` and returns a Task whose `list` changed.
+    /// The Task always lands **top-level at the head** of `destination` — the one
+    /// position Google permits for every Task, including a Completed-and-Cleared
+    /// one, so a single rule covers every case.
+    ///
+    /// Refusing a Task that has Subtasks is *oxidone's* policy, not Google's, so
+    /// it lives in `sync`, not here — implementations relocate whatever they are
+    /// given.
+    async fn move_task_to_list(
+        &self,
+        list: &ListId,
+        id: &TaskId,
+        destination: &ListId,
+    ) -> Result<Task, ApiError>;
     /// Sweep Completed Tasks out of view (`hidden=true`).
     async fn clear_completed(&self, list: &ListId) -> Result<(), ApiError>;
 }

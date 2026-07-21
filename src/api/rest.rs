@@ -434,6 +434,25 @@ impl TasksApi for RestClient {
         Ok(wire.into_domain(list.clone()))
     }
 
+    async fn move_task_to_list(
+        &self,
+        list: &ListId,
+        id: &TaskId,
+        destination: &ListId,
+    ) -> Result<Task, ApiError> {
+        let url = format!("{}/lists/{}/tasks/{}/move", self.base, list.0, id.0);
+        let query = [("destinationTasklist", &destination.0)];
+        let wire: WireTask = self.send_json(self.http.post(url).query(&query)).await?;
+        // Stamp the destination, as `move_task` stamps `list` — and clear
+        // `parent`, which the response may still echo from the source List. Such
+        // an id names a Task that does not exist in `destination`, and
+        // `Model::groups` would render the row as a trailing orphan group. The
+        // move omits `parent`, so top-level is what was actually asked for.
+        let mut task = wire.into_domain(destination.clone());
+        task.parent = None;
+        Ok(task)
+    }
+
     async fn clear_completed(&self, list: &ListId) -> Result<(), ApiError> {
         let url = format!("{}/lists/{}/tasks/clear", self.base, list.0);
         self.send_empty(self.http.post(url)).await

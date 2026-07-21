@@ -3,6 +3,7 @@
 //! their result on screen — that is what this file covers, following
 //! `legend_render.rs`.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{Focus, Message, Model};
 use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId, TaskLink};
 use oxidone::ui::{self, theme::Theme};
@@ -41,10 +42,19 @@ fn rows(model: &Model) -> Vec<String> {
 /// a picker assertion from being met instead by the notes preview now drawn on the
 /// pane behind the popup.
 fn picker_lines(drawn: &[String]) -> Vec<String> {
+    popup_lines(drawn, "Links")
+}
+
+/// The move-to-List picker's own rows, bounded the same way.
+fn list_picker_lines(drawn: &[String]) -> Vec<String> {
+    popup_lines(drawn, "Move to list")
+}
+
+fn popup_lines(drawn: &[String], title: &str) -> Vec<String> {
     let start = drawn
         .iter()
-        .position(|r| r.contains("Links"))
-        .expect("the picker's Links title");
+        .position(|r| r.contains(title))
+        .unwrap_or_else(|| panic!("the picker's {title} title"));
     let mut out = Vec::new();
     for row in &drawn[start..] {
         out.push(row.clone());
@@ -382,4 +392,82 @@ fn press(c: char) -> crossterm::event::KeyEvent {
         crossterm::event::KeyCode::Char(c),
         crossterm::event::KeyModifiers::empty(),
     )
+}
+
+// ---- The move-to-List picker (#M) ----
+//
+// `render_list_picker` and `legend_context` are unit-tested next to the view, but
+// both pass whether or not `view` ever draws the overlay — which is what this
+// covers, exactly as the link picker above.
+
+#[test]
+fn the_move_to_list_picker_draws_every_list_but_the_tasks_own() {
+    let mut model = model_with(vec![task("t1", "pick a home", None)]);
+    // Three Lists; the row lives in `l`, so only the other two are candidates.
+    ui_update(
+        &mut model,
+        Message::ListsLoaded(vec![
+            named_list("l", "Inbox"),
+            named_list("w", "Work"),
+            named_list("h", "Home"),
+        ]),
+    );
+    model.selected = Selection::List(0);
+    ui_update(
+        &mut model,
+        Message::TasksLoaded(ListId("l".into()), vec![task("t1", "pick a home", None)]),
+    );
+    model.focus = Focus::Tasks;
+
+    ui_update(
+        &mut model,
+        Message::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::empty())),
+    );
+
+    let drawn = list_picker_lines(&rows(&model));
+    let body = drawn.join("\n");
+    assert!(body.contains("Work"), "candidate drawn: {body}");
+    assert!(body.contains("Home"), "candidate drawn: {body}");
+    assert!(
+        !body.contains("Inbox"),
+        "the Task's own List must not be offered: {body}"
+    );
+}
+
+#[test]
+fn the_move_to_list_picker_marks_the_selected_row() {
+    let mut model = model_with(vec![task("t1", "pick a home", None)]);
+    ui_update(
+        &mut model,
+        Message::ListsLoaded(vec![named_list("l", "Inbox"), named_list("w", "Work")]),
+    );
+    model.selected = Selection::List(0);
+    ui_update(
+        &mut model,
+        Message::TasksLoaded(ListId("l".into()), vec![task("t1", "pick a home", None)]),
+    );
+    model.focus = Focus::Tasks;
+    ui_update(
+        &mut model,
+        Message::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::empty())),
+    );
+
+    let drawn = list_picker_lines(&rows(&model));
+    let selected = drawn
+        .iter()
+        .find(|r| r.contains("Work"))
+        .expect("the only candidate");
+    assert!(
+        selected.contains('\u{203a}'),
+        "the cursor gutter marks the selection: {selected}"
+    );
+}
+
+fn named_list(id: &str, title: &str) -> List {
+    List {
+        id: ListId(id.into()),
+        title: title.into(),
+        etag: String::new(),
+        updated: chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+    }
 }

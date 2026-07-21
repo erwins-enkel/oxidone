@@ -59,6 +59,10 @@ pub enum Action {
     Outdent,
     MoveDown,
     MoveUp,
+    /// Relocate the selected Task to another List — a cross-List Move, opened as
+    /// a picker. Unlike the four above it writes no Manual order, so it neither
+    /// needs nor switches the Sort lens and works in Today.
+    MoveToList,
     // Sidebar List management. Bound to capitals so they never clash with the
     // task-pane verbs (`a`/`e`/`x`); the reducer additionally gates them on the
     // sidebar being focused.
@@ -259,6 +263,17 @@ pub fn bindings() -> &'static [Binding] {
             action: Action::MoveUp,
             help: "move task up",
         },
+        // With the Move group, and mid-table for the same reason as `m`/`w`:
+        // `help_layout` drops cheatsheet rows from the tail. `M` is the initial
+        // of the verb, not the capital of `m` (which is Migrate) — the two are
+        // unrelated, and the help text carries the distinction. No
+        // always-visible legend cell: the 80-column TASKS row is already full
+        // through `c completed` (see `legend`); this lives in `?`.
+        Binding {
+            key: KeyCode::Char('M'),
+            action: Action::MoveToList,
+            help: "move to another list",
+        },
         Binding {
             key: KeyCode::Char('A'),
             action: Action::AddList,
@@ -346,6 +361,8 @@ pub enum LegendContext {
     Confirm,
     /// The link picker: j/k move, Enter opens, Esc cancels.
     LinkPicker,
+    /// The move-to-List picker: j/k move, Enter moves, Esc cancels.
+    ListPicker,
 }
 
 /// Where a legend cell's key text comes from.
@@ -579,6 +596,22 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // Same shape as the link picker, but `Enter` performs the Move.
+    const LIST_PICKER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("j/k"),
+            label: "move",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "move here",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
@@ -586,5 +619,6 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::TaskCapture => TASK_CAPTURE,
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,
+        LegendContext::ListPicker => LIST_PICKER,
     }
 }

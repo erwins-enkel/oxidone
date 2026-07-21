@@ -386,6 +386,36 @@ async fn move_task_sends_parent_and_previous_query_params() {
 }
 
 #[tokio::test]
+async fn move_task_to_list_sends_destination_tasklist_and_clears_the_echoed_parent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks/T3/move"))
+        .and(query_param("destinationTasklist", "L2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "T3", "title": "moved", "etag": "e5",
+            "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
+            // Google echoing the *source* List's parent. Left as-is it would name
+            // a Task absent from L2, which `Model::groups` draws as an orphan.
+            "position": "00000000000000000000", "parent": "T1"
+        })))
+        .mount(&server)
+        .await;
+
+    let task = client(&server)
+        .move_task_to_list(
+            &ListId("L1".into()),
+            &TaskId("T3".into()),
+            &ListId("L2".into()),
+        )
+        .await
+        .unwrap();
+    // The destination is stamped from the argument, not read off the wire…
+    assert_eq!(task.list, ListId("L2".into()));
+    // …and the stale parent is dropped: the move asked for top-level.
+    assert_eq!(task.parent, None);
+}
+
+#[tokio::test]
 async fn move_task_to_top_sends_no_query_params() {
     let server = MockServer::start().await;
     // Matcher deliberately omits query_param assertions; the handler still

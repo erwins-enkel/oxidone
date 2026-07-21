@@ -118,6 +118,21 @@ pub struct Model {
     /// `move_preconditions`); a field edit to *another* Task during the window is
     /// transiently overwritten but re-converges via its own by-id reconciliation.
     pending_move: Option<(ListId, Vec<Task>)>,
+    /// Cross-List Moves in flight, keyed by Task, holding what is needed to undo
+    /// the optimistic removal: the pane it was removed from, its index there, and
+    /// the Task itself.
+    ///
+    /// Three jobs in one map. It is the **single-flight guard** for `M`; it is the
+    /// **rollback snapshot**; and it is a **provisional tombstone** — `set_tasks`
+    /// and `set_today_tasks` suppress ids found here, so a fetch already in flight
+    /// cannot put the row back before the reply lands. The permanent `tombstones`
+    /// entry is written in the same message that drops this one, so the two cover
+    /// the row without a gap.
+    ///
+    /// Both replies drop the entry **unconditionally**, before any pane test: a
+    /// latched entry would refuse every later `M` on that Task *and*, as a
+    /// tombstone, hide the row from its own List until restart.
+    pending_list_moves: HashMap<TaskId, PendingListMove>,
     /// Counter for minting placeholder ids for optimistically-added Tasks, before
     /// the server assigns the real id.
     next_temp: u64,
@@ -159,6 +174,24 @@ pub struct Model {
     pending_refresh: bool,
 }
 
+/// Which pane a row was optimistically removed from, so the reply can repair
+/// only that pane. An explicit enum rather than `Option<ListId>` so Today is
+/// never confused with a transiently out-of-range List index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneKey {
+    Today,
+    List(ListId),
+}
+
+/// The snapshot behind an in-flight cross-List Move: enough to undo the
+/// optimistic removal, plus the pane that removal happened in.
+#[derive(Debug, Clone)]
+struct PendingListMove {
+    pane: PaneKey,
+    index: usize,
+    task: Task,
+}
+
 /// A modal overlay drawn over the panes.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -183,6 +216,18 @@ pub enum Overlay {
     /// notes URLs. Only raised for more than one; a single link opens without
     /// asking.
     OpenLink { links: Vec<Link>, selected: usize },
+    /// Pick the List to relocate a Task to.
+    ///
+    /// `task` and `source` are captured when the picker opens rather than re-read
+    /// from `selected_task` at `Enter`: the picker is modal to *input* but not to
+    /// *messages*, so an async `TasksLoaded`/`TodayLoaded` can replace
+    /// `model.tasks` underneath it and shift every index.
+    MoveToList {
+        task: TaskId,
+        source: ListId,
+        targets: Vec<List>,
+        selected: usize,
+    },
 }
 
 impl Overlay {
@@ -196,7 +241,7 @@ impl Overlay {
             | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
             | Overlay::RenameList { buffer, .. } => Some(buffer),
-            Overlay::Confirm(_) | Overlay::OpenLink { .. } => None,
+            Overlay::Confirm(_) | Overlay::OpenLink { .. } | Overlay::MoveToList { .. } => None,
         }
     }
 }
@@ -253,6 +298,7 @@ impl Default for Model {
             pending_clears: HashMap::new(),
             tombstones: HashMap::new(),
             pending_move: None,
+            pending_list_moves: HashMap::new(),
             next_temp: 0,
             // A fixed placeholder, deliberately not the real clock: `Default`
             // stays pure so tests construct a deterministic Model and set `now`
@@ -807,6 +853,16 @@ pub enum Message {
         list: ListId,
         reason: String,
     },
+    /// A cross-List Move succeeded; carries the server Task, whose `list` is now
+    /// the destination.
+    MovedToList(Task),
+    /// A cross-List Move failed or was refused; roll the optimistic removal back.
+    /// `reason` is shown verbatim — for the Subtask refusal it is oxidone's own
+    /// sentence, for a transport failure it is the worker's formatted chain.
+    MoveToListFailed {
+        task: TaskId,
+        reason: String,
+    },
     /// The external notes editor returned changed text; write it through. `notes`
     /// is `None` when the user emptied the buffer (clears the notes). The runtime
     /// emits this only on an actual change — an unchanged buffer emits nothing.
@@ -895,6 +951,14 @@ pub enum Command {
         task: TaskId,
         parent: Option<TaskId>,
         previous: Option<TaskId>,
+    },
+    /// Relocate a Task to another List. Carries `source` (the Task's own List,
+    /// not the selected one — they differ in Today) so the worker can run the
+    /// authoritative Subtask check against it before writing.
+    MoveToList {
+        source: ListId,
+        task: TaskId,
+        destination: ListId,
     },
     /// Insert a new List; `temp` echoes back so the placeholder can be
     /// reconciled with the server List.
@@ -1241,6 +1305,65 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             model.status_line = Some(reason);
             Vec::new()
         }
+        Message::MovedToList(task) => {
+            // Unconditional, before any pane test: this entry is the single-flight
+            // key *and* the provisional tombstone, so leaving it would refuse every
+            // later `M` on this Task and hide the row from its own List until
+            // restart.
+            let Some(snapshot) = model.pending_list_moves.remove(&task.id) else {
+                // Not ours — a spurious reply must not tombstone a live row.
+                return Vec::new();
+            };
+            // Hand the provisional tombstone over to the permanent one, in the same
+            // message so no fetch can slip between them. Evicting under the
+            // *destination* is not tidying: `reconcile_tombstones` only evicts when
+            // a fetch of that List omits the id, so a stale entry from an earlier
+            // A→B→A hop would silently drop the row on its way home.
+            let source = snapshot.task.list.clone();
+            model
+                .tombstones
+                .entry(source)
+                .or_default()
+                .insert(task.id.clone());
+            if let Some(set) = model.tombstones.get_mut(&task.list) {
+                set.remove(&task.id);
+                if set.is_empty() {
+                    model.tombstones.remove(&task.list);
+                }
+            }
+
+            // Only Today needs repair. A source List pane cannot be showing the row
+            // — the provisional tombstone kept it out — and any other pane holds
+            // nothing of ours. The re-insert is a bridge across the frames before
+            // the reload below lands, not a durable placement.
+            if snapshot.pane == PaneKey::Today && model.today_active() {
+                let selected = selected_id(model);
+                if !model.tasks.iter().any(|t| t.id == task.id) {
+                    let at = snapshot.index.min(model.tasks.len());
+                    model.tasks.insert(at, task);
+                }
+                model.selected_task =
+                    selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+                reselect_visible(model);
+                // Today spans Lists, so the row belongs in the aggregate under its
+                // new List — but a `LoadToday` issued before the move returns it
+                // under the *old* one, where the fresh source tombstone drops it.
+                // With no background poll, re-asking is what repairs that.
+                return vec![Command::LoadToday {
+                    lists: model.lists.clone(),
+                    today: model.now.date_naive(),
+                }];
+            }
+            Vec::new()
+        }
+        Message::MoveToListFailed { task, reason } => {
+            // Dropped unconditionally, for the same reason as the success arm.
+            if let Some(snapshot) = model.pending_list_moves.remove(&task) {
+                restore_list_move(model, snapshot);
+            }
+            model.status_line = Some(reason);
+            Vec::new()
+        }
         Message::NotesEdited { task, notes } => finish_edit_notes(model, task, notes),
         Message::LinkOpenFailed { reason } => {
             model.status_line = Some(format!("could not open link: {reason}"));
@@ -1404,6 +1527,21 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
         return;
     }
     let tasks = reconcile_tombstones(model, list, tasks);
+    // Then drop rows with a cross-List Move in flight *out of this List*. Kept
+    // here rather than inside `reconcile_tombstones`, which returns early when the
+    // List has no tombstone set — the first move of a session. Order matters too:
+    // reconcile must see the raw incoming ids, or a suppressed id would read as
+    // "absent" and evict its own tombstone. Scoped to the source, so an in-flight
+    // fetch of the *destination* still shows the row arriving.
+    let tasks: Vec<Task> = tasks
+        .into_iter()
+        .filter(|t| {
+            !model
+                .pending_list_moves
+                .get(&t.id)
+                .is_some_and(|p| &p.task.list == list)
+        })
+        .collect();
     let previously_selected = model
         .selected_task
         .and_then(|i| model.tasks.get(i))
@@ -1436,6 +1574,10 @@ fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
                 .get(&t.list)
                 .is_some_and(|set| set.contains(&t.id))
         })
+        // Unconditional here, unlike `set_tasks`: Today spans Lists, so there is
+        // no per-List fill to scope against and a row mid-move belongs in neither
+        // its old List nor its new one until the reply lands.
+        .filter(|t| !model.pending_list_moves.contains_key(&t.id))
         .collect();
     let previously_selected = model
         .selected_task
@@ -1504,6 +1646,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::Outdent => return outdent(model),
         Action::MoveDown => return reorder(model, 1),
         Action::MoveUp => return reorder(model, -1),
+        Action::MoveToList => open_move_to_list(model),
     }
     Vec::new()
 }
@@ -1983,6 +2126,168 @@ fn reorder(model: &mut Model, dir: isize) -> Vec<Command> {
     }]
 }
 
+/// Whether an id is an optimistic placeholder, not yet confirmed by Google.
+///
+/// A *new* convention: nothing else in this reducer inspects id text — placeholders
+/// are otherwise reconciled by identity (`TaskInserted { temp, task }`). The
+/// alternative, a `provisional` flag on `Task`, would put a local-only field on the
+/// pure mirror (ADR-0003). Kept in step with the two mint sites, `finish_add_task`
+/// and `finish_add_list`; `a_task_still_being_added_cannot_be_moved` fails if the
+/// format drifts.
+fn is_placeholder(id: &str) -> bool {
+    id.starts_with("temp-")
+}
+
+/// Which pane the task pane is currently showing, for pairing an optimistic
+/// removal with the reply that repairs it.
+fn pane_key(model: &Model) -> Option<PaneKey> {
+    if model.today_active() {
+        return Some(PaneKey::Today);
+    }
+    model.selected_list_id().cloned().map(PaneKey::List)
+}
+
+/// Open the move-to-List picker for the selected Task.
+///
+/// Deliberately does **not** call `move_preconditions`: a cross-List Move writes
+/// no Manual order and computes against nothing on screen, so it neither needs
+/// the Manual lens nor switches it — which is why it works in Today, where the
+/// in-list Moves are disabled. The source List is the row's *own* `list`, since
+/// Today spans Lists.
+fn open_move_to_list(model: &mut Model) {
+    let Some(task) = focused_task(model) else {
+        return;
+    };
+    let (id, source) = (task.id.clone(), task.list.clone());
+
+    // A placeholder has no id on Google yet; moving it would 404 into a rollback
+    // instead of refusing. This also covers a Task sitting in a not-yet-created
+    // List: its own insert cannot have been confirmed either, so it is a
+    // placeholder too and never reaches the destination checks below.
+    if is_placeholder(&id.0) {
+        model.status_line = Some("still saving — try again in a moment".to_string());
+        return;
+    }
+    // Fast path only. The deciding check runs live in `sync::move_task_to_list`,
+    // because a Cleared child is in neither this Vec nor the cache — and in Today
+    // this Vec is the `due <= today` aggregate, which hides undated and distant
+    // children too.
+    if model.tasks.iter().any(|t| t.parent.as_ref() == Some(&id)) {
+        model.status_line = Some("can't move a task with subtasks to another list".to_string());
+        return;
+    }
+    // An in-list Move must not be in flight. `MoveFailed` restores `model.tasks`
+    // wholesale from a snapshot taken when that Move started, bypassing every
+    // filter including the provisional tombstone — so refusing here is what
+    // guarantees no such snapshot can predate our optimistic removal.
+    //
+    // Note this is checked at `M`, while the removal happens at `Enter`. Nothing
+    // can start an in-list Move in between: while an overlay is set, `overlay_key`
+    // routes keys to `picker_key` and returns, so `J`/`K`/`>`/`<` never reach
+    // `move_preconditions`. `an_in_list_move_key_does_nothing_while_the_picker_is_open`
+    // pins that.
+    if model.pending_move.is_some() || model.pending_list_moves.contains_key(&id) {
+        model.status_line = Some("a move is already in progress".to_string());
+        return;
+    }
+    // A field write to this Task would `PATCH /lists/{source}/…` and 404 once
+    // Google applies the move, rejecting an edit the user made in good faith.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return;
+    }
+
+    // Every List but the Task's own — and never a placeholder List, whose id
+    // does not exist on Google yet.
+    let targets: Vec<List> = model
+        .lists
+        .iter()
+        .filter(|l| l.id != source && !is_placeholder(&l.id.0))
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        model.status_line = Some("no other list to move to".to_string());
+        return;
+    }
+
+    model.overlay = Some(Overlay::MoveToList {
+        task: id,
+        source,
+        targets,
+        selected: 0,
+    });
+}
+
+/// Perform the Move the picker has selected: remove the row optimistically and
+/// ask the worker to write it.
+fn finish_move_to_list(
+    model: &mut Model,
+    task: TaskId,
+    source: ListId,
+    destination: ListId,
+) -> Vec<Command> {
+    // The pane may have been refilled while the picker was open, so the row is
+    // re-resolved by id rather than by any index captured at open time.
+    let Some(index) = model.tasks.iter().position(|t| t.id == task) else {
+        model.status_line = Some("that task is no longer here".to_string());
+        return Vec::new();
+    };
+    // Defensive: a row was just found in `model.tasks`, so some pane is showing
+    // it. Only a transiently out-of-range List index gets here, and dropping the
+    // Move is the safe half of that — there would be no pane to roll back into.
+    let Some(pane) = pane_key(model) else {
+        return Vec::new();
+    };
+
+    // Only a cursor on the doomed row needs a new home; one elsewhere stays put.
+    // Taken before the row goes — afterwards it has no display position — and
+    // resolved by id after, since `remove` shifts every later index.
+    let anchor = if selected_id(model).as_ref() == Some(&task) {
+        display_successor(model, &task)
+    } else {
+        selected_id(model)
+    };
+    let removed = model.tasks.remove(index);
+    model.pending_list_moves.insert(
+        task.clone(),
+        PendingListMove {
+            pane,
+            index,
+            task: removed,
+        },
+    );
+    model.selected_task = anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+    reselect_visible(model);
+
+    vec![Command::MoveToList {
+        source,
+        task,
+        destination,
+    }]
+}
+
+/// Restore a row whose cross-List Move failed, if its removal pane is still the
+/// one on screen. Shared by the failure arm; the snapshot is always dropped by
+/// the caller first.
+fn restore_list_move(model: &mut Model, snapshot: PendingListMove) {
+    if pane_key(model).as_ref() != Some(&snapshot.pane) {
+        // A switch during the round trip left a different pane in place;
+        // re-inserting into it would put a foreign row on screen.
+        return;
+    }
+    let selected = selected_id(model);
+    match model.tasks.iter().position(|t| t.id == snapshot.task.id) {
+        // A refresh may already have re-added it once the suppression lifted.
+        Some(at) => model.tasks[at] = snapshot.task,
+        None => {
+            let at = snapshot.index.min(model.tasks.len());
+            model.tasks.insert(at, snapshot.task);
+        }
+    }
+    model.selected_task = selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+    reselect_visible(model);
+}
+
 /// Open the due-date editor, prefilled with the current due (ISO) or empty.
 fn open_edit_due(model: &mut Model) {
     if let Some(task) = focused_task(model) {
@@ -2288,7 +2593,11 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     // enough: the picker has no buffer either, and falling through to the
     // confirm arm would let `y` silently dismiss it.
     match model.overlay {
-        Some(Overlay::OpenLink { .. }) => return picker_key(model, key),
+        // Both pickers, routed before the `Confirm` and text-buffer arms below:
+        // falling through would let `y` dismiss one, or swallow its keys.
+        Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {
+            return picker_key(model, key)
+        }
         Some(Overlay::Confirm(_)) => {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
@@ -2328,29 +2637,59 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     Vec::new()
 }
 
-/// Keys for the link picker: move the cursor, open the selected link, or cancel.
+/// Keys shared by both pickers: `j`/`k` move the cursor, `Esc` cancels, and
+/// `Enter` acts on the selected row — opening a link, or performing a Move.
+///
+/// Everything else is swallowed, as every other overlay already does — `q` must
+/// not quit with a modal up, and in particular `J`/`K`/`>`/`<` must not reach
+/// `move_preconditions`: `open_move_to_list` checks `pending_move` when the
+/// picker opens, and relies on no in-list Move being able to start before
+/// `Enter` lands.
 fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
-    let Some(Overlay::OpenLink { links, selected }) = model.overlay.as_mut() else {
-        return Vec::new();
+    let (len, selected) = match model.overlay.as_mut() {
+        Some(Overlay::OpenLink { links, selected }) => (links.len(), selected),
+        Some(Overlay::MoveToList {
+            targets, selected, ..
+        }) => (targets.len(), selected),
+        _ => return Vec::new(),
     };
     match key.code {
-        // Clamped rather than wrapping, matching pane selection.
+        // Clamped rather than wrapping, matching pane selection. `saturating_sub`
+        // because `len - 1` would underflow on an empty picker — neither is raised
+        // empty today, but a panic is not the way to find out if that changes.
         KeyCode::Char('j') | KeyCode::Down => {
-            *selected = (*selected + 1).min(links.len().saturating_sub(1));
+            *selected = (*selected + 1).min(len.saturating_sub(1))
         }
         KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
-        KeyCode::Enter => {
-            let url = links[*selected].url().clone();
-            model.overlay = None;
-            return vec![open_url(model, url)];
-        }
+        KeyCode::Enter => return submit_picker(model),
         KeyCode::Esc => model.overlay = None,
-        // Everything else is swallowed, as every other overlay already does —
-        // `q` must not quit with a modal up.
         _ => {}
     }
     Vec::new()
+}
+
+/// `Enter` on whichever picker is open.
+fn submit_picker(model: &mut Model) -> Vec<Command> {
+    match model.overlay.take() {
+        Some(Overlay::OpenLink { links, selected }) => {
+            let url = links[selected].url().clone();
+            vec![open_url(model, url)]
+        }
+        Some(Overlay::MoveToList {
+            task,
+            source,
+            targets,
+            selected,
+        }) => finish_move_to_list(model, task, source, targets[selected].id.clone()),
+        // Unreachable: `picker_key` is the only caller and it has already matched
+        // one of the two above. Restoring the overlay keeps a future third caller
+        // from silently dismissing it.
+        other => {
+            model.overlay = other;
+            Vec::new()
+        }
+    }
 }
 
 /// Submit whichever text-input overlay is active. `literal` only reaches the two

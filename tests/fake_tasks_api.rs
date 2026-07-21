@@ -3,7 +3,7 @@
 //! terminal, network, or Google account.
 
 use oxidone::api::{ApiError, NewTask, TaskPatch, TasksApi};
-use oxidone::domain::Status;
+use oxidone::domain::{ListId, Status, TaskId};
 
 fn fake() -> oxidone::api::FakeTasksApi {
     oxidone::api::FakeTasksApi::new()
@@ -296,6 +296,103 @@ async fn move_rejects_demoting_a_parent_into_a_subtask() {
         .unwrap_err();
     assert!(matches!(err, ApiError::Rejected { status: 400, .. }));
 }
+
+#[tokio::test]
+async fn move_task_to_list_relocates_to_the_head_of_the_destination() {
+    let api = fake();
+    let src = api.insert_list("Work").await.unwrap();
+    let dst = api.insert_list("Home").await.unwrap();
+    let a = api.insert_task(&src.id, new_task("a")).await.unwrap();
+    let b = api.insert_task(&src.id, new_task("b")).await.unwrap();
+    let z = api.insert_task(&dst.id, new_task("z")).await.unwrap();
+
+    let moved = api
+        .move_task_to_list(&src.id, &a.id, &dst.id)
+        .await
+        .unwrap();
+    assert_eq!(moved.list, dst.id);
+
+    // Gone from the source, which renumbers behind it.
+    let left: Vec<_> = api
+        .list_tasks(&src.id, true, true, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.title.clone())
+        .collect();
+    assert_eq!(left, ["b"]);
+    assert_eq!(
+        b.id,
+        api.list_tasks(&src.id, true, true, None).await.unwrap()[0].id
+    );
+
+    // At the *head* of the destination: the move carries no `previous`.
+    let arrived: Vec<_> = api
+        .list_tasks(&dst.id, true, true, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.title.clone())
+        .collect();
+    assert_eq!(arrived, ["a", "z"]);
+    assert_ne!(z.position, "");
+}
+
+#[tokio::test]
+async fn move_task_to_list_lands_a_subtask_top_level() {
+    let api = fake();
+    let src = api.insert_list("Work").await.unwrap();
+    let dst = api.insert_list("Home").await.unwrap();
+    let parent = api.insert_task(&src.id, new_task("parent")).await.unwrap();
+    let child = api.insert_task(&src.id, new_task("child")).await.unwrap();
+    api.move_task(&src.id, &child.id, Some(&parent.id), None)
+        .await
+        .unwrap();
+
+    let moved = api
+        .move_task_to_list(&src.id, &child.id, &dst.id)
+        .await
+        .unwrap();
+    // The parent lives in the source List and cannot follow, so the Subtask
+    // arrives top-level — the guarantee `rest.rs` enforces on the wire side.
+    assert_eq!(moved.parent, None);
+    assert!(!moved.is_subtask());
+    assert_eq!(moved.position, format!("{:020}", 0));
+}
+
+#[tokio::test]
+async fn move_task_to_list_rejects_an_unknown_destination() {
+    let api = fake();
+    let src = api.insert_list("Work").await.unwrap();
+    let a = api.insert_task(&src.id, new_task("a")).await.unwrap();
+
+    let err = api
+        .move_task_to_list(&src.id, &a.id, &ListId("nope".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::NotFound));
+    // Rejected before `tick()`, so the Task is untouched where it stands.
+    let still = api.list_tasks(&src.id, true, true, None).await.unwrap();
+    assert_eq!(still[0].etag, a.etag);
+}
+
+#[tokio::test]
+async fn move_task_to_list_rejects_an_unknown_task() {
+    let api = fake();
+    let src = api.insert_list("Work").await.unwrap();
+    let dst = api.insert_list("Home").await.unwrap();
+
+    let err = api
+        .move_task_to_list(&src.id, &TaskId("nope".into()), &dst.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::NotFound));
+}
+
+// Deliberately no test that the fake refuses a parent with Subtasks: it does not.
+// That rule is oxidone's (Google's behaviour here is unverified), it lives in
+// `sync::move_task_to_list`, and teaching it to the fake would mask the boundary
+// test that pins it — see `tests/move_to_list_boundary.rs`.
 
 // ---- Fault injection ----
 

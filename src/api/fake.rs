@@ -361,6 +361,61 @@ impl TasksApi for FakeTasksApi {
         Ok(moved)
     }
 
+    async fn move_task_to_list(
+        &self,
+        list: &ListId,
+        id: &TaskId,
+        destination: &ListId,
+    ) -> Result<Task, ApiError> {
+        let mut st = self.state.lock().unwrap();
+        st.take_error()?;
+
+        // Validate before advancing the clock, like `move_task`, so a rejected
+        // relocation leaves the deterministic timestamps untouched.
+        if st.entry_pos(list, id).is_none() {
+            return Err(ApiError::NotFound);
+        }
+        if !st.list_exists(destination) {
+            return Err(ApiError::NotFound);
+        }
+        // Deliberately *not* rejecting a Task that has Subtasks. That rule is
+        // oxidone's, adopted because Google's behaviour here is unverified, and
+        // this fake models Google. Encoding it would also mask the refusal it
+        // stands in for: `sync::move_task_to_list` checks first, so no caller
+        // reaches this with children, and the children left behind below are an
+        // arbitrary stand-in nothing asserts on.
+
+        let (seq, ts) = st.tick();
+
+        // Relocate, top-level (the move carries no `parent`), and renumber both
+        // Lists so `position` stays one coherent index scheme per List.
+        let pos = st.entry_pos(list, id).unwrap();
+        st.tasks[pos].task.list = destination.clone();
+        st.tasks[pos].task.parent = None;
+        st.tasks[pos].task.etag = format!("etag-{seq}");
+        st.tasks[pos].task.updated = ts;
+
+        let source_order = st.live_ids_in_order(list);
+        for (i, tid) in source_order.iter().enumerate() {
+            let p = st.entry_pos(list, tid).unwrap();
+            st.tasks[p].task.position = format!("{i:020}");
+        }
+        // Head of the destination: `previous` is omitted, so the moved Task is
+        // first and everything already there shifts down.
+        let mut dest_order = st.live_ids_in_order(destination);
+        dest_order.retain(|t| t != id);
+        dest_order.insert(0, id.clone());
+        for (i, tid) in dest_order.iter().enumerate() {
+            let p = st.entry_pos(destination, tid).unwrap();
+            st.tasks[p].task.position = format!("{i:020}");
+        }
+
+        let moved = st.tasks[st.entry_pos(destination, id).unwrap()]
+            .task
+            .clone();
+        Ok(moved)
+    }
+
     async fn clear_completed(&self, list: &ListId) -> Result<(), ApiError> {
         let mut st = self.state.lock().unwrap();
         st.take_error()?;

@@ -220,14 +220,32 @@ fn key_ev(code: KeyCode) -> KeyEvent {
 // inline) and `tests/legend_render.rs`.
 
 /// Every context, so a new one can't skip the guards below.
-const CONTEXTS: [LegendContext; 6] = [
+const CONTEXTS: [LegendContext; 7] = [
     LegendContext::Tasks,
     LegendContext::Sidebar,
     LegendContext::TextInput,
     LegendContext::TaskCapture,
     LegendContext::Confirm,
     LegendContext::LinkPicker,
+    LegendContext::ListPicker,
 ];
+
+#[test]
+fn move_to_list_is_documented_in_the_cheatsheet() {
+    // Data-level, like `the_focus_keys_are_bound_and_documented` above: `M` has
+    // no always-visible legend cell (the 80-column TASKS row is full), so the `?`
+    // table is where it must appear.
+    assert_eq!(
+        keymap::resolve(key_ev(KeyCode::Char('M'))),
+        Some(Action::MoveToList)
+    );
+    let rows = keymap::cheatsheet_rows();
+    assert!(
+        rows.iter()
+            .any(|(keys, help)| keys == "M" && *help == "move to another list"),
+        "M is missing from the cheatsheet: {rows:?}"
+    );
+}
 
 #[test]
 fn contexts_covers_every_legend_context() {
@@ -242,7 +260,8 @@ fn contexts_covers_every_legend_context() {
             | LegendContext::TextInput
             | LegendContext::TaskCapture
             | LegendContext::Confirm
-            | LegendContext::LinkPicker => {}
+            | LegendContext::LinkPicker
+            | LegendContext::ListPicker => {}
         }
     }
 }

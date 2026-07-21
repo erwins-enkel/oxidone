@@ -417,7 +417,7 @@ impl Model {
     /// overdue rows are a *contiguous prefix* of this order — and therefore of
     /// `visible_tasks()`, which only filters it. The journal spread counts that
     /// prefix instead of partitioning, so a break here would file rows under the
-    /// wrong header with nothing failing; `tests/sort_views.rs` pins it across
+    /// wrong header with nothing failing; `tests/today_reducer.rs` pins it across
     /// every lens. Under Due the key is already implied by the dates, and is
     /// stated anyway so the grouping has one definition rather than a coincidence.
     ///

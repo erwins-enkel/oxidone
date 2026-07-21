@@ -362,14 +362,22 @@ impl Model {
         Self::default()
     }
 
-    /// The `ListId` of the active List, or `None` when Today is selected (Today is
-    /// not a List) or the index is transiently out of range. The single choke
-    /// point every write path and the sidebar identity read, so the Today branch
-    /// lives here rather than at each call site.
+    /// The `ListId` of the active List, or `None` when Today or **Search** is the
+    /// active pane (neither is a List), or the index is transiently out of range.
+    /// The single choke point every write path and the sidebar identity read, so
+    /// the not-a-List branches live here rather than at each call site.
+    ///
+    /// The `!search` gate is load-bearing: `selected` stays parked on the List
+    /// Search was opened from, so without it every gate of the form
+    /// `selected_list_id() == Some(list)` — the per-List write path, the Move
+    /// rollback, the Clear repairs, the sidebar meter — would match the *parked*
+    /// List against the *corpus* and fail open. Returning `None` here makes the
+    /// whole family fail closed at the source. Call sites that need the parked
+    /// List by identity (only `set_lists`'s restore) read `self.selected` directly.
     pub fn selected_list_id(&self) -> Option<&ListId> {
         match self.selected {
-            Selection::Today => None,
-            Selection::List(i) => self.lists.get(i).map(|l| &l.id),
+            Selection::List(i) if !self.search => self.lists.get(i).map(|l| &l.id),
+            _ => None,
         }
     }
 
@@ -1545,7 +1553,13 @@ fn set_completed(task: &mut Task, completed: bool) {
 /// pane's status line (see the reducer arm).
 fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     let was_today = model.today_active();
-    let previously_selected = model.selected_list_id().cloned();
+    // Read the raw cursor, not `selected_list_id()`: that accessor returns `None`
+    // in Search (Search is not a List), but here we need the List the parked
+    // cursor names so a refresh mid-Search still restores it by id.
+    let previously_selected = match model.selected {
+        Selection::List(i) => model.lists.get(i).map(|l| l.id.clone()),
+        Selection::Today => None,
+    };
     model.lists = lists;
     model.selected = if was_today {
         Selection::Today // pinned, always valid

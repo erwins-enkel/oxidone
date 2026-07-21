@@ -278,6 +278,20 @@ pub fn due_on_or_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
     due.is_some_and(|d| d <= today)
 }
 
+/// Whether an entry sits in Today's **Overdue** group: dated strictly before
+/// `today`. The single definition of the Overdue/Today split, shared by the
+/// ordering (`Model::today_ordered`, which sorts these rows to the front) and the
+/// journal spread that counts them, so the header can never name a different set
+/// than the one drawn beneath it.
+///
+/// Status-blind, unlike the overdue *styling* in the view: a Completed overdue
+/// row groups by its date like any other, or it would break the contiguous
+/// prefix the spread counts. The Completed exemption belongs to the date's
+/// colour, not to the group, and is stated separately at that one call site.
+pub fn due_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
+    due.is_some_and(|d| d < today)
+}
+
 // Newtypes keep List and Task ids from being swapped by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListId(pub String);
@@ -415,5 +429,27 @@ mod tests {
         t.title = "○Standup".into();
         assert_eq!(t.entry_type(), EntryType::Task);
         assert_eq!(t.display_title(), "○Standup");
+    }
+
+    /// The two date predicates differ on exactly one day — today itself — and
+    /// that is the whole Overdue/Today split. Undated is in neither: a Task with
+    /// no due date is not in Today at all, so it can never be its Overdue group.
+    #[test]
+    fn the_overdue_split_is_due_on_or_before_minus_today_itself() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let day = |d: u32| Some(NaiveDate::from_ymd_opt(2026, 7, d).expect("valid date"));
+
+        for due in [day(19), day(1)] {
+            assert!(due_before(due, today), "{due:?} is overdue");
+            assert!(due_on_or_before(due, today), "{due:?} is in Today");
+        }
+        // Today itself: in the view, not in the Overdue group.
+        assert!(!due_before(day(20), today));
+        assert!(due_on_or_before(day(20), today));
+        // Future and undated are in neither.
+        for due in [day(21), None] {
+            assert!(!due_before(due, today), "{due:?} is not overdue");
+            assert!(!due_on_or_before(due, today), "{due:?} is not in Today");
+        }
     }
 }

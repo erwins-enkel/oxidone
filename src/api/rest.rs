@@ -3,6 +3,7 @@
 //! its one job that a fake can't verify (request-building + JSON) is covered by
 //! the `wiremock` suite in `tests/`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -129,7 +130,7 @@ impl RestClient {
     ///
     /// Two guards keep the loop terminating, and both fail closed — an error,
     /// never the pages gathered so far:
-    /// - a cursor Google repeats verbatim is going nowhere;
+    /// - a cursor Google has already handed out is a cycle, of any length;
     /// - [`MAX_PAGES`] bounds any other way a chain could fail to end.
     async fn fetch_all_pages<T>(
         &self,
@@ -139,6 +140,12 @@ impl RestClient {
         T: for<'de> Deserialize<'de>,
     {
         let mut out: Vec<T> = Vec::new();
+        // Every cursor seen so far, not just the last one: a cycle need not be
+        // tight. `P2 → P3 → P2 → …` never repeats *adjacent* cursors, so
+        // comparing against the previous one alone would let it run to
+        // `MAX_PAGES` — thousands of round trips, duplicating the cycle's items
+        // on every lap — before the backstop caught it.
+        let mut seen: HashSet<String> = HashSet::new();
         let mut token: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let page: WirePage<T> = self.send_json(request(token.as_deref())).await?;
@@ -146,20 +153,19 @@ impl RestClient {
             // An empty string is not a cursor; Google omits the field when done,
             // but treating "" as absent costs nothing and avoids a pointless
             // extra round trip if it ever does send one.
-            let next = page.next_page_token.filter(|t| !t.is_empty());
-            match next {
-                None => return Ok(out),
-                // The cursor itself stays out of the message: it is an opaque
-                // Google blob of unbounded length, and this error is rendered in
-                // the one-line status bar.
-                Some(next) if Some(&next) == token.as_ref() => {
-                    return Err(ApiError::Pagination(format!(
-                        "google repeated the same page cursor after {} items",
-                        out.len()
-                    )))
-                }
-                Some(next) => token = Some(next),
+            let Some(next) = page.next_page_token.filter(|t| !t.is_empty()) else {
+                return Ok(out);
+            };
+            // The cursor itself stays out of the message: it is an opaque Google
+            // blob of unbounded length, and this error is rendered in the
+            // one-line status bar.
+            if !seen.insert(next.clone()) {
+                return Err(ApiError::Pagination(format!(
+                    "google re-issued a page cursor after {} items",
+                    out.len()
+                )));
             }
+            token = Some(next);
         }
         Err(ApiError::Pagination(format!("more than {MAX_PAGES} pages")))
     }

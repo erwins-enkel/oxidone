@@ -644,9 +644,58 @@ async fn list_tasks_sends_the_cursor_exactly_once_on_the_third_page() {
     assert_eq!(ids, ["T1", "T2", "T3"]);
 }
 
-/// A cursor Google repeats verbatim is going nowhere. Fail closed: the two
-/// Tasks already gathered are discarded rather than returned as if they were the
-/// whole List — a short `Vec` here is indistinguishable from a short List.
+/// A cycle need not be tight. `P2 → P3 → P2` never repeats an *adjacent*
+/// cursor, so a guard that only remembers the previous one would keep walking
+/// the loop — duplicating the cycle's Tasks on every lap — until `MAX_PAGES`
+/// finally stopped it thousands of requests later. Every cursor seen is
+/// remembered, so the second `P2` fails on the third round trip.
+#[tokio::test]
+async fn list_tasks_rejects_a_cycling_page_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T2", "00000000000000000001")],
+            "nextPageToken": "P3"
+        })))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Back to a cursor already spent — the cycle closes here.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T3", "00000000000000000002")],
+            "nextPageToken": "P2"
+        })))
+        .with_priority(3)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .list_tasks(&ListId("L1".into()), true, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Pagination(_)), "got {err:?}");
+}
+
+/// The tight case of the same cycle. Fail closed: the two Tasks already
+/// gathered are discarded rather than returned as if they were the whole List —
+/// a short `Vec` here is indistinguishable from a short List.
 #[tokio::test]
 async fn list_tasks_rejects_a_repeated_page_cursor() {
     let server = MockServer::start().await;

@@ -1553,6 +1553,11 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         }
         Message::LoadFailed(reason) => {
             model.status_line = Some(reason);
+            // A load failed, so the corpus is not coming. Clear the pending notice
+            // rather than leave "searching all lists…" promising work that will
+            // never arrive (fail closed): the offline `LoadSearch` cache read sends
+            // `LoadFailed`, not a `SearchLoaded`, when the read itself errors.
+            model.search_pending = false;
             Vec::new()
         }
     }
@@ -1677,6 +1682,13 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     // (offline included, since `main.rs` sends `live: true` when there is no
     // fan-out to wait for).
     if model.search_active() {
+        // Like Today: a flat cross-List pane has no Manual lens (`position` is
+        // per-List), so normalise a Manual carried in from a List to Due, or the
+        // header would read "my order" while `cross_list_ordered` sorts by due.
+        // `next_flat` keeps it out of Manual thereafter.
+        if model.sort == SortView::Manual {
+            model.sort = SortView::Due;
+        }
         model.search_pending = true;
         return vec![Command::LoadSearch {
             lists: model.lists.clone(),

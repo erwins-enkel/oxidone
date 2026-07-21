@@ -393,6 +393,26 @@ fn leaving_search_clears_the_pending_notice() {
     assert!(!m.search_pending, "no stale notice outlives the pane");
 }
 
+#[test]
+fn a_failed_load_clears_the_pending_notice() {
+    // The offline `LoadSearch` cache read sends `LoadFailed` when it errors, not a
+    // `SearchLoaded` — so the notice must clear there too, or it promises a corpus
+    // that will never arrive (fail closed).
+    let mut m = base(&["work"]);
+    m.selected = Selection::List(0);
+    update(&mut m, press('S')); // arms search_pending
+    assert!(m.search_pending);
+    update(
+        &mut m,
+        Message::LoadFailed("failed to read search: disk".into()),
+    );
+    assert!(
+        !m.search_pending,
+        "a failed load must not leave the notice up"
+    );
+    assert!(m.status_line.is_some(), "the failure is shown");
+}
+
 // ---- Corpus suppressions ----
 
 #[test]
@@ -719,6 +739,21 @@ fn s_cycles_due_and_title_only_never_manual() {
     assert_eq!(m.sort, SortView::Title);
     update(&mut m, press('s'));
     assert_eq!(m.sort, SortView::Due, "cycles back to Due, never Manual");
+}
+
+#[test]
+fn a_manual_lens_carried_into_search_is_normalised_to_due() {
+    // Enter from a List whose lens is Manual: the flat pane has no Manual order,
+    // so the header must not read "my order" while the pane sorts by due.
+    let mut m = base(&["work"]);
+    m.selected = Selection::List(0);
+    m.sort = SortView::Manual;
+    enter_search(&mut m, vec![undated("a", "work")]);
+    assert_eq!(
+        m.sort,
+        SortView::Due,
+        "Manual is normalised to Due on entry"
+    );
 }
 
 // ---- The accessor and the sidebar meter ----

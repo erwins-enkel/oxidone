@@ -621,7 +621,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // journal spread — see `journal_spread` — which is what the two column rules
     // below branch on.
     let today_view = model.today_active();
-    // The Overdue group, as a count of rows: `today_ordered` sorts them to the
+    // The Overdue group, as a count of rows: `cross_list_ordered` sorts them to the
     // front, so they are a contiguous prefix and `take_while` sees all of them.
     // Zero outside Today, where there is no such group.
     let overdue_rows = if today_view {

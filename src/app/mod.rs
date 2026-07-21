@@ -394,7 +394,7 @@ impl Model {
         // `move_task_cursor`, and `visible_tasks` all read `sorted_tasks()`, so
         // navigation and cursor re-anchoring walk exactly what the pane renders.
         if self.today_active() {
-            return self.today_ordered();
+            return self.cross_list_ordered();
         }
         let mut groups = self.groups();
         match self.sort {
@@ -426,12 +426,12 @@ impl Model {
         groups.into_iter().flatten().collect()
     }
 
-    /// The **Today** pane's flat, cross-List order: **overdue first**, then **due
-    /// asc → List title → `position`** (Due lens, and Manual, which Today treats
-    /// as Due), or **display title → List title → `position`** (Title lens). No
-    /// parent grouping — rows from different Lists sit together, so a global order
-    /// is the only meaningful one, and a Subtask sorts on its own key like any
-    /// other row.
+    /// A flat cross-List pane's order (Today's, and Search's): **overdue first**,
+    /// then **due asc → List title → `position`** (Due lens, and Manual, which a
+    /// flat pane treats as Due), or **display title → List title → `position`**
+    /// (Title lens). No parent grouping — rows from different Lists sit together,
+    /// so a global order is the only meaningful one, and a Subtask sorts on its
+    /// own key like any other row.
     ///
     /// **The prefix invariant.** `due_before` leads every lens's key, so the
     /// overdue rows are a *contiguous prefix* of this order — and therefore of
@@ -448,7 +448,7 @@ impl Model {
     /// Stable (`sort_by_cached_key`), so equal keys keep the cache's stored order.
     /// Every Task carries its own `list`; the List title is looked up from `lists`
     /// (empty string if the List is unknown, which sinks it consistently).
-    fn today_ordered(&self) -> Vec<&Task> {
+    fn cross_list_ordered(&self) -> Vec<&Task> {
         let titles: HashMap<&ListId, &str> = self
             .lists
             .iter()
@@ -1566,7 +1566,7 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     if model.today_active() {
         // Today has no Manual lens (cross-List order is undefined). Normalise a
         // Manual carried in from a List to Due on entry, so the pane order and the
-        // header label agree — `next_today` keeps it out of Manual thereafter.
+        // header label agree — `next_flat` keeps it out of Manual thereafter.
         if model.sort == SortView::Manual {
             model.sort = SortView::Due;
         }
@@ -1731,7 +1731,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         // (Manual is undefined across Lists).
         Action::CycleSort => {
             model.sort = if model.today_active() {
-                model.sort.next_today()
+                model.sort.next_flat()
             } else {
                 model.sort.next()
             }

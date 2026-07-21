@@ -116,11 +116,12 @@ impl SortView {
         }
     }
 
-    /// The next view in the **Today** cycle: Due ↔ Title only. Manual is excluded
-    /// there — `position` is per-List, so a hand-arranged order across Lists is
-    /// genuinely undefined (Moves are disabled in Today). `Manual` maps to `Due`
-    /// so a lens carried in from a real List lands on the home state on first `s`.
-    pub fn next_today(self) -> Self {
+    /// The next view in a **flat cross-List** pane's cycle (Today or Search): Due
+    /// ↔ Title only. Manual is excluded there — `position` is per-List, so a
+    /// hand-arranged order across Lists is genuinely undefined (Moves are disabled
+    /// in both). `Manual` maps to `Due` so a lens carried in from a real List
+    /// lands on the home state on first `s`.
+    pub fn next_flat(self) -> Self {
         match self {
             SortView::Due => SortView::Title,
             SortView::Title | SortView::Manual => SortView::Due,
@@ -280,7 +281,7 @@ pub fn due_on_or_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
 
 /// Whether an entry sits in Today's **Overdue** group: dated strictly before
 /// `today`. The single definition of the Overdue/Today split, shared by the
-/// ordering (`Model::today_ordered`, which sorts these rows to the front) and the
+/// ordering (`Model::cross_list_ordered`, which sorts these rows to the front) and the
 /// journal spread that counts them, so the header can never name a different set
 /// than the one drawn beneath it.
 ///
@@ -382,16 +383,16 @@ mod tests {
     }
 
     #[test]
-    fn next_today_cycles_due_and_title_only_never_manual() {
-        // Today has no Manual order (position is per-List), so the cycle is a
-        // two-state flip and Manual folds into Due on the way in.
-        assert_eq!(SortView::Due.next_today(), SortView::Title);
-        assert_eq!(SortView::Title.next_today(), SortView::Due);
-        assert_eq!(SortView::Manual.next_today(), SortView::Due);
-        // Manual is never reachable by repeated Today cycling.
+    fn next_flat_cycles_due_and_title_only_never_manual() {
+        // A flat cross-List pane has no Manual order (position is per-List), so the
+        // cycle is a two-state flip and Manual folds into Due on the way in.
+        assert_eq!(SortView::Due.next_flat(), SortView::Title);
+        assert_eq!(SortView::Title.next_flat(), SortView::Due);
+        assert_eq!(SortView::Manual.next_flat(), SortView::Due);
+        // Manual is never reachable by repeated flat-pane cycling.
         let mut sort = SortView::Manual;
         for _ in 0..6 {
-            sort = sort.next_today();
+            sort = sort.next_flat();
             assert_ne!(sort, SortView::Manual);
         }
     }

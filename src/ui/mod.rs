@@ -551,11 +551,16 @@ fn due_style(task: &Task, today: NaiveDate, theme: &Theme) -> Style {
 fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Tasks;
     // The displayed rows are a read-only lens over `tasks`: the current sort's
-    // order with Completed Tasks filtered out unless revealed. `tasks` (Manual
-    // order) stays untouched, and the header meter counts over all of it —
-    // hiding Completed Tasks never moves the meter. It is narrowed on the other
-    // axis though: only Task-typed entries count, so its `total` is *not*
-    // `model.tasks.len()` on a pane holding Events or Notes (see `header_title`).
+    // order, keeping what passes every view filter at once (`Model::is_visible` —
+    // Completed unless revealed, the distant-due horizon, and in Today membership
+    // plus completion recency). `tasks` (Manual order) stays untouched.
+    //
+    // The header meter does not read this lens, so the two disagree by design.
+    // It counts over `tasks`, narrowed on two axes only: Task-typed entries (so
+    // its `total` is *not* `model.tasks.len()` on a pane holding Events or Notes)
+    // and, in Today, `due <= today`. Hiding Completed Tasks therefore never moves
+    // the meter, and neither does the horizon or recency dropping a row from view
+    // — but leaving Today's membership does. See `header_title`.
     let ordered = model.visible_tasks();
     // Due dates lead the row in a fixed-width gutter so they scan vertically.
     // The gutter only exists when something in view has a due date — otherwise

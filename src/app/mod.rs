@@ -515,11 +515,18 @@ impl Model {
                     )
                 });
             }
-            // Due and Manual both order by due date; every Today row is dated
-            // (membership excludes undated), so `due` is always `Some` here.
+            // Due and Manual both order by due date, undated last. Today's rows are
+            // all dated (membership excludes undated), but Search's corpus is not —
+            // so `due_key` is needed, not raw `t.due`, or `None` (which `Option`
+            // orders *before* `Some`) would sort undated matches to the top.
             SortView::Due | SortView::Manual => {
                 tasks.sort_by_cached_key(|t| {
-                    (not_overdue(t), t.due, list_title(t), t.position.clone())
+                    (
+                        not_overdue(t),
+                        due_key(t.due),
+                        list_title(t),
+                        t.position.clone(),
+                    )
                 });
             }
         }

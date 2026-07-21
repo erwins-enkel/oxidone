@@ -1137,6 +1137,60 @@ async fn a_retry_after_above_the_ceiling_fails_without_retrying() {
     assert_eq!(request_count(&server).await, 1);
 }
 
+/// #98: the sleep budget is shared across the pages of one `list_tasks`, not
+/// reset per page. Page 1 spends the whole 1s budget on a single `Retry-After: 1`
+/// retry before succeeding; page 2's `429` then finds nothing left, so it is *not*
+/// retried and the whole call fails `RateLimited`.
+///
+/// The request count is the discriminating evidence: **3** (page1 ×2 + page2 ×1)
+/// with a shared budget, versus **4** if page 2 got its own fresh 1s budget and
+/// retried once. `Retry-After` (whole-second, un-jittered) keeps the count exact;
+/// the one real ~1s sleep is page 1's, mirroring the `Retry-After` test above.
+#[tokio::test]
+async fn the_sleep_budget_is_shared_across_pages_of_one_list_tasks() {
+    let server = MockServer::start().await;
+
+    // Page 1, first hit: rate-limited with a 1s instruction — spends the budget.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Page 1, retry: succeeds and hands out the cursor to page 2.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [task_json("T1", "00000000000000000000")],
+            "nextPageToken": "P2"
+        })))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Page 2: persistently rate-limited. With the shared budget already spent, its
+    // 1s delay no longer fits, so it must fail on the first hit without retrying.
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    let client = client(&server).with_retry(RetryPolicy {
+        sleep_budget: std::time::Duration::from_secs(1),
+        ..RetryPolicy::default()
+    });
+    let err = client
+        .list_tasks(&ListId("L1".into()), true, false, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ApiError::RateLimited);
+    assert_eq!(request_count(&server).await, 3);
+}
+
 #[tokio::test]
 async fn a_503_retries_on_a_read() {
     let server = MockServer::start().await;

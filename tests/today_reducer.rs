@@ -1,10 +1,11 @@
 //! Reducer tests for the pinned Today cross-List view (#61). `update` is pure —
 //! no terminal, no network. Today membership (`due <= today`) and ordering are
-//! stamped by `model.now`, which these tests set to a fixed date.
+//! stamped by `model.now`, which these tests set to a fixed date. Completion
+//! recency (a Completed row shows only if completed today) is stamped the same way.
 
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use oxidone::app::{update, Command, Focus, Message, Model};
+use oxidone::app::{update, Command, Focus, Message, Model, Overlay};
 use oxidone::domain::{List, ListId, Selection, SortView, Status, Task, TaskId};
 
 fn press(c: char) -> Message {
@@ -382,5 +383,254 @@ fn moves_and_add_subtask_are_disabled_in_today() {
         assert!(cmds.is_empty(), "{key} must not act in Today");
         assert!(m.status_line.is_some(), "{key} explains why it no-ops");
         m.status_line = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Completion recency: in Today, a Completed row shows only if it was completed
+// today. Membership (`due <= today`) still decides what is in the aggregate at
+// all — recency narrows the Completed rows within it, never widens the set.
+// ---------------------------------------------------------------------------
+
+/// `task` with `completed_at` stamped. The 4-arg `task` helper leaves it `None`
+/// (what an optimistic completion looks like before the server answers), so the
+/// recency cases stamp it explicitly.
+fn done_at(mut t: Task, at: DateTime<Utc>) -> Task {
+    t.completed_at = Some(at);
+    t
+}
+
+/// An instant `hours` from the pinned `now`, as UTC. Derived from the clock the
+/// model runs on rather than a literal date, so the fixtures cannot rot and hold
+/// at every host offset.
+fn hours_from_now(hours: i64) -> DateTime<Utc> {
+    let now = Local
+        .with_ymd_and_hms(TODAY.0, TODAY.1, TODAY.2, 12, 0, 0)
+        .unwrap();
+    (now + chrono::Duration::hours(hours)).to_utc()
+}
+
+fn yesterday_noon() -> DateTime<Utc> {
+    hours_from_now(-24)
+}
+
+fn today_noon() -> DateTime<Utc> {
+    hours_from_now(0)
+}
+
+#[test]
+fn a_row_completed_on_an_earlier_day_leaves_the_today_pane() {
+    let mut m = today_model(
+        &["work"],
+        vec![
+            done_at(
+                task("stale", "work", Some(ymd(2026, 7, 8)), Status::Completed),
+                yesterday_noon(),
+            ),
+            done_at(
+                task("fresh", "work", Some(today()), Status::Completed),
+                today_noon(),
+            ),
+        ],
+    );
+    m.show_completed = true;
+    let titles = visible_titles(&m);
+    assert!(
+        !titles.contains(&"stale".to_string()),
+        "completed on an earlier day: out of the pane"
+    );
+    assert!(
+        titles.contains(&"fresh".to_string()),
+        "completed today: stays"
+    );
+}
+
+#[test]
+fn completion_recency_keys_on_completed_at_not_the_due_date() {
+    // Overdue by a fortnight, ticked off today: it is part of today's log.
+    let mut m = today_model(
+        &["work"],
+        vec![done_at(
+            task(
+                "overdue-ticked",
+                "work",
+                Some(ymd(2026, 7, 6)),
+                Status::Completed,
+            ),
+            today_noon(),
+        )],
+    );
+    m.show_completed = true;
+    assert_eq!(visible_titles(&m), vec!["overdue-ticked".to_string()]);
+}
+
+#[test]
+fn an_optimistically_completed_row_stays_visible_and_selected() {
+    // `set_completed` leaves `completed_at` for the server response, so the row
+    // carries `None` for a frame. Hiding on `None` would blink it off screen
+    // between the Space press and the reply.
+    let mut m = today_model(
+        &["work"],
+        vec![
+            task("a", "work", Some(today()), Status::NeedsAction),
+            task("b", "work", Some(today()), Status::NeedsAction),
+        ],
+    );
+    m.show_completed = true;
+    m.selected_task = Some(0);
+    update(&mut m, press(' ')); // complete "a"
+    assert_eq!(m.tasks[0].status, Status::Completed);
+    assert_eq!(m.tasks[0].completed_at, None);
+    assert!(visible_titles(&m).contains(&"a".to_string()));
+    assert_eq!(
+        m.selected_task,
+        Some(0),
+        "the cursor stays on the row it just ticked"
+    );
+}
+
+#[test]
+fn completion_recency_never_touches_open_rows() {
+    let m = today_model(
+        &["work"],
+        vec![
+            task(
+                "overdue",
+                "work",
+                Some(ymd(2026, 7, 1)),
+                Status::NeedsAction,
+            ),
+            task("due-today", "work", Some(today()), Status::NeedsAction),
+        ],
+    );
+    assert_eq!(
+        visible_titles(&m),
+        vec!["overdue".to_string(), "due-today".to_string()],
+        "open rows are what Today is for, however overdue"
+    );
+}
+
+#[test]
+fn completion_recency_does_not_leak_into_a_list_pane() {
+    let mut m = Model::new();
+    m.now = Local
+        .with_ymd_and_hms(TODAY.0, TODAY.1, TODAY.2, 12, 0, 0)
+        .unwrap();
+    m.lists = vec![list("work")];
+    m.selected = Selection::List(0);
+    m.show_completed = true;
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("work".into()),
+            vec![done_at(
+                task("stale", "work", Some(ymd(2026, 7, 8)), Status::Completed),
+                yesterday_noon(),
+            )],
+        ),
+    );
+    assert_eq!(
+        visible_titles(&m),
+        vec!["stale".to_string()],
+        "a List pane shows its Completed history; the filter is Today-only"
+    );
+}
+
+#[test]
+fn a_refresh_stamping_an_earlier_completion_hides_the_row_and_reanchors() {
+    // The frame after the optimistic one: the server answers with a `completed_at`
+    // from an earlier day (the row was ticked off before today), so the row leaves
+    // the pane and the cursor must land on one that is still drawn.
+    let mut m = today_model(
+        &["work"],
+        vec![
+            task("a", "work", Some(today()), Status::Completed),
+            task("b", "work", Some(today()), Status::NeedsAction),
+        ],
+    );
+    m.show_completed = true;
+    m.selected_task = Some(0); // on "a", still visible (completed_at is None)
+    assert!(visible_titles(&m).contains(&"a".to_string()));
+
+    update(
+        &mut m,
+        Message::TodayLoaded {
+            tasks: vec![
+                done_at(
+                    task("a", "work", Some(today()), Status::Completed),
+                    yesterday_noon(),
+                ),
+                task("b", "work", Some(today()), Status::NeedsAction),
+            ],
+            failed: Vec::new(),
+        },
+    );
+
+    let titles = visible_titles(&m);
+    assert!(!titles.contains(&"a".to_string()), "the stamp hid the row");
+    let selected = m
+        .selected_task
+        .and_then(|i| m.tasks.get(i))
+        .expect("the cursor re-anchored onto a row");
+    assert_eq!(selected.display_title(), "b");
+}
+
+#[test]
+fn the_clear_confirm_deliberately_counts_rows_the_pane_no_longer_draws() {
+    // The `C` count spans every Completed row in the aggregate, not the visible
+    // subset: the sweep clears each contributing List server-side, so a row hidden
+    // by recency is still swept and still counted. Intentional, not a leak.
+    let mut m = today_model(
+        &["work"],
+        vec![
+            done_at(
+                task("stale", "work", Some(ymd(2026, 7, 8)), Status::Completed),
+                yesterday_noon(),
+            ),
+            done_at(
+                task("fresh", "work", Some(today()), Status::Completed),
+                today_noon(),
+            ),
+        ],
+    );
+    m.show_completed = true;
+    assert_eq!(visible_titles(&m), vec!["fresh".to_string()]);
+
+    update(&mut m, press('C'));
+    let prompt = match m.overlay.as_ref() {
+        Some(Overlay::Confirm(c)) => c.prompt.clone(),
+        _ => panic!("C opens a confirm"),
+    };
+    assert!(
+        prompt.starts_with("Clear 2 completed tasks"),
+        "counts both Completed rows, one of which is not drawn: {prompt}"
+    );
+}
+
+#[test]
+fn completion_recency_compares_local_days_at_the_days_edges() {
+    // Instants derived from the pinned `now` rather than literal dates, so these
+    // hold at every host offset. The ±11h pair sits near the day's edges with a
+    // margin no DST transition can eat; ±24h is unambiguously another local day.
+    for (hours, want_visible) in [
+        (-24, false),
+        (-11, true),
+        (0, true),
+        (11, true),
+        (24, false),
+    ] {
+        let mut m = today_model(
+            &["work"],
+            vec![done_at(
+                task("row", "work", Some(today()), Status::Completed),
+                hours_from_now(hours),
+            )],
+        );
+        m.show_completed = true;
+        assert_eq!(
+            !visible_titles(&m).is_empty(),
+            want_visible,
+            "completed_at {hours:+}h from now"
+        );
     }
 }

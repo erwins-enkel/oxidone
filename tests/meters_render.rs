@@ -3,7 +3,7 @@
 //! be perfectly correct in isolation while `view` never calls it, calls it with
 //! the wrong width, or drops the `ascii` flag on the way through.
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use oxidone::app::{update, Focus, Message, Model};
 use oxidone::domain::{List, ListId, Selection, Status, Task, TaskId};
 use oxidone::ui::{self, theme::Theme};
@@ -423,4 +423,74 @@ fn an_orphan_and_its_child_draw_without_meters() {
         let pane = task_pane(row, 100);
         assert!(!pane.contains('/'), "{needle} gets no meter: {pane:?}");
     }
+}
+
+/// The Today aggregate as a Model: `Selection::Today`, the clock pinned so the
+/// fixture cannot rot, and `tasks` handed straight in (as `TodayLoaded` would).
+/// Completed rows are revealed, since that is the mode the recency filter acts in.
+///
+/// Every date the caller passes is derived from `m.now`, never a literal — a
+/// literal would stop satisfying `due <= today` the day after it was written.
+fn today_meter_model(tasks: impl FnOnce(DateTime<Local>) -> Vec<Task>) -> Model {
+    let mut model = Model::new();
+    model.now = Local
+        .with_ymd_and_hms(2026, 7, 20, 12, 0, 0)
+        .single()
+        .expect("an unambiguous local noon");
+    let list = List {
+        id: ListId("l".into()),
+        title: "L".into(),
+        etag: String::new(),
+        updated: Utc.timestamp_opt(0, 0).unwrap(),
+    };
+    update(&mut model, Message::ListsLoaded(vec![list]));
+    model.selected = Selection::Today;
+    model.show_completed = true;
+    let tasks = tasks(model.now);
+    update(
+        &mut model,
+        Message::TodayLoaded {
+            tasks,
+            failed: Vec::new(),
+        },
+    );
+    model.focus = Focus::Tasks;
+    model
+}
+
+#[test]
+fn the_today_header_meter_spans_the_aggregate_not_the_visible_rows() {
+    // Deliberate incoherence, pinned so a reviewer can tell intent from
+    // regression: `within_completion_day` hides a row completed on an earlier day,
+    // but the meter reports completion over the whole `due <= today` set and keeps
+    // counting it. Today's completion is a property of the day's workload, not of
+    // what survives the view filters.
+    let model = today_meter_model(|now| {
+        let today = now.date_naive();
+        let mut stale = task("1", "stale", Status::Completed, None, None);
+        stale.due = Some(today - chrono::Duration::days(2));
+        stale.completed_at = Some((now - chrono::Duration::days(1)).to_utc());
+        let mut fresh = task("2", "fresh", Status::Completed, None, None);
+        fresh.due = Some(today);
+        fresh.completed_at = Some(now.to_utc());
+        let mut open = task("3", "open", Status::NeedsAction, None, None);
+        open.due = Some(today);
+        vec![stale, fresh, open]
+    });
+
+    assert_eq!(
+        model.visible_tasks().len(),
+        2,
+        "the pane drops the row completed on an earlier day"
+    );
+
+    let drawn = rows(&model);
+    let header = drawn[0].clone();
+    let (done, total) =
+        first_ratio(&header).unwrap_or_else(|| panic!("no ratio in the header: {header:?}"));
+    assert_eq!(
+        (done, total),
+        (2, 3),
+        "both completions still count, over all three aggregate rows: {header:?}"
+    );
 }

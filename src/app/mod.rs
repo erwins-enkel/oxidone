@@ -532,8 +532,13 @@ impl Model {
     }
 
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
-    /// with Completed Tasks filtered out unless `show_completed` reveals them.
-    /// The view renders this; the completion meter still counts over all `tasks`.
+    /// keeping only what passes [`is_visible`](Self::is_visible) — every view
+    /// filter at once, not just `show_completed`. See that predicate for the set.
+    ///
+    /// The view renders this; the meters do not read it. The header completion
+    /// meter counts over `tasks`, honouring Today's `due <= today` membership and
+    /// nothing else, so it deliberately spans rows this lens drops (a Task hidden
+    /// by the distant-due horizon or by completion recency still counts there).
     pub fn visible_tasks(&self) -> Vec<&Task> {
         self.sorted_tasks()
             .into_iter()
@@ -543,9 +548,12 @@ impl Model {
 
     /// Whether a Task is currently shown, combining the view filters with AND: the
     /// Completed filter, the distant-due horizon (#81), and — in Today only — the
-    /// `due <= today` membership (#61).
+    /// `due <= today` membership (#61) and completion recency.
     fn is_visible(&self, task: &Task) -> bool {
-        self.completed_visible(task) && self.within_horizon(task) && self.within_today(task)
+        self.completed_visible(task)
+            && self.within_horizon(task)
+            && self.within_today(task)
+            && self.within_completion_day(task)
     }
 
     /// The Completed filter: a Task shows unless it is Completed and Completed
@@ -562,6 +570,37 @@ impl Model {
     /// today drops it from view in the same frame.
     fn within_today(&self, task: &Task) -> bool {
         !self.today_active() || due_on_or_before(task.due, self.now.date_naive())
+    }
+
+    /// The Today completion-recency filter: outside Today, and for any row that is
+    /// not Completed, a no-op. In Today a Completed row passes only if it was
+    /// completed today — the pane answers "among what was due, what got done
+    /// today", so a row completed on an earlier day leaves it even though its due
+    /// date keeps it in the `due <= today` set.
+    ///
+    /// Not a log of the day's completions: membership still gates on
+    /// `due <= today`, so a future-due Task ticked off today is never in the
+    /// aggregate to begin with. Recency narrows the Completed rows *within* that
+    /// set; it does not widen it.
+    ///
+    /// `completed_at: None` passes. Completing is optimistic — [`set_completed`]
+    /// deliberately leaves `completed_at` for the server response to fill — so
+    /// hiding on `None` would blink a row off screen the instant Space is pressed
+    /// and back on at the next refresh. A cache row with a NULL `completed_at`
+    /// takes the same benefit of the doubt.
+    ///
+    /// Compared in `now`'s timezone: `completed_at` is UTC, but "today" is the
+    /// user's day, not UTC's.
+    fn within_completion_day(&self, task: &Task) -> bool {
+        if !self.today_active() || task.status != Status::Completed {
+            return true;
+        }
+        match task.completed_at {
+            None => true,
+            Some(at) => {
+                at.with_timezone(&self.now.timezone()).date_naive() == self.now.date_naive()
+            }
+        }
     }
 
     /// The distant-due filter: with `hide_distant` on, an entry is hidden only if
@@ -2080,10 +2119,14 @@ fn open_delete_confirm(model: &mut Model) {
 /// A no-op with no active List or nothing to Clear (don't prompt for zero).
 fn open_clear_completed_confirm(model: &mut Model) {
     if model.today_active() {
-        // Cross-List sweep: group the visible Completed rows by their own List.
+        // Cross-List sweep: group the aggregate's Completed rows by their own List.
         // Google's clear_completed is per-List, so one command per contributing
-        // List. The count is the Today-visible Completed rows; the sweep clears
-        // each List's Completed server-side (any not due today were never in view).
+        // List. The count spans every Completed row in the Today aggregate —
+        // deliberately more than the pane draws, since a row completed on an
+        // earlier day is filtered out of view by `within_completion_day` yet is
+        // still swept. It is a lower bound on what the sweep clears, not a tally
+        // of the visible rows: the server-side clear also takes Completed rows the
+        // aggregate never held (not due today), which no local count can know.
         let mut lists: Vec<ListId> = Vec::new();
         let mut done = 0usize;
         for t in &model.tasks {

@@ -389,6 +389,97 @@ async fn move_task_to_list_rejects_an_unknown_task() {
     assert!(matches!(err, ApiError::NotFound));
 }
 
+#[tokio::test]
+async fn move_task_to_list_carries_the_subtree_along() {
+    let api = fake();
+    let src = api.insert_list("Work").await.unwrap();
+    let dst = api.insert_list("Home").await.unwrap();
+    let parent = api.insert_task(&src.id, new_task("parent")).await.unwrap();
+    let c1 = api.insert_task(&src.id, new_task("c1")).await.unwrap();
+    let c2 = api.insert_task(&src.id, new_task("c2")).await.unwrap();
+    let c3 = api.insert_task(&src.id, new_task("c3")).await.unwrap();
+    // A pre-existing task in the destination the subtree must land ahead of.
+    let _z = api.insert_task(&dst.id, new_task("z")).await.unwrap();
+
+    // Seat the children deterministically. `move_task` with `previous=None`
+    // inserts each new child right after the parent — reparenting c1 then c2 that
+    // way would leave [parent, c2, c1] — so chain them by `previous` for
+    // [parent, c1, c2, c3].
+    api.move_task(&src.id, &c1.id, Some(&parent.id), None)
+        .await
+        .unwrap();
+    api.move_task(&src.id, &c2.id, Some(&parent.id), Some(&c1.id))
+        .await
+        .unwrap();
+    api.move_task(&src.id, &c3.id, Some(&parent.id), Some(&c2.id))
+        .await
+        .unwrap();
+
+    // Clear c3, so the subtree includes a Cleared (hidden + Completed) child.
+    api.patch_task(
+        &src.id,
+        &c3.id,
+        TaskPatch {
+            completed: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    api.clear_completed(&src.id).await.unwrap();
+
+    // A child's etag before the move, to pin the "leave etag/updated" rule.
+    let c1_etag_before = api
+        .list_tasks(&src.id, true, true, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == c1.id)
+        .unwrap()
+        .etag;
+
+    let moved = api
+        .move_task_to_list(&src.id, &parent.id, &dst.id)
+        .await
+        .unwrap();
+
+    // The whole subtree left: the source is empty.
+    assert!(api
+        .list_tasks(&src.id, true, true, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Read the destination with BOTH flags on: c3 is hidden *and* Completed, so
+    // `show_completed=false` would silently drop it and leave the Cleared carry
+    // untested. The subtree lands intact at the head, ahead of the existing `z`.
+    let arrived = api.list_tasks(&dst.id, true, true, None).await.unwrap();
+    let titles: Vec<_> = arrived.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(titles, ["parent", "c1", "c2", "c3", "z"]);
+
+    // Each carried child still names the parent, with its id intact.
+    for (child, title) in [(&c1, "c1"), (&c2, "c2"), (&c3, "c3")] {
+        let got = arrived.iter().find(|t| t.title == title).unwrap();
+        assert_eq!(got.id, child.id, "id survives the move");
+        assert_eq!(
+            got.parent.as_ref(),
+            Some(&parent.id),
+            "still names the parent"
+        );
+        assert_eq!(got.list, dst.id);
+    }
+
+    // etag left unbumped: a carried child's etag is what it was pre-move.
+    let c1_after = arrived.iter().find(|t| t.id == c1.id).unwrap();
+    assert_eq!(c1_after.etag, c1_etag_before);
+
+    // The returned Task is the parent: top-level, at the head of the destination.
+    assert_eq!(moved.id, parent.id);
+    assert_eq!(moved.list, dst.id);
+    assert_eq!(moved.parent, None);
+    assert_eq!(moved.position, format!("{:020}", 0));
+}
+
 // Deliberately no test that the fake refuses a parent with Subtasks: it does not.
 // That rule is oxidone's — Google accepts the move and carries the subtree intact
 // (verified 2026-07-21, see #86) — it lives in `sync::move_task_to_list`, and

@@ -292,14 +292,38 @@ fn each_group_header_is_drawn_only_when_its_group_has_rows() {
 
 #[test]
 fn the_header_count_is_outstanding_work_not_the_rows_drawn() {
-    // Two overdue rows are drawn, one of them settled. The header counts what is
-    // left to migrate — the ritual's question — so it reads 1, not 2.
-    let rows = spread(&both_groups());
+    // Both headers, not just `Overdue`: they are documented to mean the same
+    // thing, so the rule is asserted on each. A settled row in either group is
+    // still *drawn* — it is only not *counted*, because the count answers what is
+    // left to migrate rather than what is on screen.
+    //
+    // Its own fixture, deliberately asymmetric (2 overdue of which 1 settled, 3
+    // due today of which 1 settled): equal group sizes would let a renderer that
+    // counted the wrong group pass.
+    let mut m = today_model(
+        &["work", "home"],
+        vec![
+            dated(task("Dentist", "home"), day(18)),
+            completed(dated(task("File taxes", "work"), day(19))),
+            task("Ship 62", "work"),
+            task("Standup", "home"),
+            completed(task("Groceries", "home")),
+        ],
+    );
+    m.show_completed = true;
+    let rows = spread(&m);
+
     assert!(rows.iter().any(|r| r.trim() == "Overdue 1"), "{rows:?}");
     assert!(
-        rows.iter().any(|r| r.contains("File taxes")),
-        "the settled row is still drawn, it is just not counted: {rows:?}"
+        rows.iter().any(|r| r.trim() == "Today 2"),
+        "a Completed today-due row is not owed either: {rows:?}"
     );
+    for settled in ["File taxes", "Groceries"] {
+        assert!(
+            rows.iter().any(|r| r.contains(settled)),
+            "{settled} is still drawn, it is just not counted: {rows:?}"
+        );
+    }
 }
 
 #[test]

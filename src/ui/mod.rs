@@ -575,7 +575,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // the rows the indent rule nests — and stays one pass over `tasks`.
     let subtask_counts = model.subtask_counts(&top_level);
     // Today is a flat cross-List pane: no Subtask indent or meters (per-List
-    // hierarchy concepts), and each row carries a dimmed List name so its home is
+    // hierarchy concepts), and each row carries a muted List name so its home is
     // visible where rows from different Lists sit together.
     let today_view = model.today_active();
     let list_titles: HashMap<&ListId, &str> = if today_view {
@@ -687,18 +687,19 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                     style.remove_modifier(Modifier::CROSSED_OUT),
                 ));
             }
-            // Today only: the dimmed List name, trailing the markers/meter. Its
-            // width comes off the notes-preview budget below (like the meter's), so
-            // the variable-length preview tail can never clip it. Strike removed —
-            // it is stable context, not the Task's own struck-through text.
+            // Today only: the List name, trailing the markers/meter. Painted
+            // `muted` — a step below the `subtext` preview that follows it, so the
+            // two tails do not compete: the name is context about the row, not the
+            // row's own text. Its width comes off the notes-preview budget below
+            // (like the meter's), so the variable-length preview tail can never
+            // clip it. Strike removed — it is stable context, not the Task's own
+            // struck-through text.
             let list_seg = list_titles.get(&t.list).map(|name| format!("  {name}"));
             let list_seg_width = list_seg.as_ref().map_or(0, |s| s.width());
             if let Some(seg) = list_seg {
                 spans.push(Span::styled(
                     seg,
-                    style
-                        .remove_modifier(Modifier::CROSSED_OUT)
-                        .fg(theme.subtext),
+                    style.remove_modifier(Modifier::CROSSED_OUT).fg(theme.muted),
                 ));
             }
             // Last of all, after the meter, so this variable-length tail can never

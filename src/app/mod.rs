@@ -769,6 +769,10 @@ fn group_due_key(group: &[&Task]) -> Option<NaiveDate> {
 #[derive(Debug)]
 pub enum Message {
     Key(crossterm::event::KeyEvent),
+    /// The terminal was resized. Carries no dimensions — `terminal.draw`'s
+    /// autoresize re-reads the size — it exists only to wake the loop for a
+    /// repaint, which the loop already does on any received message.
+    Resize,
     /// The current set of Lists (from cache at startup, or a refresh).
     ListsLoaded(Vec<List>),
     /// Per-List `(done, total)` re-derived from the cache. Emitted at startup and
@@ -977,6 +981,23 @@ pub enum Command {
     RefreshLists,
 }
 
+/// Map a terminal event to the `Message` that should wake the reducer loop, or
+/// `None` for events the app ignores.
+///
+/// Kept a pure free function — not inlined in the reader thread — so the mapping
+/// is unit-testable without a live terminal. Only key **presses** and resizes
+/// drive the loop: key releases/repeats, mouse, focus, and paste events are
+/// nothing the app acts on, and dropping the resize here was the whole bug — a
+/// resize never woke the loop, so the frame stayed sized for the old terminal.
+pub fn classify_event(event: crossterm::event::Event) -> Option<Message> {
+    use crossterm::event::{Event, KeyEventKind};
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => Some(Message::Key(key)),
+        Event::Resize(_, _) => Some(Message::Resize),
+        _ => None,
+    }
+}
+
 /// The pure reducer. Applies a `Message` to the `Model` and returns any
 /// side-effect `Command`s for workers to run.
 pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
@@ -990,6 +1011,10 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 None => Vec::new(),
             }
         }
+        // No-op: the repaint happens in the loop's next `terminal.draw`, whose
+        // autoresize picks up the new size. The reducer stays pure and touches
+        // no state.
+        Message::Resize => Vec::new(),
         Message::ListsLoaded(lists) => set_lists(model, lists),
         Message::CountsLoaded(counts) => {
             // Replaced wholesale, and deliberately *not* filtered against

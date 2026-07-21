@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::NaiveDate;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 
 use oxidone::api::{RestClient, TasksApi};
-use oxidone::app::{update, Command, Message, Model, OFFLINE};
+use oxidone::app::{classify_event, update, Command, Message, Model, OFFLINE};
 use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config};
@@ -160,12 +160,15 @@ async fn run(
         reader_parked.store(false, Ordering::Release);
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if reader_tx.send(Message::Key(key)).is_err() {
-                        break;
+                // `classify_event` decides what wakes the loop (key presses and
+                // resizes); anything it maps to `None` is dropped here.
+                Ok(ev) => {
+                    if let Some(msg) = classify_event(ev) {
+                        if reader_tx.send(msg).is_err() {
+                            break;
+                        }
                     }
                 }
-                Ok(_) => {}
                 Err(_) => break,
             },
             Ok(false) => {}
@@ -244,10 +247,12 @@ async fn run(
                 // list to keep in step. Keys are skipped because a keystroke
                 // never writes the cache: it may change the Model optimistically
                 // and emit a Command, but the write lands later in a worker,
-                // whose reply is not a Key and so recounts then. Some worker
-                // replies (a failure, say) wrote nothing either — recounting
-                // anyway costs one indexed query and keeps the rule simple.
-                let cache_may_have_changed = !matches!(msg, Message::Key(_));
+                // whose reply is not a Key and so recounts then. A Resize is
+                // skipped too — it only triggers a repaint and touches no state.
+                // Some worker replies (a failure, say) wrote nothing either —
+                // recounting anyway costs one indexed query and keeps the rule
+                // simple.
+                let cache_may_have_changed = !matches!(msg, Message::Key(_) | Message::Resize);
                 let commands = update(&mut model, msg);
                 if cache_may_have_changed {
                     recount(&cache, &mut model);

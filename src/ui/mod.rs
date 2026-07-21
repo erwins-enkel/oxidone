@@ -753,6 +753,12 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     // `total > 0` guard: there is no completion to report. In Today the count also
     // honours membership (`due <= today`), so a row optimistically migrated past
     // today leaves the meter in the same frame it leaves the pane.
+    //
+    // Membership is the only view filter it honours. The meter reports over the
+    // whole `due <= today` aggregate, so it deliberately counts Completed rows the
+    // pane no longer draws — `Model::within_completion_day` hides a row completed
+    // on an earlier day, and that row stays in this ratio. Today's completion is a
+    // property of the day's workload, not of what survives the view filters.
     let today = model.now.date_naive();
     let today_active = model.today_active();
     let actionable = || {
@@ -777,7 +783,8 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     // Due-load strip: workload ahead over the next `DUE_LOAD_DAYS` days. Dropped
     // in Today — every row there is due<=today, so the strip would fold the whole
     // pane into a single "today" bucket and forecast nothing. The completion meter
-    // above stays: it reports today's actionable completion from the aggregate.
+    // above stays: it reports today's actionable completion over the whole
+    // `due <= today` aggregate (not over the rows the pane draws — see there).
     let counts = if model.today_active() {
         vec![0; DUE_LOAD_DAYS]
     } else {

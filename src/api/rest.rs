@@ -8,8 +8,8 @@
 //! network through, so rate limits and transient read failures are handled
 //! there once instead of separately in every method. Everything the retry loop
 //! decides is a pure function ([`retry_delay`], [`jitter`], [`is_retriable`],
-//! [`is_rate_limit`], [`is_quota_exhausted`]), so the rules are unit-testable
-//! without a socket.
+//! [`is_rate_limit`], [`is_quota_exhausted`], [`SleepBudget::take`]), so the rules
+//! are unit-testable without a socket.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -78,12 +78,14 @@ pub struct RetryPolicy {
     /// The longest `Retry-After` worth honouring. Anything above it is not
     /// retried at all — see [`retry_delay`].
     pub retry_after_ceiling: Duration,
-    /// Total time one request may spend asleep across all of its retries. This,
-    /// not the per-delay ceiling, is what bounds a single request: against the
-    /// 60s default, three consecutive `Retry-After: 30`s sleep twice (30s + 30s
-    /// exactly fills the budget) and the third is refused — 60s of waiting, not
-    /// the 90s an unbounded ladder would spend. A delay is taken only if it fits
-    /// whole; the budget is never overshot.
+    /// Total time one `TasksApi` call may spend asleep across its retries — and,
+    /// via the [`SleepBudget`] threaded through [`RestClient::fetch_all_pages`],
+    /// across every page of a paginated read (#98). This, not the per-delay
+    /// ceiling, is what bounds a call: against the 60s default, three consecutive
+    /// `Retry-After: 30`s sleep twice (30s + 30s exactly fills the budget) and the
+    /// third is refused — 60s of waiting, not the 90s an unbounded ladder would
+    /// spend, nor the N × 60s that a per-page budget would let one read spend. A
+    /// delay is taken only if it fits whole; the budget is never overshot.
     pub sleep_budget: Duration,
 }
 
@@ -94,6 +96,36 @@ impl Default for RetryPolicy {
             base_delay: Duration::from_millis(250),
             retry_after_ceiling: Duration::from_secs(60),
             sleep_budget: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The remaining half of [`RetryPolicy::sleep_budget`], carried across the retries
+/// of a request — and, threaded through [`RestClient::fetch_all_pages`], across
+/// every page of one `TasksApi` call. One paginated read therefore sleeps at most
+/// `sleep_budget` in total, not that per page (#98).
+///
+/// A delay is taken only if it fits whole, so the budget is never overshot; a
+/// refused delay leaves the remainder untouched, so the caller can fall through to
+/// the terminal error. Pure and `send`-free, so the rule is unit-testable.
+struct SleepBudget {
+    remaining: Duration,
+}
+
+impl SleepBudget {
+    fn new(total: Duration) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Spend `delay` if it fits within what is left, reporting whether it did.
+    /// `false` leaves the remainder unchanged — the request is out of budget and
+    /// must surface its failure rather than sleep past the ceiling.
+    fn take(&mut self, delay: Duration) -> bool {
+        if delay <= self.remaining {
+            self.remaining -= delay;
+            true
+        } else {
+            false
         }
     }
 }
@@ -164,8 +196,10 @@ impl RestClient {
     /// on a write may mean the write landed and only the response was lost, and
     /// replaying `insert_task` there would duplicate a Task. Timing comes from
     /// [`retry_delay`]: Google's `Retry-After` when it sent a parseable one,
-    /// otherwise a jittered exponential ladder, all bounded by
-    /// [`RetryPolicy::sleep_budget`].
+    /// otherwise a jittered exponential ladder, all bounded by a [`SleepBudget`].
+    /// A single-request method gets a fresh budget of [`RetryPolicy::sleep_budget`];
+    /// [`RestClient::send_budgeted`] lets [`RestClient::fetch_all_pages`] share one
+    /// across every page instead (#98).
     ///
     /// Transport failures (reset, timeout, DNS) are *not* retried: they surface
     /// before any status exists, and whether a timed-out write reached Google is
@@ -177,6 +211,23 @@ impl RestClient {
     /// whose `reasons` the retry decision needs and whose `message` the terminal
     /// [`status_to_error`] needs.
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ApiError> {
+        // A single-request call gets a fresh sleep budget. Paginated reads share
+        // one across every page via `send_budgeted` — see `fetch_all_pages`.
+        self.send_budgeted(req, &mut SleepBudget::new(self.retry.sleep_budget))
+            .await
+    }
+
+    /// [`RestClient::send`], but drawing its retry sleep from a caller-owned
+    /// [`SleepBudget`] instead of a fresh one. The paginated path threads a single
+    /// budget through every page, so one `TasksApi` call sleeps at most
+    /// `sleep_budget` in total rather than that per page (#98). The `max_retries`
+    /// *attempt* cap remains per request — it bounds one HTTP exchange, not the
+    /// call.
+    async fn send_budgeted(
+        &self,
+        req: reqwest::RequestBuilder,
+        budget: &mut SleepBudget,
+    ) -> Result<reqwest::Response, ApiError> {
         // Built once, cloned per attempt. Beyond making the replay explicit this
         // exposes the HTTP method, which `is_retriable` needs to keep 5xx retries
         // off writes.
@@ -186,7 +237,6 @@ impl RestClient {
         let mut bearer = self.auth.bearer().await?;
         let mut refreshed = false;
         let mut attempt: u32 = 0;
-        let mut slept = Duration::ZERO;
 
         loop {
             let Some(mut next) = req.try_clone() else {
@@ -233,8 +283,7 @@ impl RestClient {
                         Some(_) => delay,
                         None => jitter(delay, clock_nanos()),
                     };
-                    if slept + delay <= self.retry.sleep_budget {
-                        slept += delay;
+                    if budget.take(delay) {
                         tracing::debug!(
                             status = code,
                             attempt,
@@ -250,12 +299,23 @@ impl RestClient {
         }
     }
 
-    /// Send and decode a JSON body into `T`.
+    /// Send and decode a JSON body into `T`, on a fresh per-request sleep budget.
     async fn send_json<T: for<'de> Deserialize<'de>>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, ApiError> {
-        let resp = self.send(req).await?;
+        self.send_json_budgeted(req, &mut SleepBudget::new(self.retry.sleep_budget))
+            .await
+    }
+
+    /// [`RestClient::send_json`] drawing from a caller-owned [`SleepBudget`], so
+    /// `fetch_all_pages` can share one across every page of a call (#98).
+    async fn send_json_budgeted<T: for<'de> Deserialize<'de>>(
+        &self,
+        req: reqwest::RequestBuilder,
+        budget: &mut SleepBudget,
+    ) -> Result<T, ApiError> {
+        let resp = self.send_budgeted(req, budget).await?;
         resp.json::<T>()
             .await
             .map_err(|e| ApiError::Network(format!("decoding response: {e}")))
@@ -284,11 +344,16 @@ impl RestClient {
     /// - a cursor Google has already handed out is a cycle, of any length;
     /// - [`MAX_PAGES`] bounds any other way a chain could fail to end.
     ///
-    /// Each page is a separate [`RestClient::send`], so each carries its **own**
-    /// retry budget: a rate limit on page 7 is backed off without spending page
-    /// 1's. The flip side is that a long chain has no shared ceiling on how long
-    /// it may spend retrying, and that exhausting the budget mid-chain still
-    /// discards the pages already fetched — see #98.
+    /// Every page draws from **one shared [`SleepBudget`]**, so the whole call
+    /// sleeps at most [`RetryPolicy::sleep_budget`] in total — a rate limit on
+    /// page 7 spends what pages 1..7 left, not a fresh 60s (#98). The `max_retries`
+    /// *attempt* cap is still per page; it bounds one HTTP exchange, not the chain.
+    ///
+    /// The residual this does **not** fix: a shared budget makes a long read fail
+    /// closed *sooner* under sustained limiting — after ~`sleep_budget`, not
+    /// N_pages × `sleep_budget` — and exhausting it mid-chain still discards the
+    /// pages already fetched. Only carrying the cursor + partial results across a
+    /// failure would return them; tracked in #102.
     async fn fetch_all_pages<T>(
         &self,
         request: impl Fn(Option<&str>) -> reqwest::RequestBuilder,
@@ -304,8 +369,13 @@ impl RestClient {
         // on every lap — before the backstop caught it.
         let mut seen: HashSet<String> = HashSet::new();
         let mut token: Option<String> = None;
+        // One budget for the whole chain: page 7's backoff draws from the same
+        // ceiling page 1's did, so the call sleeps at most `sleep_budget` in total.
+        let mut budget = SleepBudget::new(self.retry.sleep_budget);
         for _ in 0..MAX_PAGES {
-            let page: WirePage<T> = self.send_json(request(token.as_deref())).await?;
+            let page: WirePage<T> = self
+                .send_json_budgeted(request(token.as_deref()), &mut budget)
+                .await?;
             out.extend(page.items);
             // An empty string is not a cursor; Google omits the field when done,
             // but treating "" as absent costs nothing and avoids a pointless
@@ -1126,5 +1196,50 @@ mod tests {
         // A near-zero test policy has no span to spread over; it must not divide
         // by zero or spin.
         assert_eq!(jitter(Duration::ZERO, 12_345), Duration::ZERO);
+    }
+
+    // ---- SleepBudget: the per-call sleep ceiling threaded across pages (#98) ----
+
+    #[test]
+    fn a_delay_that_fits_is_taken_and_deducted() {
+        let mut budget = SleepBudget::new(Duration::from_secs(60));
+        assert!(budget.take(Duration::from_secs(20)));
+        assert_eq!(budget.remaining, Duration::from_secs(40));
+    }
+
+    #[test]
+    fn a_delay_larger_than_the_remainder_is_refused_and_leaves_it_intact() {
+        let mut budget = SleepBudget::new(Duration::from_secs(60));
+        assert!(!budget.take(Duration::from_secs(61)));
+        assert_eq!(budget.remaining, Duration::from_secs(60));
+    }
+
+    /// Successive takes deplete the same budget — this is what makes a paginated
+    /// read share one ceiling across its pages rather than reset per page.
+    #[test]
+    fn successive_takes_deplete_toward_zero() {
+        let mut budget = SleepBudget::new(Duration::from_secs(60));
+        assert!(budget.take(Duration::from_secs(30)));
+        assert!(budget.take(Duration::from_secs(30)));
+        assert_eq!(budget.remaining, Duration::ZERO);
+        // Exhausted: any positive delay is now refused.
+        assert!(!budget.take(Duration::from_millis(1)));
+    }
+
+    /// A delay that exactly fills the remainder is taken — the boundary is
+    /// inclusive, matching the ladder's "fits whole" rule.
+    #[test]
+    fn a_delay_equal_to_the_remainder_is_taken() {
+        let mut budget = SleepBudget::new(Duration::from_secs(30));
+        assert!(budget.take(Duration::from_secs(30)));
+        assert_eq!(budget.remaining, Duration::ZERO);
+    }
+
+    /// A zero-delay instruction (`Retry-After: 0`) never fails on budget grounds,
+    /// even once the budget is spent: it costs nothing.
+    #[test]
+    fn a_zero_delay_is_always_taken() {
+        let mut budget = SleepBudget::new(Duration::ZERO);
+        assert!(budget.take(Duration::ZERO));
     }
 }

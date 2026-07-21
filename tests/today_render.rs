@@ -260,33 +260,69 @@ fn the_dateline_is_drawn_on_an_empty_day() {
 }
 
 #[test]
-fn each_group_header_is_drawn_only_when_its_group_has_rows() {
+fn the_dividers_track_the_overdue_and_today_split() {
     let overdue = dated(task("Dentist", "home"), day(18));
     let due_today = task("Ship 62", "work");
 
+    // Both groups: each divider is drawn, with its outstanding count.
     let both = spread(&both_groups()).join("\n");
     assert!(
         both.contains("Overdue") && both.contains("Today 2"),
         "{both}"
     );
 
-    let only_today = spread(&today_model(&["work"], vec![due_today.clone()])).join("\n");
-    assert!(!only_today.contains("Overdue"), "{only_today}");
-    assert!(only_today.contains("Today 1"), "{only_today}");
-
+    // Only overdue: the `Overdue` divider is drawn; the `Today` divider is not,
+    // since the group it would head has no rows.
     let only_overdue = spread(&today_model(&["home"], vec![overdue]));
     assert!(only_overdue.iter().any(|r| r.trim() == "Overdue 1"));
-    // No `Today` header at all — the dateline above is a different row, and the
-    // group it would head has no rows.
     assert!(
         !only_overdue.iter().any(|r| r.trim().starts_with("Today")),
         "{only_overdue:?}"
     );
 
+    // Only today (nothing overdue): neither divider is drawn. The `Today` divider
+    // would only echo the dateline, so it is dropped — its count rides the
+    // dateline instead (asserted in `the_dateline_carries_the_count_...`).
+    let only_today = spread(&today_model(&["work"], vec![due_today])).join("\n");
+    assert!(!only_today.contains("Overdue"), "{only_today}");
+    assert!(!only_today.contains("Today"), "{only_today}");
+
+    // Empty day: dateline only, no dividers.
     let empty = spread(&today_model(&["work"], vec![])).join("\n");
     assert!(
-        !empty.contains("Overdue") && !empty.contains("Today 1"),
+        !empty.contains("Overdue") && !empty.contains("Today"),
         "{empty}"
+    );
+}
+
+#[test]
+fn the_dateline_carries_the_count_when_nothing_is_overdue() {
+    // With no Overdue group the redundant `Today` divider is dropped, and its one
+    // unique signal — the count still outstanding today — rides the dateline. Two
+    // open and one settled: the settled row is drawn but not counted, so the
+    // dateline reads `2`, not `3`.
+    let mut m = today_model(
+        &["work"],
+        vec![
+            task("Ship 62", "work"),
+            task("Standup", "work"),
+            completed(task("Groceries", "work")),
+        ],
+    );
+    m.show_completed = true;
+    let rows = spread(&m);
+
+    assert!(
+        rows[0].contains("Monday 20 July 2026  2"),
+        "the dateline carries the outstanding count: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.trim().starts_with("Today")),
+        "no redundant `Today` divider when nothing is overdue: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Groceries")),
+        "the settled row is still drawn, just not counted: {rows:?}"
     );
 }
 

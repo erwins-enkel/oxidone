@@ -843,20 +843,22 @@ const DATELINE_FORMAT: &str = "%A %-d %B %Y";
 /// Interleave Today's journal-spread header rows into the Task rows, and shift
 /// the cursor to match.
 ///
-/// Three non-selectable rows, in the same `List` widget as the Tasks: the
-/// dateline, then an `Overdue` and a `Today` group header. One widget, not a
-/// `Paragraph` above the pane — a second widget would need its own scroll, and
-/// would detach a label from the rows it heads the moment the pane moved.
+/// Non-selectable rows share the Tasks' `List` widget — not a `Paragraph` above
+/// the pane, which would need its own scroll and would detach a label from the
+/// rows it heads the moment the pane moved:
 ///
-/// A group header is drawn when its group has **rows**; its count is only the
-/// rows still `needsAction`. The two rules differ deliberately: membership must
-/// be status-blind for the Overdue prefix to hold (see [`due_before`]), while the
-/// count answers the migration ritual's question — what is *left* to move — so a
-/// struck-through row is not in it. At zero outstanding the count and the urgent
-/// colour both drop: the rows are settled, and nothing is owed.
-///
-/// The dateline is drawn even on an empty day. It is the page, not a label for
-/// the rows.
+/// - The **dateline** always leads. It is the page, not a label for the rows, so
+///   it is drawn even on an empty day.
+/// - When an **Overdue** group splits the pane, an `Overdue` header heads it and a
+///   `Today` header heads the rows due today — the two dividers of the migration
+///   ritual. A divider is drawn when its group has **rows**; its count is only the
+///   rows still `needsAction`. Membership is status-blind so the Overdue prefix
+///   holds (see [`due_before`]), while the count answers what is *left* to move,
+///   so a struck-through row is not in it. At zero outstanding the count and the
+///   urgent colour both drop.
+/// - With **no Overdue** group the `Today` header would only echo the dateline
+///   (which is itself today), so it is dropped; the dateline carries the
+///   outstanding count instead.
 fn journal_spread<'a>(
     rows: Vec<ListItem<'a>>,
     selected: Option<usize>,
@@ -874,27 +876,53 @@ fn journal_spread<'a>(
             .count()
     };
 
-    let mut out = Vec::with_capacity(rows.len() + 3);
-    out.push(ListItem::new(Line::from(Span::styled(
+    // The dateline. With no Overdue group there is nothing for a `Today` divider
+    // to divide from, so it would only echo the dateline — carry its one unique
+    // signal, the count still outstanding today, here instead. Two spaces set the
+    // count off from the long date text, where the divider's tight `label N` would
+    // read as cramped. Omitted at zero, as a divider's count is.
+    let mut dateline = vec![Span::styled(
         today.format(DATELINE_FORMAT).to_string(),
         Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
-    ))));
+    )];
+    if overdue.is_empty() {
+        let n = outstanding(rest);
+        if n > 0 {
+            dateline.push(Span::styled(
+                format!("  {n}"),
+                Style::new().fg(theme.subtext),
+            ));
+        }
+    }
+
+    let mut out = Vec::with_capacity(rows.len() + 3);
+    out.push(ListItem::new(Line::from(dateline)));
     let mut rows = rows.into_iter();
     if !overdue.is_empty() {
         out.push(spread_header("Overdue", outstanding(overdue), true, theme));
         out.extend(rows.by_ref().take(overdue.len()));
+        if !rest.is_empty() {
+            out.push(spread_header("Today", outstanding(rest), false, theme));
+        }
     }
-    if !rest.is_empty() {
-        out.push(spread_header("Today", outstanding(rest), false, theme));
-        out.extend(rows);
-    }
+    out.extend(rows);
 
-    // The dateline sits above every row; the `Overdue` header above every row
-    // when it exists at all; the `Today` header only above the rows past the
-    // prefix. A cursor at `p` is pushed down by however many of those precede it.
-    let selected =
-        selected.map(|p| p + 1 + usize::from(!overdue.is_empty()) + usize::from(p >= overdue_rows));
+    // A cursor at display position `p` is pushed down by the header rows above it.
+    let selected = selected.map(|p| spread_offset(p, overdue_rows));
     (out, selected)
+}
+
+/// Rows the journal spread inserts above the Task at display position `p`: the
+/// dateline always, plus the `Overdue`/`Today` dividers when an Overdue group
+/// splits the pane. With no Overdue group there are no dividers — the dateline
+/// carries the count instead — so every row shifts by one.
+fn spread_offset(p: usize, overdue_rows: usize) -> usize {
+    p + 1
+        + if overdue_rows == 0 {
+            0
+        } else {
+            1 + usize::from(p >= overdue_rows)
+        }
 }
 
 /// One group header of the journal spread: a bold label, then the count of rows
@@ -1931,6 +1959,48 @@ mod tests {
             &theme,
         );
         assert_eq!(style.fg, Some(theme.subtext));
+    }
+
+    #[test]
+    fn the_journal_spread_inserts_a_header_per_group_and_shifts_the_cursor() {
+        let theme = Theme::from_flavor("mocha");
+        let today = ymd(2026, 7, 20);
+        // Three Tasks; `overdue_rows` alone decides how the spread groups them.
+        let tasks = [
+            task(Some(today), Status::NeedsAction),
+            task(Some(today), Status::NeedsAction),
+            task(Some(today), Status::NeedsAction),
+        ];
+        let ordered: Vec<&Task> = tasks.iter().collect();
+        let build = || -> Vec<ListItem<'static>> {
+            (0..ordered.len()).map(|_| ListItem::new("row")).collect()
+        };
+
+        // No Overdue group: the dateline is the only inserted row.
+        let (out, cursor) = journal_spread(build(), Some(1), &ordered, 0, today, &theme);
+        assert_eq!(out.len() - ordered.len(), 1, "dateline only");
+        assert_eq!(cursor, Some(2), "shift past the dateline");
+
+        // All overdue, none due today: dateline + `Overdue`, and no `Today`.
+        let (out, cursor) =
+            journal_spread(build(), Some(0), &ordered, ordered.len(), today, &theme);
+        assert_eq!(out.len() - ordered.len(), 2, "dateline + Overdue");
+        assert_eq!(cursor, Some(2), "shift past dateline + Overdue header");
+
+        // Both groups: dateline + `Overdue` + `Today`.
+        let (out, prefix) = journal_spread(build(), Some(0), &ordered, 1, today, &theme);
+        assert_eq!(out.len() - ordered.len(), 3, "dateline + Overdue + Today");
+        assert_eq!(
+            prefix,
+            Some(2),
+            "a row in the Overdue prefix clears two headers"
+        );
+        let (_, past) = journal_spread(build(), Some(2), &ordered, 1, today, &theme);
+        assert_eq!(
+            past,
+            Some(5),
+            "a row past the prefix clears all three header rows"
+        );
     }
 
     // --- Legend: fitting, row assembly, and context ----------------------

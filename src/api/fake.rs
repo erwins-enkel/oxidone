@@ -383,33 +383,59 @@ impl TasksApi for FakeTasksApi {
         // Encoding oxidone's refusal would also mask it: `sync::move_task_to_list`
         // checks first, so no caller reaches this with children.
         //
-        // KNOWN DIVERGENCE (#95): Google carries the subtree — the children
-        // follow their parent into the destination, still naming it. The code
-        // below leaves them behind instead, which is what this fake did while
-        // the real behaviour was unknown. Nothing asserts on it today, so it is
-        // recorded rather than changed here; correcting it is a test-infra
-        // change of its own.
+        // Google carries the subtree (#86, #95): the children follow their
+        // parent into the destination, still naming it, ids intact — so the code
+        // below relocates them alongside the parent. What #86 did *not* verify is
+        // the children's `etag`/`updated`, so those are left unbumped here as a
+        // stand-in, not observed behaviour; a reader lifting the `sync` refusal
+        // (#93) must not read the carried timestamps as Google's truth.
+
+        // The parent's children in Manual order, captured before any mutation.
+        // `live_ids_in_order` excludes only `deleted`, so a Cleared (`hidden`)
+        // child is carried too — the case #86 confirmed under `show_hidden=true`.
+        let children: Vec<TaskId> = st
+            .live_ids_in_order(list)
+            .into_iter()
+            .filter(|c| {
+                st.entry_pos(list, c)
+                    .is_some_and(|p| st.tasks[p].task.parent.as_ref() == Some(id))
+            })
+            .collect();
 
         let (seq, ts) = st.tick();
 
-        // Relocate, top-level (the move carries no `parent`), and renumber both
-        // Lists so `position` stays one coherent index scheme per List.
+        // Relocate the parent, top-level (the move carries no `parent`), and bump
+        // it — the operation's subject, as in `move_task`.
         let pos = st.entry_pos(list, id).unwrap();
         st.tasks[pos].task.list = destination.clone();
         st.tasks[pos].task.parent = None;
         st.tasks[pos].task.etag = format!("etag-{seq}");
         st.tasks[pos].task.updated = ts;
 
+        // Carry each child into the destination: only its `list` changes. `id`,
+        // `parent` (still naming the parent), `etag`, and `updated` stand as they
+        // were — see the note above on the unbumped timestamps.
+        for child in &children {
+            let p = st.entry_pos(list, child).unwrap();
+            st.tasks[p].task.list = destination.clone();
+        }
+
+        // Renumber both Lists so `position` stays one coherent index scheme per
+        // List; `live_ids_in_order(list)` now excludes the departed subtree.
         let source_order = st.live_ids_in_order(list);
         for (i, tid) in source_order.iter().enumerate() {
             let p = st.entry_pos(list, tid).unwrap();
             st.tasks[p].task.position = format!("{i:020}");
         }
-        // Head of the destination: `previous` is omitted, so the moved Task is
-        // first and everything already there shifts down.
-        let mut dest_order = st.live_ids_in_order(destination);
-        dest_order.retain(|t| t != id);
-        dest_order.insert(0, id.clone());
+        // Subtree at the head of the destination: the parent first, then its
+        // children in their prior order, then everything already there shifts
+        // down. `previous` is omitted, so head is where the move lands.
+        let mut tail = st.live_ids_in_order(destination);
+        tail.retain(|t| t != id && !children.contains(t));
+        let dest_order: Vec<TaskId> = std::iter::once(id.clone())
+            .chain(children.iter().cloned())
+            .chain(tail)
+            .collect();
         for (i, tid) in dest_order.iter().enumerate() {
             let p = st.entry_pos(destination, tid).unwrap();
             st.tasks[p].task.position = format!("{i:020}");

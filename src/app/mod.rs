@@ -70,6 +70,14 @@ pub struct Model {
     /// than this many days out is hidden while the filter is on. Held separately
     /// from the flag so the cutoff survives toggling the filter off and on.
     pub horizon_days: u16,
+    /// The active title/notes filter (`/`), or `None` when off. A case-insensitive
+    /// substring matched against each row's display title and notes body — a local,
+    /// read-only view filter like `show_completed`/`hide_distant`, never mutating
+    /// `tasks` or writing to Google. While the [`Overlay::Filter`] input is open
+    /// this is edited live so the pane narrows on each keystroke; on `Enter` the
+    /// input closes and this persists, on `Esc` it clears. Dropped on a List/Today
+    /// switch (see [`request_selected`]).
+    pub filter: Option<String>,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -210,6 +218,12 @@ pub enum Overlay {
     AddList { buffer: String },
     /// In-place title editor for a List.
     RenameList { list: ListId, buffer: String },
+    /// The title/notes filter input (`/`). A marker with no buffer of its own:
+    /// the query lives on [`Model::filter`] (the single source of truth the view
+    /// filter reads), edited in place by [`filter_key`] so the pane narrows live
+    /// while this is open. Renders nothing over the panes — the pane header shows
+    /// the query and caret.
+    Filter,
     /// A reusable destructive-action confirmation (delete Task or List).
     Confirm(Confirm),
     /// Pick which of a Task's links to open — merged from its `links[]` and its
@@ -241,7 +255,12 @@ impl Overlay {
             | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
             | Overlay::RenameList { buffer, .. } => Some(buffer),
-            Overlay::Confirm(_) | Overlay::OpenLink { .. } | Overlay::MoveToList { .. } => None,
+            // `Filter` has no buffer of its own — its query lives on `Model::filter`
+            // and `overlay_key` routes it through `filter_key` before this path.
+            Overlay::Filter
+            | Overlay::Confirm(_)
+            | Overlay::OpenLink { .. }
+            | Overlay::MoveToList { .. } => None,
         }
     }
 }
@@ -285,6 +304,7 @@ impl Default for Model {
             sort: SortView::Due,
             hide_distant: false,
             horizon_days: 14,
+            filter: None,
             show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
@@ -600,6 +620,31 @@ impl Model {
             && self.within_horizon(task)
             && self.within_today(task)
             && self.within_completion_day(task)
+            && self.matches_filter(task)
+    }
+
+    /// The title/notes filter (`/`): with no filter a no-op; otherwise a row shows
+    /// only if the case-insensitive query is a substring of its **display title**
+    /// (prefix stripped, matching the Title sort) or its **notes** body. An empty
+    /// query — the input just opened, before any character — matches everything,
+    /// so opening the filter never blanks the pane.
+    ///
+    /// A per-row predicate like the other view filters, so a matching Subtask
+    /// under a non-matching parent renders flush-left as an orphan, exactly as the
+    /// distant-due horizon already does.
+    fn matches_filter(&self, task: &Task) -> bool {
+        let Some(query) = self.filter.as_deref() else {
+            return true;
+        };
+        if query.is_empty() {
+            return true;
+        }
+        let needle = query.to_lowercase();
+        task.display_title().to_lowercase().contains(&needle)
+            || task
+                .notes
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().contains(&needle))
     }
 
     /// The Completed filter: a Task shows unless it is Completed and Completed
@@ -1465,6 +1510,13 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
 /// first (a List change); otherwise the current Tasks stay until the new ones
 /// arrive. With no List selected, the pane is always emptied.
 fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
+    // `clear_pane` marks a change of the active List/Today — the pane is being
+    // replaced with another's Tasks — so drop the filter with it: a query typed
+    // against one List should not silently narrow the next. Refresh reconciles the
+    // *same* pane with `clear_pane == false`, so it preserves the filter.
+    if clear_pane {
+        model.filter = None;
+    }
     if model.today_active() {
         // Today has no Manual lens (cross-List order is undefined). Normalise a
         // Manual carried in from a List to Due on entry, so the pane order and the
@@ -1593,7 +1645,19 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
     match action {
         Action::Quit => model.should_quit = true,
         Action::ToggleHelp => model.show_help = !model.show_help,
-        Action::CloseOverlay => model.show_help = false,
+        // Esc with no overlay open. Closes the cheatsheet first; failing that,
+        // clears a persisted filter and restores the full pane (its cursor may
+        // have to re-anchor onto a row the filter had hidden). The filter *input*
+        // being open is handled earlier, in `filter_key` — this arm never runs
+        // then, since `overlay_key` intercepts keys while any overlay is set.
+        Action::CloseOverlay => {
+            if model.show_help {
+                model.show_help = false;
+            } else if model.filter.is_some() {
+                model.filter = None;
+                reselect_visible(model);
+            }
+        }
         Action::SwitchPane => model.focus = model.focus.toggled(),
         // Directional, unlike `SwitchPane`: they name a pane rather than flip to
         // the other one, so they are idempotent at the layout's edges. The panes
@@ -1639,6 +1703,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             model.hide_distant = !model.hide_distant;
             reselect_visible(model);
         }
+        Action::Filter => open_filter(model),
         Action::ClearCompleted => open_clear_completed_confirm(model),
         Action::Refresh => return refresh(model),
         Action::AddSubtask => open_add_subtask(model),
@@ -2585,14 +2650,66 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
-/// Route a key to the active overlay: cursor keys for the link picker, yes/no
-/// for `Confirm`, text editing for the input overlays.
+/// Open the title/notes filter input (`/`). Focuses the task pane — the filter
+/// narrows it, so acting on the results wants that pane — and seeds an empty query
+/// only when none is active, so `/` on a persisted filter reopens it for
+/// refinement in place rather than blanking it.
+fn open_filter(model: &mut Model) {
+    model.focus = Focus::Tasks;
+    if model.filter.is_none() {
+        model.filter = Some(String::new());
+    }
+    model.overlay = Some(Overlay::Filter);
+}
+
+/// Keys for the open filter input. The query lives on `Model::filter` (the single
+/// source of truth the view filter reads), so each edit narrows the pane live and
+/// re-anchors the cursor onto a surviving row. `Enter` keeps the filter and closes
+/// the input — an all-empty query commits to `None`, since a blank filter is no
+/// filter. `Esc` clears the filter and restores the pane. Everything else is
+/// swallowed, as every other overlay does.
+fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    // `Some` whenever the Filter overlay is open (`open_filter` seeds it); the
+    // fallback keeps this total without asserting that invariant in a panic.
+    let query = model.filter.get_or_insert_with(String::new);
+    match key.code {
+        KeyCode::Char(c) => query.push(c),
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Enter => {
+            if query.is_empty() {
+                model.filter = None;
+            }
+            model.overlay = None;
+            return Vec::new();
+        }
+        KeyCode::Esc => {
+            model.filter = None;
+            model.overlay = None;
+            reselect_visible(model);
+            return Vec::new();
+        }
+        _ => return Vec::new(),
+    }
+    // A live edit (char/backspace) changed what is visible: keep the cursor on a
+    // row that still shows.
+    reselect_visible(model);
+    Vec::new()
+}
+
+/// Route a key to the active overlay: the filter input, cursor keys for the link
+/// picker, yes/no for `Confirm`, text editing for the input overlays.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // Three-way on the overlay's kind. "Has a text buffer, else y/n" is not
     // enough: the picker has no buffer either, and falling through to the
     // confirm arm would let `y` silently dismiss it.
     match model.overlay {
+        // The filter input, routed first: its query lives on `Model::filter`, not
+        // a buffer, and its keys narrow the pane live rather than editing text.
+        Some(Overlay::Filter) => return filter_key(model, key),
         // Both pickers, routed before the `Confirm` and text-buffer arms below:
         // falling through would let `y` dismiss one, or swallow its keys.
         Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {

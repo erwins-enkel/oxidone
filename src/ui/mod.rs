@@ -121,6 +121,9 @@ fn render_overlay(
         Overlay::MoveToList {
             targets, selected, ..
         } => return render_list_picker(frame, area, targets, *selected, theme),
+        // The filter input draws no popup — the pane header carries its query and
+        // caret (see `header_title`), so the narrowed pane stays fully visible.
+        Overlay::Filter => return,
     };
     let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
     let popup = centered(area, OVERLAY_WIDTH, height + OVERLAY_BORDERS);
@@ -791,6 +794,21 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     let inner = inner_width as usize;
     let mut title = base.to_string();
 
+    // The active title/notes filter (`/`), shown before the optional data widgets
+    // so a narrowed — or empty — pane always says why. A caret trails the query
+    // only while the input is open (`Overlay::Filter`), distinguishing a live edit
+    // from a committed filter. Appended unconditionally like the base title: it is
+    // state, not a droppable widget, so the braille meter and strip below degrade
+    // before it if the pane is narrow.
+    if let Some(query) = &model.filter {
+        let caret = if matches!(model.overlay, Some(Overlay::Filter)) {
+            "▏"
+        } else {
+            ""
+        };
+        title.push_str(&format!("  /{query}{caret}"));
+    }
+
     // Completion meter over Task-typed entries only: Events and Notes are not work
     // you complete, so counting them would make the meter permanently under-report.
     // Numerator and denominator come from the *same* set — a completed Note counts
@@ -956,6 +974,7 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
+        Some(Overlay::Filter) => keymap::LegendContext::Filter,
         // The add-entry captures parse a trailing date and bind `Tab` for a
         // literal submit, so they get their own legend rather than `TextInput`'s.
         Some(Overlay::AddTask { .. } | Overlay::AddSubtask { .. }) => {

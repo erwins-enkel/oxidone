@@ -428,16 +428,22 @@ async fn move_task_to_list_sends_destination_tasklist_and_clears_a_synthetically
     assert_eq!(task.parent, None);
 }
 
-/// The shape Google actually returned on 2026-07-21 (#86) when relocating a
-/// **top-level** Task: no `parent` field, and the `id` unchanged across Lists.
-/// The id is the load-bearing part — `sync::write_move_to_list` relocates the
-/// cache row with a single `INSERT OR REPLACE` keyed on it, which *relocates*
-/// rather than duplicates only while the id is stable.
+/// The `id` survives a cross-List move, against the body Google actually
+/// returned on 2026-07-21 (#86) when relocating a **top-level** Task — no
+/// `parent` field, `id` unchanged.
+///
+/// Only the `id` assertion below tests anything: `move_task_to_list` stamps
+/// `list` from its argument and clears `parent` unconditionally, so those two
+/// hold for *any* response body and are kept as regression guards, not as
+/// evidence about the wire. The id is what carries weight —
+/// `sync::write_move_to_list` relocates the cache row with a single
+/// `INSERT OR REPLACE` keyed on it, which *relocates* rather than duplicates
+/// only while the id is stable.
 ///
 /// Pinned alongside the synthetic case above, not in place of it: that one
 /// covers a synthetic parent echo, which this observation does not reach.
 #[tokio::test]
-async fn move_task_to_list_keeps_the_id_and_gets_no_parent_from_the_wire() {
+async fn move_task_to_list_keeps_the_id_across_lists() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/T3/move"))
@@ -459,7 +465,9 @@ async fn move_task_to_list_keeps_the_id_and_gets_no_parent_from_the_wire() {
         )
         .await
         .unwrap();
+    // The one assertion this test exists for: the id came off the wire unchanged.
     assert_eq!(task.id, TaskId("T3".into()));
+    // Both true by construction (stamped / cleared regardless of the body).
     assert_eq!(task.list, ListId("L2".into()));
     assert_eq!(task.parent, None);
 }

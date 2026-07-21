@@ -763,8 +763,13 @@ impl Model {
     /// it has a due date strictly more than `horizon_days` past today. Undated
     /// entries are never distant, so they always pass. Keys on the due date, not
     /// the entry type, so a far-future Event is hidden the same as a Task.
+    ///
+    /// **Exempt in Search**: the horizon is a triage filter ("what is near"), while
+    /// Search is a retrieval surface ("where is it") — a retrieval that presumes a
+    /// date range cannot answer its own question. So a far-future match is found in
+    /// Search even with the horizon on, while its own List pane still hides it.
     fn within_horizon(&self, task: &Task) -> bool {
-        if !self.hide_distant {
+        if !self.hide_distant || self.search_active() {
             return true;
         }
         match task.due {
@@ -1488,11 +1493,17 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 }
             }
 
-            // Only Today needs repair. A source List pane cannot be showing the row
-            // — the provisional tombstone kept it out — and any other pane holds
-            // nothing of ours. The re-insert is a bridge across the frames before
-            // the reload below lands, not a durable placement.
-            if snapshot.pane == PaneKey::Today && model.today_active() {
+            // Only a flat cross-List pane needs repair, and only the one the Move
+            // started in: a source List pane cannot be showing the row — the
+            // provisional tombstone kept it out — and any other pane holds nothing
+            // of ours. The re-insert is a bridge across the frames before the reload
+            // below lands, not a durable placement.
+            let repair_pane = match snapshot.pane {
+                PaneKey::Today => model.today_active(),
+                PaneKey::Search => model.search_active(),
+                PaneKey::List(_) => false,
+            };
+            if repair_pane {
                 let selected = selected_id(model);
                 if !model.tasks.iter().any(|t| t.id == task.id) {
                     let at = snapshot.index.min(model.tasks.len());
@@ -1501,14 +1512,13 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 model.selected_task =
                     selected.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                 reselect_visible(model);
-                // Today spans Lists, so the row belongs in the aggregate under its
-                // new List — but a `LoadToday` issued before the move returns it
-                // under the *old* one, where the fresh source tombstone drops it.
-                // With no background poll, re-asking is what repairs that.
-                return vec![Command::LoadToday {
-                    lists: model.lists.clone(),
-                    today: model.now.date_naive(),
-                }];
+                // A flat pane spans Lists, so the row belongs in the aggregate under
+                // its new List — but a load issued before the move returns it under
+                // the *old* one, where the fresh source tombstone drops it. With no
+                // background poll, re-asking repairs that. `clear_pane: false` keeps
+                // the bridged row (and, in Search, the query); the branch dispatches
+                // `LoadToday` or `LoadSearch` by pane.
+                return request_selected(model, false);
             }
             Vec::new()
         }
@@ -1574,9 +1584,12 @@ fn set_completed(task: &mut Task, completed: bool) {
 /// id-less `LoadFailed`, so one List's failure never splashes onto the active
 /// pane's status line (see the reducer arm).
 fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
-    let was_today = model.today_active();
-    // Read the raw cursor, not `selected_list_id()`: that accessor returns `None`
-    // in Search (Search is not a List), but here we need the List the parked
+    // Read the raw cursor, not `today_active()`: this asks "was the *parked cursor*
+    // on Today?" — where `selected` lands after the List set is replaced — a
+    // question Search (which parks on Today or a List) does not change.
+    let was_today = matches!(model.selected, Selection::Today);
+    // Likewise the raw cursor, not `selected_list_id()`: that accessor returns
+    // `None` in Search (Search is not a List), but here we need the List the parked
     // cursor names so a refresh mid-Search still restores it by id.
     let previously_selected = match model.selected {
         Selection::List(i) => model.lists.get(i).map(|l| l.id.clone()),
@@ -1596,8 +1609,15 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     model.status_line = None;
     // Only wipe the pane when the target actually changed; a refresh that keeps the
     // same selection (Today↔Today or List X↔List X) reloads in place, no blank flash.
+    //
+    // Forced `false` in Search: the pane is Search regardless of what became of the
+    // parked List, so no List-set change is a target change. This keeps a refresh
+    // after the parked List disappears server-side from reaching `request_selected`
+    // with `clear_pane` — belt-and-suspenders beside the Search branch's own
+    // `clear_pane` opt-out, and legible if that branch ever changes.
     let now_selected = model.selected_list_id().cloned();
-    let target_changed = was_today != model.today_active() || previously_selected != now_selected;
+    let target_changed = !model.search_active()
+        && (was_today != model.today_active() || previously_selected != now_selected);
     let mut commands = request_selected(model, target_changed);
 
     // Consume the flag unconditionally, so a Refresh's `full` never carries into a
@@ -1644,7 +1664,13 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     // `refresh()` reaches here with `clear_pane == false`, which is how `r` keeps
     // the corpus. Precedes the `selected_list_id()` match below, which is `None` in
     // Search and would otherwise blank the pane.
+    //
+    // The single choke point for `LoadSearch`, so the pending notice is armed here
+    // — on entry, on `r`, and on the Move repair alike. The `live` reply clears it
+    // (offline included, since `main.rs` sends `live: true` when there is no
+    // fan-out to wait for).
     if model.search_active() {
+        model.search_pending = true;
         return vec![Command::LoadSearch {
             lists: model.lists.clone(),
         }];
@@ -1871,9 +1897,19 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         // View-only: hide/reveal entries due beyond the horizon. Hiding may drop
         // the selected Task out of view, so re-anchor the cursor onto a visible
         // one, exactly as the Completed toggle does.
+        //
+        // Refused in Search, and the flag is **not** flipped: `within_horizon` is
+        // exempt there, so a working `w` would flip `hide_distant` invisibly — and
+        // that flip persists for the session (seeded from config, never written
+        // back), silently changing the List pane the user returns to.
         Action::ToggleHideDistant => {
-            model.hide_distant = !model.hide_distant;
-            reselect_visible(model);
+            if model.search_active() {
+                model.status_line =
+                    Some("distant filter doesn't apply in Search — every match shows".to_string());
+            } else {
+                model.hide_distant = !model.hide_distant;
+                reselect_visible(model);
+            }
         }
         Action::Filter => open_filter(model),
         // In Search already, `S` reopens the query input over the existing query
@@ -2008,10 +2044,11 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
 }
 
 /// Open the capture overlay for a new Task. Needs a target List: the active List
-/// normally, or — in Today — the resolved default List, refused up front (fail
-/// closed) when that is not yet known rather than opening an overlay that discards.
+/// normally, or — in Today or Search (neither is a List) — the resolved default
+/// List, refused up front (fail closed) when that is not yet known rather than
+/// opening an overlay that discards.
 fn open_add_task(model: &mut Model) {
-    if model.today_active() {
+    if model.today_active() || model.search_active() {
         if model.default_list.is_none() {
             model.status_line =
                 Some("can't capture: default list not resolved (connect to Google)".to_string());
@@ -2056,6 +2093,18 @@ fn finish_add_task(model: &mut Model, buffer: String, literal: bool) -> Vec<Comm
         let due = due.or_else(|| Some(model.now.date_naive()));
         return add_task_placeholder(model, list, title, None, 0, due);
     }
+    if model.search_active() {
+        // Also the default List, but **undated**: Search has no membership to
+        // preserve (unlike Today's `due <= today`), so forcing a due date would
+        // invent a schedule the user did not ask for. A trailing parsed date is
+        // still honoured, exactly as in a List pane.
+        let Some(list) = model.default_list.clone() else {
+            model.status_line =
+                Some("can't capture: default list not resolved (connect to Google)".to_string());
+            return Vec::new();
+        };
+        return add_task_placeholder(model, list, title, None, 0, due);
+    }
     let Some(list) = model.selected_list_id().cloned() else {
         return Vec::new();
     };
@@ -2084,9 +2133,11 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    // Subtasks are a per-List, position-shaped concept; Today is a flat cross-List
-    // view, so `o` is disabled there (like the Moves).
-    if model.today_active() {
+    // Subtasks are a per-List, position-shaped concept; Today and Search are flat
+    // cross-List views, so `o` is disabled in both (like the Moves). Explicit in
+    // Search: its `today_active()` guard no longer covers it, and without this `o`
+    // would parent a Subtask into the parked List.
+    if model.today_active() || model.search_active() {
         model.status_line = Some("subtasks are per-list — open the list to add one".to_string());
         return;
     }
@@ -2214,9 +2265,15 @@ fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
         return None;
     }
     // Moves write Manual order (per-List `position`); across Lists that order is
-    // genuinely undefined, so J/K/>/< are disabled in Today.
+    // genuinely undefined, so J/K/>/< are disabled in Today and Search. Explicit
+    // in Search too: `selected_list_id()` is `None` there, so without this the `?`
+    // below would make the key a silent no-op.
     if model.today_active() {
         model.status_line = Some("can't move in Today — open the list to reorder".to_string());
+        return None;
+    }
+    if model.search_active() {
+        model.status_line = Some("can't move in Search — open the list to reorder".to_string());
         return None;
     }
     let list = model.selected_list_id().cloned()?;
@@ -2673,6 +2730,17 @@ fn open_delete_confirm(model: &mut Model) {
 /// Open the destructive-confirm for Clearing the active List's Completed Tasks.
 /// A no-op with no active List or nothing to Clear (don't prompt for zero).
 fn open_clear_completed_confirm(model: &mut Model) {
+    // Refused in Search: it is destructive, and neither existing scope fits. A
+    // Today-style sweep would clear every Completed row across every List in the
+    // corpus; a List-style sweep would clear the parked List, which is not what
+    // the pane shows. A sweep of "everything you searched" is unbounded and the
+    // confirm's count could not honestly describe it. `C` from a List/Today is
+    // unaffected.
+    if model.search_active() {
+        model.status_line =
+            Some("can't clear in Search — open the list to clear completed".to_string());
+        return;
+    }
     if model.today_active() {
         // Cross-List sweep: group the aggregate's Completed rows by their own List.
         // Google's clear_completed is per-List, so one command per contributing
@@ -2863,9 +2931,9 @@ fn open_filter(model: &mut Model) {
 /// `Enter` steers the results, not the sidebar Search was opened from.
 fn enter_search(model: &mut Model) -> Vec<Command> {
     model.search = true;
-    model.search_pending = true;
     model.tasks.clear();
     model.selected_task = None;
+    // `request_selected`'s Search branch arms `search_pending` and emits the load.
     let commands = request_selected(model, true);
     model.focus = Focus::Tasks;
     model.filter = Some(String::new());

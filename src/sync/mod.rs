@@ -234,11 +234,18 @@ pub async fn delete_list(api: &dyn TasksApi, cache: &Cache, list: &ListId) -> Re
 
 /// Relocate a Task to another List, refusing first if it still has Subtasks.
 ///
-/// The refusal is **oxidone's**, not Google's — whether Google rejects this is
-/// unverified — so it is an `anyhow` error rather than an [`ApiError`] variant:
-/// `Rejected` would render as "google rejected the request" for a call Google
-/// never received. Transport failures keep their cause under a context line;
-/// callers format with `{e:#}` to show the whole chain.
+/// The refusal is **oxidone's**, not Google's: Google *accepts* the move and
+/// carries the subtree intact — children follow, still naming their parent, and
+/// every `id` survives (verified 2026-07-21 against a live account, two runs of
+/// two fixtures each; see #86). So this stays an `anyhow` error rather than an
+/// [`ApiError`] variant: `Rejected` would render as "google rejected the
+/// request" for a call Google never received. Transport failures keep their
+/// cause under a context line; callers format with `{e:#}` to show the chain.
+///
+/// The rule outlived its reason — it was adopted because a half-moved subtree
+/// could not be undone, and nothing is half-moved. It is kept here only until
+/// #93 removes it; note that removing it also needs #94, since the cache
+/// mirrors only the parent (see [`write_move_to_list`]).
 ///
 /// The check must be **live**. A Cleared Subtask is in neither the pane nor the
 /// cache — the cache is filled by [`fetch_active_tasks`] with `show_hidden=false`

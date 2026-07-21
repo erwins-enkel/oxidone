@@ -63,7 +63,7 @@ Repositioning, reparenting, or **relocating** a Task (Google's `move` operation)
 
 Relocating (`M`, "move to list") is the third axis: the same operation with a `destinationTasklist`, sending a Task to another List. It writes no Manual order in the pane it leaves, so unlike the other Moves it neither needs nor switches the Sort lens, and it works in **Today** — where the source is the row's own List, not the selected one. The Task lands at the **top** of the destination, the one position Google permits for every Task including a Cleared one, and a Subtask arrives **top-level**: its parent stays behind and cannot follow.
 
-A Task that still *has* Subtasks is refused. Google does not document whether children follow their parent across Lists, and a half-moved subtree cannot be undone — so oxidone declines rather than guesses. The refusal is decided by a live query with `show_hidden=true`, because a Cleared Subtask appears in neither the pane nor the cache.
+A Task that still *has* Subtasks is refused. **Google moves the subtree intact**: the children follow their parent into the destination, still naming it, and every `id` survives the move (verified 2026-07-21 — one account, two runs of two fixtures each; see #86). The original reasoning for the refusal — that a half-moved subtree cannot be undone — is therefore **false**: nothing is half-moved and nothing needs undoing. The refusal is retained for now but no longer rests on that ground; removing it is #93. The refusal is decided by a live query with `show_hidden=true`, because a Cleared Subtask appears in neither the pane nor the cache.
 
 ### The four dispositions
 

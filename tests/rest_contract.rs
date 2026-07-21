@@ -358,6 +358,11 @@ async fn delete_task_deletes_by_id() {
         .unwrap();
 }
 
+// Every bodyless POST below asserts `content-length: 0`. reqwest omits the
+// header entirely for a request with no body, and Google's HTTP/1.1 frontend
+// answers 411 without it — never reaching the Tasks API. Observed live: the same
+// POST is 411 without the header and 401 (i.e. past framing) with it.
+
 #[tokio::test]
 async fn move_task_sends_parent_and_previous_query_params() {
     let server = MockServer::start().await;
@@ -365,6 +370,7 @@ async fn move_task_sends_parent_and_previous_query_params() {
         .and(path("/lists/L1/tasks/T3/move"))
         .and(query_param("parent", "T1"))
         .and(query_param("previous", "T2"))
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "T3", "title": "moved", "etag": "e5",
             "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
@@ -391,6 +397,7 @@ async fn move_task_to_list_sends_destination_tasklist_and_clears_the_echoed_pare
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/T3/move"))
         .and(query_param("destinationTasklist", "L2"))
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "T3", "title": "moved", "etag": "e5",
             "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
@@ -422,6 +429,7 @@ async fn move_task_to_top_sends_no_query_params() {
     // responds, proving oxidone sends a bare move for a top-of-list reposition.
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/T3/move"))
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "T3", "title": "moved", "etag": "e5",
             "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction", "position": "0"
@@ -441,6 +449,7 @@ async fn clear_completed_posts_to_clear_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/clear"))
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
@@ -539,6 +548,46 @@ async fn a_401_forces_a_refresh_and_retries_once() {
 
     let lists = client(&server).list_lists().await.unwrap();
     assert!(lists.is_empty());
+}
+
+/// The 401 replay is a `try_clone` of the original builder, so anything set on
+/// the request by hand — notably the explicit `Content-Length: 0` a bodyless
+/// POST needs — has to survive onto the retry. Asserted on both mocks: drop the
+/// header on either attempt and that mock stops matching.
+#[tokio::test]
+async fn a_401_retry_of_a_bodyless_post_keeps_content_length() {
+    let server = MockServer::start().await;
+    // First attempt: 401 (served once, higher priority).
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks/T1/move"))
+        .and(header("content-length", "0"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // The forced-refresh retry sees 200 — and still carries the header.
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks/T1/move"))
+        .and(header("content-length", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "T1", "title": "moved", "etag": "e6",
+            "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
+            "position": "00000000000000000000"
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let task = client(&server)
+        .move_task_to_list(
+            &ListId("L1".into()),
+            &TaskId("T1".into()),
+            &ListId("L2".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.list, ListId("L2".into()));
 }
 
 #[tokio::test]

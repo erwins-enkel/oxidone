@@ -532,8 +532,13 @@ impl Model {
     }
 
     /// The Tasks actually shown in the pane: [`sorted_tasks`](Self::sorted_tasks)
-    /// with Completed Tasks filtered out unless `show_completed` reveals them.
-    /// The view renders this; the completion meter still counts over all `tasks`.
+    /// keeping only what passes [`is_visible`](Self::is_visible) — every view
+    /// filter at once, not just `show_completed`. See that predicate for the set.
+    ///
+    /// The view renders this; the meters do not read it. The header completion
+    /// meter counts over `tasks`, honouring Today's `due <= today` membership and
+    /// nothing else, so it deliberately spans rows this lens drops (a Task hidden
+    /// by the distant-due horizon or by completion recency still counts there).
     pub fn visible_tasks(&self) -> Vec<&Task> {
         self.sorted_tasks()
             .into_iter()

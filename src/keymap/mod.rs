@@ -43,6 +43,9 @@ pub enum Action {
     ToggleShowCompleted,
     /// Hide/reveal entries due beyond the configured horizon (`hide_distant`).
     ToggleHideDistant,
+    /// Open the title/notes filter input (`/`): a live view filter narrowing the
+    /// task pane by a case-insensitive substring of a row's title or notes.
+    Filter,
     /// Open a URL found in the selected Task's notes.
     OpenLink,
     ClearCompleted,
@@ -228,6 +231,17 @@ pub fn bindings() -> &'static [Binding] {
             action: Action::ToggleHideDistant,
             help: "show/hide distant tasks",
         },
+        // With the view toggles, and mid-table for the same reason as `m`/`w`/`M`:
+        // `help_layout` drops cheatsheet rows from the tail, so a new verb appended
+        // after the sidebar capitals would be first to vanish on a short pane. No
+        // always-visible legend cell — the 80-column TASKS row is already full
+        // through `c completed` (see `legend`); this lives in `?` and, while active,
+        // in the pane header.
+        Binding {
+            key: KeyCode::Char('/'),
+            action: Action::Filter,
+            help: "filter by title/notes",
+        },
         Binding {
             key: KeyCode::Char('C'),
             action: Action::ClearCompleted,
@@ -336,6 +350,11 @@ pub fn cheatsheet_rows() -> Vec<(String, &'static str)> {
 pub fn key_label(code: KeyCode) -> String {
     match code {
         KeyCode::Char(' ') => "Space".to_string(),
+        // Named like the other special keys, and load-bearing: `cheatsheet_rows`
+        // and `LegendEntry::key_text` join a verb's keys with `/`, so a label of
+        // literal "/" would split a row in two. "Slash" is the one printable key
+        // that must spell its name.
+        KeyCode::Char('/') => "Slash".to_string(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::Esc => "Esc".to_string(),
@@ -363,6 +382,9 @@ pub enum LegendContext {
     LinkPicker,
     /// The move-to-List picker: j/k move, Enter moves, Esc cancels.
     ListPicker,
+    /// The title/notes filter input: characters narrow the pane live, Enter keeps
+    /// the filter applied, Esc clears it.
+    Filter,
 }
 
 /// Where a legend cell's key text comes from.
@@ -612,6 +634,19 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // The filter narrows live as you type; `Enter` keeps it applied and `Esc`
+    // clears it — neither of which the plain text-input legend would have said.
+    const FILTER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "keep",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "clear",
+        },
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
@@ -620,5 +655,6 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,
         LegendContext::ListPicker => LIST_PICKER,
+        LegendContext::Filter => FILTER,
     }
 }

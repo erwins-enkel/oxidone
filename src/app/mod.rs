@@ -79,6 +79,20 @@ pub struct Model {
     /// input closes and this persists, on `Esc` it clears. Dropped on a List/Today
     /// switch (see [`request_selected`]).
     pub filter: Option<String>,
+    /// Whether the cross-List **Search** pane (`S`) is active. Orthogonal to
+    /// [`selected`](Self::selected), which stays parked on the pane Search was
+    /// opened from: the sidebar cursor never moves while searching. When set,
+    /// `tasks` holds the whole cached corpus (as Today holds its `due <= today`
+    /// aggregate) and the query lives on `filter`. `today_active()` is gated on
+    /// `!search`, so a Search opened from Today is its own pane, not Today.
+    pub search: bool,
+    /// Whether the Search corpus is still awaiting its live fan-out. The cache
+    /// paint lands first, so a List never mirrored on this machine is absent until
+    /// the fan-out returns — set on `LoadSearch` and cleared **only** by the
+    /// `live: true` [`Message::SearchLoaded`] (and by [`leave_search`]), so an
+    /// incomplete corpus renders a pending notice rather than reading "no match".
+    /// Held here, not on `status_line`, so no other message can erase it.
+    pub search_pending: bool,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -306,6 +320,8 @@ impl Default for Model {
             hide_distant: false,
             horizon_days: 14,
             filter: None,
+            search: false,
+            search_pending: false,
             show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
@@ -357,9 +373,27 @@ impl Model {
         }
     }
 
-    /// Whether the pinned Today view is the active pane.
+    /// Whether the pinned Today view is the active pane — **strictly** Today, not
+    /// Search opened from Today. `selected` stays parked on Today while searching
+    /// (the sidebar cursor never moves), so the `!search` gate is what keeps every
+    /// Today-only rule — `due <= today` membership, completion-day hiding, the
+    /// journal spread — from firing inside Search.
     pub fn today_active(&self) -> bool {
-        matches!(self.selected, Selection::Today)
+        matches!(self.selected, Selection::Today) && !self.search
+    }
+
+    /// Whether the cross-List Search pane is active.
+    pub fn search_active(&self) -> bool {
+        self.search
+    }
+
+    /// Whether the active pane is **flat and cross-List** — Today or Search. The
+    /// ordering and layout axis they share: the flat `cross_list_ordered` order,
+    /// the Due↔Title `s` cycle (Manual is undefined across Lists), and the view's
+    /// `flat` column rules. Distinct from `today_active()`, which names the
+    /// Today-only rules Search does not inherit.
+    pub fn flat_pane(&self) -> bool {
+        self.today_active() || self.search
     }
 
     /// The Tasks in the current `sort`'s **display order**.
@@ -388,12 +422,13 @@ impl Model {
     /// untouched. Navigation (`j`/`k`) follows this order, so the cursor never
     /// jumps between non-adjacent rows.
     pub fn sorted_tasks(&self) -> Vec<&Task> {
-        // Today is flat and cross-List: it bypasses `groups()` (parent/Subtask
-        // grouping is a per-List concept) for a single global order. This is the
-        // *one* ordering seam — `reselect_visible`, `display_successor`,
-        // `move_task_cursor`, and `visible_tasks` all read `sorted_tasks()`, so
-        // navigation and cursor re-anchoring walk exactly what the pane renders.
-        if self.today_active() {
+        // A flat cross-List pane (Today or Search) bypasses `groups()`
+        // (parent/Subtask grouping is a per-List concept) for a single global
+        // order. This is the *one* ordering seam — `reselect_visible`,
+        // `display_successor`, `move_task_cursor`, and `visible_tasks` all read
+        // `sorted_tasks()`, so navigation and cursor re-anchoring walk exactly what
+        // the pane renders.
+        if self.flat_pane() {
             return self.cross_list_ordered();
         }
         let mut groups = self.groups();
@@ -1727,10 +1762,10 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::DeleteList => open_delete_list_confirm(model),
         // View-only: cycle the local lens. `tasks` is untouched and `selected_task`
         // keeps indexing it, so the cursor stays on the same Task by id across the
-        // re-sort. Never emits a Command. In Today the cycle is Due↔Title only
-        // (Manual is undefined across Lists).
+        // re-sort. Never emits a Command. In a flat cross-List pane (Today or
+        // Search) the cycle is Due↔Title only (Manual is undefined across Lists).
         Action::CycleSort => {
-            model.sort = if model.today_active() {
+            model.sort = if model.flat_pane() {
                 model.sort.next_flat()
             } else {
                 model.sort.next()

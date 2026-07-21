@@ -621,7 +621,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // where rows from different Lists sit together. `spread`: the journal spread
     // and the two column rules that serve it — the Overdue group, the always-on
     // signifier gutter, and the overdue-only due column.
-    let flat = model.today_active();
+    let flat = model.flat_pane();
     let spread = model.today_active();
     // The Overdue group, as a count of rows: `cross_list_ordered` sorts them to the
     // front, so they are a contiguous prefix and `take_while` sees all of them.

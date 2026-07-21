@@ -121,7 +121,9 @@ The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, bl
 _Avoid_: bullet, icon, marker (a marker *trails* the title — the link `⧉` or the **Notes marker** `≡`).
 
 **Journal spread**:
-How **Today** is laid out: a **dateline** row (`Monday 20 July 2026`), then the entries under an **Overdue** and a **Today** group header. Three non-selectable rows in the ordinary task pane — the sidebar stays visible, the focus model does not fork, and the panel title still names the Sort view like every other pane.
+How **Today** is laid out: a **dateline** row (`Monday 20 July 2026`), then the entries under an **Overdue** and a **Today** group header. Non-selectable rows in the ordinary task pane — the sidebar stays visible, the focus model does not fork, and the panel title still names the Sort view like every other pane.
+
+A group header is drawn only when its group has entries, so the spread is at most three such rows and rarely all three: a clean morning is the dateline and `Today`, an empty day the dateline alone. The dateline is always drawn — it is the page, not a label for the rows.
 
 Two rules that read alike and are not: an entry is in the **Overdue** group when it is dated strictly before today (`domain::due_before`, **status-blind** — a Completed overdue entry groups by its date like any other, which is what keeps the group a contiguous prefix of the pane and lets the renderer count it rather than partition). What the header *counts* is narrower: only the entries still `needsAction`, because the count answers the migration ritual's question — what is left to move. So `Overdue 1` above two drawn rows is right, not an off-by-one. At zero outstanding the count and its red both drop.
 

@@ -6,7 +6,7 @@ mod fake;
 mod rest;
 
 pub use fake::FakeTasksApi;
-pub use rest::RestClient;
+pub use rest::{RestClient, RetryPolicy};
 
 use crate::domain::{List, ListId, Task, TaskId};
 use async_trait::async_trait; // NOTE: add `async-trait` to Cargo.toml, or use RPITIT.
@@ -104,4 +104,18 @@ pub enum ApiError {
     /// is indistinguishable from a genuinely short List.
     #[error("pagination did not terminate: {0}")]
     Pagination(String),
+    /// A *short-term* rate limit that backing off did not clear: the retries at
+    /// the `send` seam ran out, or Google asked for a longer wait than we are
+    /// willing to hold. Distinct from `Rejected` so the status line says what the
+    /// user can act on instead of echoing Google's raw refusal — and distinct
+    /// from [`ApiError::QuotaExhausted`], because "try again shortly" is only
+    /// honest advice for a limit measured in seconds.
+    #[error("rate limited by google; try again shortly")]
+    RateLimited,
+    /// A quota that no amount of waiting *shortly* will clear — Google's daily
+    /// cap. Retrying is pointless until it resets and only spends more of it, so
+    /// this is never backed off; it reports immediately, carrying Google's own
+    /// message rather than replacing it with advice that would be wrong.
+    #[error("google quota exhausted; try again later: {message}")]
+    QuotaExhausted { message: String },
 }

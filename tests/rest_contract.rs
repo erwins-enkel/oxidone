@@ -10,7 +10,7 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use oxidone::api::{ApiError, NewTask, RestClient, TaskPatch, TasksApi};
+use oxidone::api::{ApiError, NewTask, RestClient, RetryPolicy, TaskPatch, TasksApi};
 use oxidone::auth::StaticTokenProvider;
 use oxidone::domain::{ListId, Status, TaskId};
 
@@ -842,10 +842,10 @@ async fn a_401_forces_a_refresh_and_retries_once() {
     assert!(lists.is_empty());
 }
 
-/// The 401 replay is a `try_clone` of the original builder, so anything set on
-/// the request by hand — notably the explicit `Content-Length: 0` a bodyless
-/// POST needs — has to survive onto the retry. Asserted on both mocks: drop the
-/// header on either attempt and that mock stops matching.
+/// The 401 replay is a `try_clone` of the built `reqwest::Request`, so anything
+/// set on the request by hand — notably the explicit `Content-Length: 0` a
+/// bodyless POST needs — has to survive onto the retry. Asserted on both
+/// mocks: drop the header on either attempt and that mock stops matching.
 #[tokio::test]
 async fn a_401_retry_of_a_bodyless_post_keeps_content_length() {
     let server = MockServer::start().await;
@@ -893,4 +893,422 @@ async fn a_persistent_401_surfaces_auth_expired() {
 
     let err = client(&server).list_lists().await.unwrap_err();
     assert_eq!(err, ApiError::AuthExpired);
+}
+
+// ---- Rate limiting and backoff (#89) ----
+
+/// A client whose ladder is instantaneous. The ladder's *values* are pinned by
+/// the unit tests in `rest.rs`; what these tests prove is the wiring around it,
+/// so paying real seconds for it would only slow the gate. `Retry-After`
+/// handling is deliberately left at production settings — test 6 needs a real
+/// sleep to prove the header is read at all.
+fn retrying_client(server: &MockServer) -> RestClient {
+    client(server).with_retry(RetryPolicy {
+        base_delay: std::time::Duration::ZERO,
+        ..RetryPolicy::default()
+    })
+}
+
+async fn request_count(server: &MockServer) -> usize {
+    server.received_requests().await.unwrap().len()
+}
+
+/// `{"error":{…,"errors":[{"reason":…}]}}` — the shape the retry decision reads.
+fn google_error(code: u16, message: &str, domain: &str, reason: &str) -> serde_json::Value {
+    json!({ "error": {
+        "code": code,
+        "message": message,
+        "errors": [{ "domain": domain, "reason": reason }],
+    }})
+}
+
+#[tokio::test]
+async fn a_429_then_200_recovers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{ "id": "L1", "title": "Work", "etag": "e1",
+                        "updated": "2023-11-14T22:13:20.000Z" }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    // The caller sees the 200's data, not an error — the whole point of #89.
+    let lists = retrying_client(&server).list_lists().await.unwrap();
+    assert_eq!(lists[0].title, "Work");
+    assert_eq!(request_count(&server).await, 2);
+}
+
+/// The budget is finite: 1 attempt + `max_retries`, then the honest error.
+#[tokio::test]
+async fn a_persistent_429_exhausts_the_budget_and_surfaces_rate_limited() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let err = retrying_client(&server).list_lists().await.unwrap_err();
+    assert_eq!(err, ApiError::RateLimited);
+    assert_eq!(
+        request_count(&server).await,
+        1 + RetryPolicy::default().max_retries as usize
+    );
+}
+
+/// The case most likely to be what a real account actually sends: Google
+/// Workspace APIs report a rate limit as a `403` with a `usageLimits` reason at
+/// least as often as a `429`. A status-only predicate would never fire here.
+#[tokio::test]
+async fn a_quota_403_with_a_rate_limit_reason_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(google_error(
+            403,
+            "Rate Limit Exceeded",
+            "usageLimits",
+            "rateLimitExceeded",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    retrying_client(&server).list_lists().await.unwrap();
+    assert_eq!(request_count(&server).await, 2);
+}
+
+/// The counter-test: a 403 is only a rate limit when its reason says so. Without
+/// this, a classifier that waved through every 403 would look correct.
+#[tokio::test]
+async fn a_plain_permission_403_does_not_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(google_error(
+            403,
+            "Insufficient Permission",
+            "global",
+            "insufficientPermissions",
+        )))
+        .mount(&server)
+        .await;
+
+    let err = retrying_client(&server).list_lists().await.unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Rejected {
+            status: 403,
+            message: "Insufficient Permission".into(),
+        }
+    );
+    assert_eq!(request_count(&server).await, 1);
+}
+
+/// A daily quota is a limit the user should hear about, but not one any ladder
+/// can clear — so it reports immediately instead of spending three more queries
+/// against the very cap that is exhausted, and says "later" rather than
+/// "shortly" while keeping Google's own wording.
+#[tokio::test]
+async fn a_daily_quota_403_fails_immediately_as_quota_exhausted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(google_error(
+            403,
+            "Quota Exceeded",
+            "usageLimits",
+            "quotaExceeded",
+        )))
+        .mount(&server)
+        .await;
+
+    let err = retrying_client(&server).list_lists().await.unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::QuotaExhausted {
+            message: "Quota Exceeded".into()
+        }
+    );
+    assert_eq!(request_count(&server).await, 1);
+}
+
+/// The one test that spends real wall-clock time, deliberately: a fake cannot
+/// prove that the `Retry-After` header is found by name, parsed, and read as
+/// *seconds*. Against a zero-length ladder the two outcomes are unmistakable —
+/// honouring `Retry-After: 1` takes about a second, ignoring it takes none. A
+/// typo'd header name would otherwise degrade silently to plain exponential and
+/// ship green.
+#[tokio::test]
+async fn retry_after_header_is_read_parsed_and_unit_correct() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let started = std::time::Instant::now();
+    retrying_client(&server).list_lists().await.unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(800),
+        "Retry-After: 1 should have delayed the retry by ~1s, waited {waited:?}"
+    );
+}
+
+/// Anything that is not delta-seconds falls back to the ladder rather than being
+/// mis-read. The upper bound only has to separate a zero-length ladder from a 1s
+/// sleep; it is loose enough to survive two real round trips plus scheduling on
+/// a loaded CI runner.
+#[tokio::test]
+async fn a_malformed_or_http_date_retry_after_falls_back_to_the_ladder() {
+    for value in ["not-a-number", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me/lists"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", value))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me/lists"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        retrying_client(&server).list_lists().await.unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "{value:?} should have fallen back to the ladder, waited {waited:?}"
+        );
+        assert_eq!(request_count(&server).await, 2);
+    }
+}
+
+/// Told to wait longer than we are willing to, the honest move is to stop —
+/// not to sleep for minutes, and not to retry early against a limit Google just
+/// said is still in force.
+#[tokio::test]
+async fn a_retry_after_above_the_ceiling_fails_without_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .mount(&server)
+        .await;
+
+    let client = client(&server).with_retry(RetryPolicy {
+        base_delay: std::time::Duration::ZERO,
+        retry_after_ceiling: std::time::Duration::from_secs(2),
+        ..RetryPolicy::default()
+    });
+    let err = client.list_lists().await.unwrap_err();
+    assert_eq!(err, ApiError::RateLimited);
+    assert_eq!(request_count(&server).await, 1);
+}
+
+#[tokio::test]
+async fn a_503_retries_on_a_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .list_tasks(&ListId("L1".into()), false, false, None)
+        .await
+        .unwrap();
+    assert_eq!(request_count(&server).await, 2);
+}
+
+/// A 5xx on a write may mean the write landed and only the response was lost.
+/// Replaying it would duplicate a Task, so each write fails on the first 503.
+#[tokio::test]
+async fn a_503_does_not_retry_a_write() {
+    let post = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&post)
+        .await;
+    let err = retrying_client(&post)
+        .insert_task(
+            &ListId("L1".into()),
+            NewTask {
+                title: "t".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Rejected { status: 503, .. }));
+    assert_eq!(request_count(&post).await, 1);
+
+    let patch = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/lists/L1/tasks/T1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&patch)
+        .await;
+    retrying_client(&patch)
+        .patch_task(
+            &ListId("L1".into()),
+            &TaskId("T1".into()),
+            TaskPatch {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(request_count(&patch).await, 1);
+
+    let delete = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/lists/L1/tasks/T1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&delete)
+        .await;
+    retrying_client(&delete)
+        .delete_task(&ListId("L1".into()), &TaskId("T1".into()))
+        .await
+        .unwrap_err();
+    assert_eq!(request_count(&delete).await, 1);
+}
+
+/// Unlike a 5xx, a rate limit means Google never processed the request — so
+/// replaying a write is safe, and is what keeps a keypress from failing.
+#[tokio::test]
+async fn a_429_retries_a_write() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/lists/L1/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "T1", "title": "t", "etag": "e1",
+            "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
+            "position": "00000000000000000000"
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let task = retrying_client(&server)
+        .insert_task(
+            &ListId("L1".into()),
+            NewTask {
+                title: "t".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.id, TaskId("T1".into()));
+    assert_eq!(request_count(&server).await, 2);
+}
+
+/// The two replay mechanisms share one loop, so their interleaving is pinned in
+/// both orders. A refresh consumes no retry...
+#[tokio::test]
+async fn a_401_then_a_429_still_recovers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    retrying_client(&server).list_lists().await.unwrap();
+    assert_eq!(request_count(&server).await, 3);
+}
+
+/// ...and, the direction that is easy to get wrong, a spent retry does not
+/// consume the refresh: the 401 arriving *after* a 429 still gets it.
+#[tokio::test]
+async fn a_429_then_a_401_still_gets_the_one_forced_refresh() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/@me/lists"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    retrying_client(&server).list_lists().await.unwrap();
+    assert_eq!(request_count(&server).await, 3);
 }

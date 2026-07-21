@@ -9,7 +9,8 @@ use chrono::NaiveDate;
 
 use crate::dateparse;
 use crate::domain::{
-    due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task, TaskId,
+    due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
+    TaskId,
 };
 use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
@@ -405,11 +406,24 @@ impl Model {
         groups.into_iter().flatten().collect()
     }
 
-    /// The **Today** pane's flat, cross-List order: **due asc → List title →
-    /// `position`** (Due lens, and Manual, which Today treats as Due), or **display
-    /// title → List title → `position`** (Title lens). No parent grouping — rows
-    /// from different Lists sit together, so a global order is the only meaningful
-    /// one, and a Subtask sorts on its own key like any other row.
+    /// The **Today** pane's flat, cross-List order: **overdue first**, then **due
+    /// asc → List title → `position`** (Due lens, and Manual, which Today treats
+    /// as Due), or **display title → List title → `position`** (Title lens). No
+    /// parent grouping — rows from different Lists sit together, so a global order
+    /// is the only meaningful one, and a Subtask sorts on its own key like any
+    /// other row.
+    ///
+    /// **The prefix invariant.** `due_before` leads every lens's key, so the
+    /// overdue rows are a *contiguous prefix* of this order — and therefore of
+    /// `visible_tasks()`, which only filters it. The journal spread counts that
+    /// prefix instead of partitioning, so a break here would file rows under the
+    /// wrong header with nothing failing; `tests/today_reducer.rs` pins it across
+    /// every lens. Under Due the key is already implied by the dates, and is
+    /// stated anyway so the grouping has one definition rather than a coincidence.
+    ///
+    /// Status-blind, like [`due_before`] itself: a Completed overdue row sorts
+    /// into the prefix with the rest. What the header *counts* is narrower (only
+    /// outstanding rows) — a display rule, decided in the view.
     ///
     /// Stable (`sort_by_cached_key`), so equal keys keep the cache's stored order.
     /// Every Task carries its own `list`; the List title is looked up from `lists`
@@ -421,11 +435,16 @@ impl Model {
             .map(|l| (&l.id, l.title.as_str()))
             .collect();
         let list_title = |t: &Task| titles.get(&t.list).copied().unwrap_or("").to_string();
+        // `false` sorts before `true`, so "not overdue" second puts the overdue
+        // rows first. Leads every lens's key — see the prefix invariant above.
+        let today = self.now.date_naive();
+        let not_overdue = |t: &Task| !due_before(t.due, today);
         let mut tasks: Vec<&Task> = self.tasks.iter().collect();
         match self.sort {
             SortView::Title => {
                 tasks.sort_by_cached_key(|t| {
                     (
+                        not_overdue(t),
                         t.display_title().to_lowercase(),
                         list_title(t),
                         t.position.clone(),
@@ -435,7 +454,9 @@ impl Model {
             // Due and Manual both order by due date; every Today row is dated
             // (membership excludes undated), so `due` is always `Some` here.
             SortView::Due | SortView::Manual => {
-                tasks.sort_by_cached_key(|t| (t.due, list_title(t), t.position.clone()));
+                tasks.sort_by_cached_key(|t| {
+                    (not_overdue(t), t.due, list_title(t), t.position.clone())
+                });
             }
         }
         tasks

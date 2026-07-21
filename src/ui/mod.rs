@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::{format_due_relative, split_title_and_due};
-use crate::domain::{due_on_or_before, EntryType, ListId, Selection, Status, Task};
+use crate::domain::{due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task};
 use crate::keymap;
 use crate::links::{self, Link};
 use theme::Theme;
@@ -580,8 +580,14 @@ fn signifier(entry: EntryType, ascii: bool) -> &'static str {
 /// Style for a Task's due-date cell. Overdue reads in the palette's red so it
 /// catches the eye when scanning the column — but Completed wins: a done Task
 /// is settled, so its date stays dim alongside the struck-through title.
+///
+/// The date test is `due_before`, shared with Today's Overdue group, so the two
+/// cannot drift. The Completed exemption is *this* call site's alone: the group
+/// is status-blind by necessity (a Completed overdue row must still sort into the
+/// contiguous prefix the spread counts), while the colour is a nudge to act, and
+/// there is nothing left to do about a row already done.
 fn due_style(task: &Task, today: NaiveDate, theme: &Theme) -> Style {
-    let overdue = task.status != Status::Completed && task.due.is_some_and(|d| d < today);
+    let overdue = task.status != Status::Completed && due_before(task.due, today);
     Style::new().fg(if overdue {
         theme.overdue
     } else {
@@ -603,27 +609,54 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // the meter, and neither does the horizon or recency dropping a row from view
     // — but leaving Today's membership does. See `header_title`.
     let ordered = model.visible_tasks();
-    // Due dates lead the row in a fixed-width gutter so they scan vertically.
-    // The gutter only exists when something in view has a due date — otherwise
-    // every title would sit behind a column of blanks.
-    let due_gutter = ordered.iter().any(|t| t.due.is_some());
-    // Like the due gutter: the cell only exists when something in view is typed.
-    // On an all-Task pane — the overwhelmingly common case — a column of blanks
-    // would spend width to say "ordinary".
-    let signifiers = ordered.iter().any(|t| t.entry_type() != EntryType::Task);
     // Overdue is a property of the date against today, decided here in the view
     // — `model.now` keeps that testable rather than reading the wall clock.
     let today = model.now.date_naive();
+    // Today is a flat cross-List pane: no Subtask indent or meters (per-List
+    // hierarchy concepts), and each row carries a muted List name so its home is
+    // visible where rows from different Lists sit together. It also renders as a
+    // journal spread — see `journal_spread` — which is what the two column rules
+    // below branch on.
+    let today_view = model.today_active();
+    // The Overdue group, as a count of rows: `today_ordered` sorts them to the
+    // front, so they are a contiguous prefix and `take_while` sees all of them.
+    // Zero outside Today, where there is no such group.
+    let overdue_rows = if today_view {
+        ordered
+            .iter()
+            .take_while(|t| due_before(t.due, today))
+            .count()
+    } else {
+        0
+    };
+    // Due dates lead the row in a fixed-width gutter so they scan vertically.
+    // The gutter only exists when something in view has a due date — otherwise
+    // every title would sit behind a column of blanks.
+    //
+    // In Today every row is dated, so that test would always pass and every
+    // today-due row would read "today" down a 12-cell column. The column exists
+    // there on the *Overdue group's* condition instead — exactly the one that
+    // draws the `Overdue` header — so the two appear and vanish together and
+    // titles never shift without the header announcing it.
+    let due_gutter = if today_view {
+        overdue_rows > 0
+    } else {
+        ordered.iter().any(|t| t.due.is_some())
+    };
+    // Like the due gutter: the cell only exists when something in view is typed.
+    // On an all-Task pane — the overwhelmingly common case — a column of blanks
+    // would spend width to say "ordinary".
+    //
+    // Today is the exception: the spread reserves it always, so titles hold their
+    // column as Events and Notes enter and leave the day. That fixed position is
+    // what makes it a gutter rather than a cell.
+    let signifiers = today_view || ordered.iter().any(|t| t.entry_type() != EntryType::Task);
     // Built once per render: the per-row indent check is then a hash lookup, not
     // a scan of every Task.
     let top_level = model.top_level_ids();
     // Shares that set rather than deriving its own, so the meter counts exactly
     // the rows the indent rule nests — and stays one pass over `tasks`.
     let subtask_counts = model.subtask_counts(&top_level);
-    // Today is a flat cross-List pane: no Subtask indent or meters (per-List
-    // hierarchy concepts), and each row carries a muted List name so its home is
-    // visible where rows from different Lists sit together.
-    let today_view = model.today_active();
     let list_titles: HashMap<&ListId, &str> = if today_view {
         model
             .lists
@@ -650,9 +683,15 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 // clock of its own. Left-aligned in the column: the relative
                 // forms are all shorter than the ISO fallback, so they pad
                 // rather than truncate and the titles stay aligned.
+                //
+                // In Today's spread only the Overdue group prints a date. A
+                // today-due row's cell is blank *at full width*, so titles stay
+                // aligned across the fold — the `Today` header two rows up
+                // already said what the date would be.
+                let prints_date = !today_view || due_before(t.due, today);
                 let due = match t.due {
-                    Some(d) => format_due_relative(d, today),
-                    None => String::new(),
+                    Some(d) if prints_date => format_due_relative(d, today),
+                    _ => String::new(),
                 };
                 spans.push(Span::styled(
                     format!("{due:<DUE_WIDTH$}  "),
@@ -775,6 +814,15 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         .and_then(|i| model.tasks.get(i))
         .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
 
+    // Today interleaves the journal spread's header rows, which shifts every
+    // display index below them — so the cursor is translated in the same place
+    // the rows are inserted, and cannot be left behind.
+    let (items, selected) = if today_view {
+        journal_spread(items, selected, &ordered, overdue_rows, today, theme)
+    } else {
+        (items, selected)
+    };
+
     let base = format!("Tasks — {}", model.sort.label());
     // Inline btop-style data widgets in the header: a completion meter for the
     // active List and a due-load strip. Both drop out (never the text) when the
@@ -782,6 +830,97 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     let inner_width = area.width.saturating_sub(PANEL_BORDERS);
     let title = header_title(&base, model, inner_width, ascii);
     render_selectable(frame, area, &title, items, selected, focused, theme);
+}
+
+/// How the spread's dateline renders the day: `Wednesday 30 September 2026`.
+/// Unpadded day-of-month (`%-d`), because a journal page writes "1 July", not
+/// "01 July".
+const DATELINE_FORMAT: &str = "%A %-d %B %Y";
+
+/// Interleave Today's journal-spread header rows into the Task rows, and shift
+/// the cursor to match.
+///
+/// Three non-selectable rows, in the same `List` widget as the Tasks: the
+/// dateline, then an `Overdue` and a `Today` group header. One widget, not a
+/// `Paragraph` above the pane — a second widget would need its own scroll, and
+/// would detach a label from the rows it heads the moment the pane moved.
+///
+/// A group header is drawn when its group has **rows**; its count is only the
+/// rows still `needsAction`. The two rules differ deliberately: membership must
+/// be status-blind for the Overdue prefix to hold (see [`due_before`]), while the
+/// count answers the migration ritual's question — what is *left* to move — so a
+/// struck-through row is not in it. At zero outstanding the count and the urgent
+/// colour both drop: the rows are settled, and nothing is owed.
+///
+/// The dateline is drawn even on an empty day. It is the page, not a label for
+/// the rows.
+fn journal_spread<'a>(
+    rows: Vec<ListItem<'a>>,
+    selected: Option<usize>,
+    ordered: &[&Task],
+    overdue_rows: usize,
+    today: NaiveDate,
+    theme: &Theme,
+) -> (Vec<ListItem<'a>>, Option<usize>) {
+    debug_assert_eq!(rows.len(), ordered.len(), "one row per displayed Task");
+    let (overdue, rest) = ordered.split_at(overdue_rows);
+    let outstanding = |group: &[&Task]| {
+        group
+            .iter()
+            .filter(|t| t.status != Status::Completed)
+            .count()
+    };
+
+    let mut out = Vec::with_capacity(rows.len() + 3);
+    out.push(ListItem::new(Line::from(Span::styled(
+        today.format(DATELINE_FORMAT).to_string(),
+        Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+    ))));
+    let mut rows = rows.into_iter();
+    if !overdue.is_empty() {
+        out.push(spread_header("Overdue", outstanding(overdue), true, theme));
+        out.extend(rows.by_ref().take(overdue.len()));
+    }
+    if !rest.is_empty() {
+        out.push(spread_header("Today", outstanding(rest), false, theme));
+        out.extend(rows);
+    }
+
+    // The dateline sits above every row; the `Overdue` header above every row
+    // when it exists at all; the `Today` header only above the rows past the
+    // prefix. A cursor at `p` is pushed down by however many of those precede it.
+    let selected =
+        selected.map(|p| p + 1 + usize::from(!overdue.is_empty()) + usize::from(p >= overdue_rows));
+    (out, selected)
+}
+
+/// One group header of the journal spread: a bold label, then the count of rows
+/// still owed. `urgent` paints a non-zero count's label in the palette's overdue
+/// red — the same colour the dates below it carry — so the migration worklist
+/// announces itself; a spent group falls back to the dim label every other header
+/// wears. The count is omitted entirely at zero rather than printed as `0`.
+fn spread_header(
+    label: &'static str,
+    outstanding: usize,
+    urgent: bool,
+    theme: &Theme,
+) -> ListItem<'static> {
+    let fg = if urgent && outstanding > 0 {
+        theme.overdue
+    } else {
+        theme.subtext
+    };
+    let mut spans = vec![Span::styled(
+        label,
+        Style::new().fg(fg).add_modifier(Modifier::BOLD),
+    )];
+    if outstanding > 0 {
+        spans.push(Span::styled(
+            format!(" {outstanding}"),
+            Style::new().fg(theme.subtext),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 /// Compose the task-pane header: the base title, then — only while they fit — a

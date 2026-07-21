@@ -48,6 +48,10 @@ _Avoid_: clean title, stripped title.
 A **date, never a time**. Google's API discards the time portion, so oxidone never stores or shows a due time.
 _Avoid_: deadline, due time, due-at.
 
+**Today**:
+The pinned, cross-List view of what is due — the sidebar's first row, always selectable, never a real List. Membership is `due <= today` (`domain::due_on_or_before`, the one definition, shared by the cache aggregate and the view filter); an **undated** entry is therefore never in it. A Completed row shows only if it was completed today, so the pane answers "among what was due, what got done". Flat and read-only in ordering terms: no Subtask nesting, no Manual lens (`position` is per-List, so a cross-List hand order is undefined), and a Manual lens carried in from a List is normalised to Due on entry. Renders as a **Journal spread**.
+_Avoid_: today list, agenda, inbox, dashboard.
+
 ### Ordering
 
 **Manual order**:
@@ -113,8 +117,18 @@ A local, append-only record of completion events (`task_id`, `list_id`, `title`,
 ### Visual vocabulary
 
 **Signifier**:
-The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task.
+The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task — except in the **Journal spread**, which reserves the cell always, so a title holds its column as Events and Notes enter and leave the day. That fixed position is what makes it a gutter there rather than a cell.
 _Avoid_: bullet, icon, marker (a marker *trails* the title — the link `⧉` or the **Notes marker** `≡`).
+
+**Journal spread**:
+How **Today** is laid out: a **dateline** row (`Monday 20 July 2026`), then the entries under an **Overdue** and a **Today** group header. Non-selectable rows in the ordinary task pane — the sidebar stays visible, the focus model does not fork, and the panel title still names the Sort view like every other pane.
+
+A group header is drawn only when its group has entries, so the spread is at most three such rows and rarely all three: a clean morning is the dateline and `Today`, an empty day the dateline alone. The dateline is always drawn — it is the page, not a label for the rows.
+
+Two rules that read alike and are not: an entry is in the **Overdue** group when it is dated strictly before today (`domain::due_before`, **status-blind** — a Completed overdue entry groups by its date like any other, which is what keeps the group a contiguous prefix of the pane and lets the renderer count it rather than partition). What the header *counts* is narrower: only the entries still `needsAction`, because the count answers the migration ritual's question — what is left to move. So `Overdue 1` above two drawn rows is right, not an off-by-one. At zero outstanding the count and its red both drop.
+
+The due gutter exists here on exactly the Overdue group's condition, so the two appear and vanish together: with overdue entries the group prints its dates and a today-due row's cell is blank at the same width (titles stay aligned); with none there is no column at all.
+_Avoid_: section, bucket, page, agenda.
 
 **Notes marker**:
 The `≡` a row carries when its Task's **notes** hold anything visible. Trails the title, after the link `⧉` and before the Subtask meter, and degrades to `=` under `ascii_fallback`. A body of only whitespace or invisible formatting draws nothing — the marker promises text `n` will show.

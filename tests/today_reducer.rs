@@ -6,7 +6,7 @@
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{update, Command, Focus, Message, Model, Overlay};
-use oxidone::domain::{List, ListId, Selection, SortView, Status, Task, TaskId};
+use oxidone::domain::{due_before, List, ListId, Selection, SortView, Status, Task, TaskId};
 
 fn press(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -633,4 +633,76 @@ fn completion_recency_compares_local_days_at_the_days_edges() {
             "completed_at {hours:+}h from now"
         );
     }
+}
+
+// --- The Overdue prefix invariant (#62) -------------------------------------
+
+/// A fixture built to interleave under a naive sort: every overdue row's title
+/// sorts *after* every today-due row's, so the Title lens has to fight the
+/// grouping key rather than agree with it by luck. One overdue row is Completed,
+/// so status-blindness is exercised instead of assumed.
+fn interleaving_fixture() -> Vec<Task> {
+    vec![
+        task("zulu", "work", Some(ymd(2026, 7, 18)), Status::NeedsAction),
+        task("alpha", "home", Some(today()), Status::NeedsAction),
+        // Completed, and overdue: it must still sort into the prefix. Its
+        // `completed_at` is None, which completion recency lets through.
+        task("yankee", "home", Some(ymd(2026, 7, 19)), Status::Completed),
+        task("bravo", "work", Some(today()), Status::NeedsAction),
+        task(
+            "charlie",
+            "home",
+            Some(ymd(2026, 7, 17)),
+            Status::NeedsAction,
+        ),
+    ]
+}
+
+/// The journal spread counts a contiguous *prefix* of overdue rows rather than
+/// partitioning, so a single row out of place files rows under the wrong header
+/// with nothing failing. Asserted over `visible_tasks()` — the slice the renderer
+/// actually walks — under every lens, including the Manual arm that is reachable
+/// only transiently (`request_selected` normalises it to Due on entry to Today).
+#[test]
+fn overdue_rows_are_a_contiguous_prefix_of_the_today_pane_under_every_lens() {
+    for lens in [SortView::Due, SortView::Title, SortView::Manual] {
+        let mut m = today_model(&["work", "home"], interleaving_fixture());
+        m.show_completed = true;
+        m.sort = lens;
+
+        let visible = m.visible_tasks();
+        let overdue: Vec<bool> = visible.iter().map(|t| due_before(t.due, today())).collect();
+        assert_eq!(visible.len(), 5, "{lens:?}: every fixture row is visible");
+
+        // Falsifiable only if both groups are actually present.
+        assert!(
+            overdue.contains(&true) && overdue.contains(&false),
+            "{lens:?}"
+        );
+        let titles: Vec<&str> = visible.iter().map(|t| t.display_title()).collect();
+        let first_today = overdue
+            .iter()
+            .position(|o| !o)
+            .expect("a today-due row in the fixture");
+        assert!(
+            !overdue[first_today..].contains(&true),
+            "{lens:?}: an overdue row follows a today-due one, got {titles:?}",
+        );
+    }
+}
+
+/// The invariant above holds even when the lens *disagrees* with it: under Title,
+/// "alpha" and "bravo" are due today yet sort first alphabetically, so the
+/// grouping key is doing real work here rather than riding on the dates.
+#[test]
+fn the_title_lens_sorts_within_the_two_groups_not_across_them() {
+    let mut m = today_model(&["work", "home"], interleaving_fixture());
+    m.show_completed = true;
+    m.sort = SortView::Title;
+
+    assert_eq!(
+        visible_titles(&m),
+        vec!["charlie", "yankee", "zulu", "alpha", "bravo"],
+        "overdue alphabetically, then today alphabetically",
+    );
 }

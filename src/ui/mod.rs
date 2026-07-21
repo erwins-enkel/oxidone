@@ -828,7 +828,14 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         (items, selected)
     };
 
-    let base = format!("Tasks — {}", model.sort.label());
+    // Search names itself in the header — it has no sidebar row and the parked
+    // cursor still highlights the List it was opened from, so the title is where
+    // the user reads that they are in Search.
+    let base = if model.search_active() {
+        format!("SEARCH — {}", model.sort.label())
+    } else {
+        format!("Tasks — {}", model.sort.label())
+    };
     // Inline btop-style data widgets in the header: a completion meter for the
     // active List and a due-load strip. Both drop out (never the text) when the
     // pane is too narrow — braille degrades before the title (ADR-0006).
@@ -948,6 +955,23 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
             ""
         };
         title.push_str(&format!("  /{query}{caret}"));
+    }
+
+    // The pending notice while Search awaits its live fan-out: a List never
+    // mirrored on this machine contributes nothing until it lands, so an empty
+    // pane could read "no match" when it means "not yet". Appended unconditionally
+    // like the query — it is state, not a droppable widget — so a narrow pane clips
+    // it as it clips the title, never silently dropping the one cue that tells the
+    // two apart. Held on `search_pending`, so no status-line write can erase it.
+    if model.search_pending {
+        title.push_str("  · searching all lists…");
+    }
+
+    // Both header widgets are suppressed in Search: the meter would report a
+    // whole-corpus ratio (a fact about no pane you are reading), and the strip
+    // forecasts a workload "every Task in every List" is not.
+    if model.search_active() {
+        return title;
     }
 
     // Completion meter over Task-typed entries only: Events and Notes are not work
@@ -1115,6 +1139,10 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
+        // The same overlay in Search advertises `Esc leave search`, not `Esc
+        // clear` — the pane behind it is the corpus, so "clear" would promise the
+        // wrong affordance (matching `filter_key`'s Search-aware `Esc`).
+        Some(Overlay::Filter) if model.search_active() => keymap::LegendContext::SearchFilter,
         Some(Overlay::Filter) => keymap::LegendContext::Filter,
         // The add-entry captures parse a trailing date and bind `Tab` for a
         // literal submit, so they get their own legend rather than `TextInput`'s.

@@ -203,6 +203,7 @@ pub struct Model {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneKey {
     Today,
+    Search,
     List(ListId),
 }
 
@@ -898,6 +899,17 @@ pub enum Message {
         tasks: Vec<Task>,
         failed: Vec<ListId>,
     },
+    /// The **Search** corpus (every cached Task, across all Lists) plus the
+    /// ListIds whose live fetch/mirror failed. Ignored unless Search is still
+    /// active. Sent twice per load: the instant cache paint (`live: false`), then
+    /// the live fan-out result (`live: true`). Offline `main.rs` sends the cache
+    /// read with `live: true`, since there is no fan-out to wait for. `live` is the
+    /// only signal that clears [`Model::search_pending`].
+    SearchLoaded {
+        tasks: Vec<Task>,
+        failed: Vec<ListId>,
+        live: bool,
+    },
     /// Google's `@default` alias resolved to a concrete `ListId` (startup, online).
     DefaultListResolved(ListId),
     /// A write succeeded; reconcile the Model with the server's Task.
@@ -1010,6 +1022,12 @@ pub enum Command {
     /// for the sort) and the reducer's `today`, so membership is stamped by the
     /// reducer, not a worker clock.
     LoadToday { lists: Vec<List>, today: NaiveDate },
+    /// Load the **Search** corpus: an instant cache paint of every cached Task,
+    /// then (online) a concurrent per-List fan-out — the same worker as
+    /// `LoadToday`, reading the whole corpus back instead of the `due <= today`
+    /// aggregate. Carries the Lists to fan out over. Query-independent, so it fires
+    /// on entry and `r` only, never per keystroke.
+    LoadSearch { lists: Vec<List> },
     /// Write-through a completion toggle for a Task.
     SetCompleted {
         list: ListId,
@@ -1144,23 +1162,27 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 return Vec::new();
             }
             set_today_tasks(model, tasks);
-            // Name any List whose live fetch/mirror failed rather than rendering a
-            // short day as a light one (fail closed). Titles resolved from `lists`.
-            if failed.is_empty() {
-                model.status_line = None;
-            } else {
-                let names: Vec<String> = failed
-                    .iter()
-                    .map(|id| {
-                        model
-                            .lists
-                            .iter()
-                            .find(|l| &l.id == id)
-                            .map_or_else(|| id.0.clone(), |l| l.title.clone())
-                    })
-                    .collect();
-                model.status_line = Some(format!("failed to load: {}", names.join(", ")));
+            set_fanout_status(model, &failed);
+            Vec::new()
+        }
+        Message::SearchLoaded {
+            tasks,
+            failed,
+            live,
+        } => {
+            // Ignore a corpus landing after the user left Search (e.g. after Esc),
+            // so it cannot overwrite the restored pane.
+            if !model.search_active() {
+                return Vec::new();
             }
+            set_search_tasks(model, tasks);
+            // The live fan-out is the only thing that completes the corpus; the
+            // cache paint (`live: false`) leaves the pending notice up so a
+            // never-mirrored List reads as "not yet", not "no match".
+            if live {
+                model.search_pending = false;
+            }
+            set_fanout_status(model, &failed);
             Vec::new()
         }
         Message::DefaultListResolved(id) => {
@@ -1581,10 +1603,10 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     // Consume the flag unconditionally, so a Refresh's `full` never carries into a
     // later lazy cascade.
     let full = std::mem::take(&mut model.pending_refresh);
-    // When Today is active its `LoadToday` already fans out every List (fetch +
-    // mirror), so a separate per-List meter fan-out would double-fetch — skip it.
-    // Recount fills the meters from the mirrored cache.
-    if model.today_active() {
+    // A flat cross-List pane (Today or Search) already fans out every List (fetch +
+    // mirror) via its `LoadToday`/`LoadSearch`, so a separate per-List meter fan-out
+    // would double-fetch — skip it. Recount fills the meters from the mirrored cache.
+    if model.flat_pane() {
         return commands;
     }
     let active = now_selected;
@@ -1609,8 +1631,23 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     // replaced with another's Tasks — so drop the filter with it: a query typed
     // against one List should not silently narrow the next. Refresh reconciles the
     // *same* pane with `clear_pane == false`, so it preserves the filter.
-    if clear_pane {
+    //
+    // Search opts out: the corpus is every cached Task regardless of which List is
+    // parked, so no List-set change invalidates it, and its query must survive a
+    // stray `clear_pane` (an `X` on the parked List, a List create/delete reply).
+    if clear_pane && !model.search_active() {
         model.filter = None;
+    }
+    // Search's corpus is query-independent and pane-stable, so this ignores
+    // `clear_pane` entirely — touching neither `tasks`, `selected_task`, nor
+    // `filter` — and only re-emits the load. `enter_search` owns the clearing, and
+    // `refresh()` reaches here with `clear_pane == false`, which is how `r` keeps
+    // the corpus. Precedes the `selected_list_id()` match below, which is `None` in
+    // Search and would otherwise blank the pane.
+    if model.search_active() {
+        return vec![Command::LoadSearch {
+            lists: model.lists.clone(),
+        }];
     }
     if model.today_active() {
         // Today has no Manual lens (cross-List order is undefined). Normalise a
@@ -1703,16 +1740,19 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
     reselect_visible(model);
 }
 
-/// Fill the **Today** pane from a cross-List aggregate (already `due <= today`),
-/// keeping the cursor on the same Task by id where possible.
+/// Fill a **flat cross-List** pane (Today's aggregate or Search's corpus) from a
+/// cross-List Task set, keeping the cursor on the same Task by id where possible.
 ///
 /// Drops any id confirmed deleted/Cleared under its own List (the #65 stale-fetch
-/// guard). It only *drops* here, never evicts: the aggregate is filtered to
-/// `due <= today`, so "absent from the aggregate" does not imply Google dropped
-/// the row, and Task ids are never reused — an un-evicted tombstone can only ever
-/// match its own dead id. Per-List eviction still happens when that List is viewed
-/// (`set_tasks` → `reconcile_tombstones`).
-fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
+/// guard) and any row with a cross-List Move in flight. Both are unconditional,
+/// unlike `set_tasks`: a flat pane spans Lists, so there is no per-List fill to
+/// scope against, and a row mid-move belongs in neither its old List nor its new
+/// one until the reply lands.
+///
+/// It only *drops* here, never evicts a tombstone. Task ids are never reused, so
+/// an un-evicted tombstone can only ever match its own dead id; per-List eviction
+/// still happens when that List is viewed (`set_tasks` → `reconcile_tombstones`).
+fn fill_flat_pane(model: &mut Model, tasks: Vec<Task>) {
     let tasks: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
@@ -1721,9 +1761,6 @@ fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
                 .get(&t.list)
                 .is_some_and(|set| set.contains(&t.id))
         })
-        // Unconditional here, unlike `set_tasks`: Today spans Lists, so there is
-        // no per-List fill to scope against and a row mid-move belongs in neither
-        // its old List nor its new one until the reply lands.
         .filter(|t| !model.pending_list_moves.contains_key(&t.id))
         .collect();
     let previously_selected = model
@@ -1736,18 +1773,58 @@ fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
     reselect_visible(model);
 }
 
+/// Fill the **Today** pane from its `due <= today` aggregate. See [`fill_flat_pane`].
+fn set_today_tasks(model: &mut Model, tasks: Vec<Task>) {
+    fill_flat_pane(model, tasks);
+}
+
+/// Fill the **Search** pane from the whole cached corpus. See [`fill_flat_pane`].
+/// The corpus is unfiltered, so absence would imply a row is gone — but eviction
+/// is still declined here, because eviction is defined against "a fetch *of that
+/// List* omitted the id", and this reducer only ever sees the flat aggregate, not
+/// the per-List omission (that lives in `sync::mirror_and_aggregate`, with no
+/// `Model` access). The per-List path evicts on the next load of that List.
+fn set_search_tasks(model: &mut Model, tasks: Vec<Task>) {
+    fill_flat_pane(model, tasks);
+}
+
+/// Set the status line to name the Lists whose live fetch/mirror failed, or clear
+/// it when all succeeded — so a short cross-List pane never reads as a light one
+/// (fail closed). Shared by the Today and Search fan-out replies.
+fn set_fanout_status(model: &mut Model, failed: &[ListId]) {
+    if failed.is_empty() {
+        model.status_line = None;
+        return;
+    }
+    let names: Vec<String> = failed
+        .iter()
+        .map(|id| {
+            model
+                .lists
+                .iter()
+                .find(|l| &l.id == id)
+                .map_or_else(|| id.0.clone(), |l| l.title.clone())
+        })
+        .collect();
+    model.status_line = Some(format!("failed to load: {}", names.join(", ")));
+}
+
 fn apply(model: &mut Model, action: Action) -> Vec<Command> {
     match action {
         Action::Quit => model.should_quit = true,
         Action::ToggleHelp => model.show_help = !model.show_help,
-        // Esc with no overlay open. Closes the cheatsheet first; failing that,
-        // clears a persisted filter and restores the full pane (its cursor may
-        // have to re-anchor onto a row the filter had hidden). The filter *input*
-        // being open is handled earlier, in `filter_key` — this arm never runs
-        // then, since `overlay_key` intercepts keys while any overlay is set.
+        // Esc with no overlay open. Closes the cheatsheet first (it is drawn on
+        // top, so it goes before Search); failing that, in Search it exits the pane
+        // in one press even with the input already closed by `Enter`; failing that,
+        // clears a persisted filter and restores the full pane (its cursor may have
+        // to re-anchor onto a row the filter had hidden). The filter *input* being
+        // open is handled earlier, in `filter_key` — this arm never runs then, since
+        // `overlay_key` intercepts keys while any overlay is set.
         Action::CloseOverlay => {
             if model.show_help {
                 model.show_help = false;
+            } else if model.search_active() {
+                return exit_search(model);
             } else if model.filter.is_some() {
                 model.filter = None;
                 reselect_visible(model);
@@ -1799,6 +1876,16 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             reselect_visible(model);
         }
         Action::Filter => open_filter(model),
+        // In Search already, `S` reopens the query input over the existing query
+        // (like `/`), never re-entering: `enter_search` would clear the corpus,
+        // discard the typed query, and re-fan-out the whole account.
+        Action::Search => {
+            if model.search_active() {
+                open_filter(model);
+            } else {
+                return enter_search(model);
+            }
+        }
         Action::ClearCompleted => open_clear_completed_confirm(model),
         Action::Refresh => return refresh(model),
         Action::AddSubtask => open_add_subtask(model),
@@ -2304,6 +2391,9 @@ fn pane_key(model: &Model) -> Option<PaneKey> {
     if model.today_active() {
         return Some(PaneKey::Today);
     }
+    if model.search_active() {
+        return Some(PaneKey::Search);
+    }
     model.selected_list_id().cloned().map(PaneKey::List)
 }
 
@@ -2688,6 +2778,11 @@ fn finish_add_list(model: &mut Model, buffer: String) -> Vec<Command> {
     if title.is_empty() {
         return Vec::new();
     }
+    // `A` moves `selected` onto the new List deliberately (like `j`/`k`), so it
+    // leaves Search. This bypasses `request_selected` entirely, so `leave_search`
+    // is what drops the query — otherwise a stale search query would narrow the
+    // brand-new empty List.
+    leave_search(model);
     let temp = ListId(format!("temp-list-{}", model.next_temp));
     model.next_temp += 1;
     model.lists.push(List {
@@ -2757,6 +2852,47 @@ fn open_filter(model: &mut Model) {
     model.overlay = Some(Overlay::Filter);
 }
 
+/// Enter the cross-List **Search** pane (`S`) from a List or Today.
+///
+/// Sets the flag, clears the pane so a `selected_task` index inherited from the
+/// parked pane cannot point into a corpus of different length, marks the corpus
+/// pending, then routes through `request_selected` for its `Command::LoadSearch`.
+/// The query is seeded **after** that call: the Search branch ignores `clear_pane`
+/// (so the clearing above is ours), but seeding before would still be wiped were
+/// that ever to change. Focus moves to the task pane so the first `j` after
+/// `Enter` steers the results, not the sidebar Search was opened from.
+fn enter_search(model: &mut Model) -> Vec<Command> {
+    model.search = true;
+    model.search_pending = true;
+    model.tasks.clear();
+    model.selected_task = None;
+    let commands = request_selected(model, true);
+    model.focus = Focus::Tasks;
+    model.filter = Some(String::new());
+    model.overlay = Some(Overlay::Filter);
+    commands
+}
+
+/// Shared teardown for the three sites that drop Search (`exit_search`,
+/// `move_list_selection`, `finish_add_list`): clear the flag, the pending notice,
+/// and the query. Clearing the query here rather than leaning on `request_selected`
+/// is what makes it reusable — `finish_add_list` bypasses that path entirely, so
+/// without this a stale search query would narrow the brand-new empty List.
+fn leave_search(model: &mut Model) {
+    model.search = false;
+    model.search_pending = false;
+    model.filter = None;
+}
+
+/// Leave Search (`Esc`), reloading the pane `selected` still names. The sidebar
+/// cursor is restored exactly — `selected` never moved — but the pane's own `/`
+/// filter is not (dropped by `leave_search`, like any pane switch).
+fn exit_search(model: &mut Model) -> Vec<Command> {
+    leave_search(model);
+    model.overlay = None;
+    request_selected(model, true)
+}
+
 /// Keys for the open filter input. The query lives on `Model::filter` (the single
 /// source of truth the view filter reads), so each edit narrows the pane live and
 /// re-anchors the cursor onto a surviving row. `Enter` keeps the filter and closes
@@ -2781,6 +2917,12 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
             return Vec::new();
         }
         KeyCode::Esc => {
+            // In Search, `Esc` from the open input exits the pane in one press
+            // rather than clearing the query — the pane behind it is the corpus,
+            // not a List, so "clear and stay" is not a state worth stopping at.
+            if model.search_active() {
+                return exit_search(model);
+            }
             model.filter = None;
             model.overlay = None;
             reselect_visible(model);
@@ -3277,5 +3419,11 @@ fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     if model.selected == before {
         return Vec::new();
     }
+    // Below the no-movement early return, so a clamped `j`/`k` at the sidebar's
+    // edges is inert in Search rather than silently dropping the corpus. A genuine
+    // move is the "open the List instead" gesture, so it leaves Search — here, not
+    // inside `request_selected`, which `refresh()` also calls (with
+    // `clear_pane == false`) and must keep Search for `r`.
+    leave_search(model);
     request_selected(model, true)
 }

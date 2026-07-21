@@ -317,7 +317,48 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                     }
                 });
                 if let Some(api) = api {
-                    spawn_load_today(api.clone(), cache.clone(), tx.clone(), lists, today);
+                    spawn_fanout(
+                        api.clone(),
+                        cache.clone(),
+                        tx.clone(),
+                        lists,
+                        sync::Aggregate::Today(today),
+                        |tasks, failed| Message::TodayLoaded { tasks, failed },
+                    );
+                }
+            }
+            Command::LoadSearch { lists } => {
+                // Instant paint of the whole cached corpus, then — online — the
+                // fan-out for fresh data. Offline the cache read *is* the final
+                // answer, so it is sent `live: true` and the pending notice never
+                // sticks; online the cache paint is `live: false` and the fan-out
+                // reply below clears the notice.
+                let live = api.is_none();
+                let cached = sync::all_from_cache(&cache.lock().unwrap());
+                let _ = tx.send(match cached {
+                    Ok(tasks) => Message::SearchLoaded {
+                        tasks,
+                        failed: Vec::new(),
+                        live,
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read search corpus from cache");
+                        Message::LoadFailed(format!("failed to read search: {e}"))
+                    }
+                });
+                if let Some(api) = api {
+                    spawn_fanout(
+                        api.clone(),
+                        cache.clone(),
+                        tx.clone(),
+                        lists,
+                        sync::Aggregate::All,
+                        |tasks, failed| Message::SearchLoaded {
+                            tasks,
+                            failed,
+                            live: true,
+                        },
+                    );
                 }
             }
             Command::SetCompleted {
@@ -982,16 +1023,26 @@ fn spawn_load_tasks(
 /// cache lock, then the `due <= today` aggregate read back. Reports the aggregate
 /// plus the ListIds whose fetch *or* mirror failed, so a failed List is named on
 /// the status line rather than silently shortening the day (fail closed).
-fn spawn_load_today(
+/// The concurrent cross-List fan-out shared by Today and Search: fetch every
+/// List's active view in parallel, then hand the awaited results to
+/// `sync::mirror_and_aggregate` — the spawn-free core, covered by
+/// `tests/search_boundary.rs` — which mirrors, attributes failures, and reads the
+/// requested `aggregate` back. `to_message` wraps that `(tasks, failed)` in the
+/// pane's own `Message` (`TodayLoaded`, or `SearchLoaded { live: true }`).
+///
+/// Keeping the `tokio::spawn`/`JoinSet` glue here honours the "all spawns in
+/// `main.rs`" convention; it is branch-free but for logging a worker-join panic.
+fn spawn_fanout(
     api: Arc<dyn TasksApi>,
     cache: SharedCache,
     tx: UnboundedSender<Message>,
     lists: Vec<List>,
-    today: NaiveDate,
+    aggregate: sync::Aggregate,
+    to_message: impl Fn(Vec<Task>, Vec<ListId>) -> Message + Send + 'static,
 ) {
     tokio::spawn(async move {
-        // Fan out fetches concurrently; each returns its List's id + result so the
-        // mirror and failure-attribution below know which List each came from.
+        // Fan out fetches concurrently; each returns its List's id + result so
+        // `mirror_and_aggregate` knows which List each came from.
         let mut set = tokio::task::JoinSet::new();
         for list in lists {
             let api = api.clone();
@@ -1000,31 +1051,20 @@ fn spawn_load_today(
                 (list.id, res)
             });
         }
-        let mut fetched: Vec<(ListId, Vec<Task>)> = Vec::new();
-        let mut failed: Vec<ListId> = Vec::new();
+        let mut fetched: Vec<(ListId, anyhow::Result<Vec<Task>>)> = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((id, Ok(tasks))) => fetched.push((id, tasks)),
-                Ok((id, Err(e))) => {
-                    tracing::warn!(error = %e, list = %id.0, "today fan-out: list fetch failed");
-                    failed.push(id);
-                }
-                Err(e) => tracing::error!(error = %e, "today fan-out: worker join failed"),
+                Ok(pair) => fetched.push(pair),
+                Err(e) => tracing::error!(error = %e, "fan-out: worker join failed"),
             }
         }
         // Mirror sequentially under one lock, then read the aggregate back — the
-        // same cache read `today_from_cache` serves for the instant paint.
+        // same cache read the instant paint serves.
         let message = {
             let cache = cache.lock().unwrap();
-            for (id, tasks) in &fetched {
-                if let Err(e) = cache.replace_tasks(id, tasks) {
-                    tracing::warn!(error = %e, list = %id.0, "today fan-out: mirror failed");
-                    failed.push(id.clone());
-                }
-            }
-            match sync::today_from_cache(&cache, today) {
-                Ok(tasks) => Message::TodayLoaded { tasks, failed },
-                Err(e) => Message::LoadFailed(format!("failed to build today: {e}")),
+            match sync::mirror_and_aggregate(&cache, fetched, aggregate) {
+                Ok((tasks, failed)) => to_message(tasks, failed),
+                Err(e) => Message::LoadFailed(format!("failed to build pane: {e}")),
             }
         };
         let _ = tx.send(message);

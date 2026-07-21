@@ -60,6 +60,62 @@ pub fn today_from_cache(cache: &Cache, today: NaiveDate) -> Result<Vec<Task>> {
         .collect())
 }
 
+/// The whole cached corpus, across all Lists (each carrying its own `list`).
+/// **Search**'s instant paint and offline answer — `today_from_cache` without the
+/// date filter. Borrow-based and spawn-free, so `main.rs` owns the concurrent live
+/// fan-out that follows it.
+pub fn all_from_cache(cache: &Cache) -> Result<Vec<Task>> {
+    cache.all_tasks()
+}
+
+/// Which cross-List aggregate a fan-out reads back from the cache once its
+/// per-List fetches are mirrored: Today's date-bounded set, or Search's whole
+/// corpus.
+#[derive(Debug, Clone, Copy)]
+pub enum Aggregate {
+    /// Today: every cached Task due on or before this date.
+    Today(NaiveDate),
+    /// Search: every cached Task, unfiltered.
+    All,
+}
+
+/// The spawn-free core of the cross-List fan-out, shared by the Today and Search
+/// workers in `main.rs`. `fetched` is one `(ListId, fetch result)` per List,
+/// already awaited: each `Ok` is mirrored into the cache, and every `Err` (fetch
+/// or mirror) contributes its `ListId` to the returned failed set so the caller
+/// can name a short pane rather than render it as a light one (fail closed). The
+/// requested aggregate is then read back from the mirrored cache.
+///
+/// Takes a plain `&Cache`, so the `tokio::spawn`/`JoinSet` glue stays in `main.rs`
+/// while this — the mirroring, failure attribution, and aggregate read — is
+/// covered by `tests/search_boundary.rs`.
+pub fn mirror_and_aggregate(
+    cache: &Cache,
+    fetched: Vec<(ListId, Result<Vec<Task>>)>,
+    aggregate: Aggregate,
+) -> Result<(Vec<Task>, Vec<ListId>)> {
+    let mut failed: Vec<ListId> = Vec::new();
+    for (id, res) in fetched {
+        match res {
+            Ok(tasks) => {
+                if let Err(e) = cache.replace_tasks(&id, &tasks) {
+                    tracing::warn!(error = %e, list = %id.0, "fan-out: mirror failed");
+                    failed.push(id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, list = %id.0, "fan-out: list fetch failed");
+                failed.push(id);
+            }
+        }
+    }
+    let tasks = match aggregate {
+        Aggregate::Today(today) => today_from_cache(cache, today)?,
+        Aggregate::All => all_from_cache(cache)?,
+    };
+    Ok((tasks, failed))
+}
+
 /// Set a Task's completed state on Google and return the updated Task from the
 /// response. The cache is *not* touched — a caller doing its own locking mirrors
 /// separately (see `main`'s worker); the combined [`write_completed`] is the

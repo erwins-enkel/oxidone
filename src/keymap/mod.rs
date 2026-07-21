@@ -46,6 +46,10 @@ pub enum Action {
     /// Open the title/notes filter input (`/`): a live view filter narrowing the
     /// task pane by a case-insensitive substring of a row's title or notes.
     Filter,
+    /// Enter the cross-List **Search** pane (`S`): the whole cached corpus,
+    /// narrowed live by the `/` query. When Search is already active, reopens the
+    /// query input over the existing query.
+    Search,
     /// Open a URL found in the selected Task's notes.
     OpenLink,
     ClearCompleted,
@@ -242,6 +246,14 @@ pub fn bindings() -> &'static [Binding] {
             action: Action::Filter,
             help: "filter by title/notes",
         },
+        // Beside `/`, and like it: no always-visible legend cell (the 80-column
+        // TASKS row is full through `c completed` — see `legend`), so this lives in
+        // `?` and, while active, in the `SEARCH` pane title.
+        Binding {
+            key: KeyCode::Char('S'),
+            action: Action::Search,
+            help: "search all lists",
+        },
         Binding {
             key: KeyCode::Char('C'),
             action: Action::ClearCompleted,
@@ -385,6 +397,10 @@ pub enum LegendContext {
     /// The title/notes filter input: characters narrow the pane live, Enter keeps
     /// the filter applied, Esc clears it.
     Filter,
+    /// The same input open in **Search**, where `Esc` exits Search rather than
+    /// clearing the query — so the `Esc` cell must read "leave search", not
+    /// "clear", or the legend promises an affordance the pane does not honour.
+    SearchFilter,
 }
 
 /// Where a legend cell's key text comes from.
@@ -647,6 +663,20 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
+    // The same input in Search: `Esc` exits Search rather than clearing the query,
+    // so this cell reads "leave search" — the pane behind the input is the corpus,
+    // not a List, and "clear" would promise landing on a full result set.
+    const SEARCH_FILTER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "keep",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "leave search",
+        },
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
@@ -656,5 +686,6 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::LinkPicker => LINK_PICKER,
         LegendContext::ListPicker => LIST_PICKER,
         LegendContext::Filter => FILTER,
+        LegendContext::SearchFilter => SEARCH_FILTER,
     }
 }

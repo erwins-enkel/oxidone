@@ -615,16 +615,18 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // Overdue is a property of the date against today, decided here in the view
     // — `model.now` keeps that testable rather than reading the wall clock.
     let today = model.now.date_naive();
-    // Today is a flat cross-List pane: no Subtask indent or meters (per-List
-    // hierarchy concepts), and each row carries a muted List name so its home is
-    // visible where rows from different Lists sit together. It also renders as a
-    // journal spread — see `journal_spread` — which is what the two column rules
-    // below branch on.
-    let today_view = model.today_active();
+    // Two independent axes, both true only for Today today (Search joins `flat`).
+    // `flat`: a cross-List pane — no Subtask indent or meters (per-List hierarchy
+    // concepts), and each row carries a muted List name so its home is visible
+    // where rows from different Lists sit together. `spread`: the journal spread
+    // and the two column rules that serve it — the Overdue group, the always-on
+    // signifier gutter, and the overdue-only due column.
+    let flat = model.today_active();
+    let spread = model.today_active();
     // The Overdue group, as a count of rows: `cross_list_ordered` sorts them to the
     // front, so they are a contiguous prefix and `take_while` sees all of them.
-    // Zero outside Today, where there is no such group.
-    let overdue_rows = if today_view {
+    // Zero outside a spread, where there is no such group.
+    let overdue_rows = if spread {
         ordered
             .iter()
             .take_while(|t| due_before(t.due, today))
@@ -636,12 +638,12 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // The gutter only exists when something in view has a due date — otherwise
     // every title would sit behind a column of blanks.
     //
-    // In Today every row is dated, so that test would always pass and every
+    // In a spread every row is dated, so that test would always pass and every
     // today-due row would read "today" down a 12-cell column. The column exists
     // there on the *Overdue group's* condition instead — exactly the one that
     // draws the `Overdue` header — so the two appear and vanish together and
     // titles never shift without the header announcing it.
-    let due_gutter = if today_view {
+    let due_gutter = if spread {
         overdue_rows > 0
     } else {
         ordered.iter().any(|t| t.due.is_some())
@@ -650,17 +652,17 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // On an all-Task pane — the overwhelmingly common case — a column of blanks
     // would spend width to say "ordinary".
     //
-    // Today is the exception: the spread reserves it always, so titles hold their
-    // column as Events and Notes enter and leave the day. That fixed position is
-    // what makes it a gutter rather than a cell.
-    let signifiers = today_view || ordered.iter().any(|t| t.entry_type() != EntryType::Task);
+    // The spread is the exception: it reserves the gutter always, so titles hold
+    // their column as Events and Notes enter and leave the day. That fixed position
+    // is what makes it a gutter rather than a cell.
+    let signifiers = spread || ordered.iter().any(|t| t.entry_type() != EntryType::Task);
     // Built once per render: the per-row indent check is then a hash lookup, not
     // a scan of every Task.
     let top_level = model.top_level_ids();
     // Shares that set rather than deriving its own, so the meter counts exactly
     // the rows the indent rule nests — and stays one pass over `tasks`.
     let subtask_counts = model.subtask_counts(&top_level);
-    let list_titles: HashMap<&ListId, &str> = if today_view {
+    let list_titles: HashMap<&ListId, &str> = if flat {
         model
             .lists
             .iter()
@@ -687,11 +689,11 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 // forms are all shorter than the ISO fallback, so they pad
                 // rather than truncate and the titles stay aligned.
                 //
-                // In Today's spread only the Overdue group prints a date. A
-                // today-due row's cell is blank *at full width*, so titles stay
-                // aligned across the fold — the `Today` header two rows up
-                // already said what the date would be.
-                let prints_date = !today_view || due_before(t.due, today);
+                // In a spread only the Overdue group prints a date. A today-due
+                // row's cell is blank *at full width*, so titles stay aligned
+                // across the fold — the `Today` header two rows up already said
+                // what the date would be.
+                let prints_date = !spread || due_before(t.due, today);
                 let due = match t.due {
                     Some(d) if prints_date => format_due_relative(d, today),
                     _ => String::new(),
@@ -703,8 +705,8 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             }
             // Subtasks sit indented under their parent so the hierarchy reads.
             // An orphan (parent gone) draws flush-left rather than claiming the
-            // row above it as its parent. Never in Today — that pane is flat.
-            let is_subtask = !today_view && renders_as_subtask(&top_level, t);
+            // row above it as its parent. Never in a flat pane.
+            let is_subtask = !flat && renders_as_subtask(&top_level, t);
             if is_subtask {
                 spans.push(Span::raw(SUBTASK_INDENT));
             }
@@ -752,8 +754,8 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // Neither marker is dropped for the meter's sake: they are not this
             // widget's information to spend — so both widths come off its budget,
             // or it would lay itself out over cells the row has already spent.
-            // Today has no Subtask meter (flat pane), so it is skipped there.
-            let segment = if today_view {
+            // A flat pane has no Subtask meter, so it is skipped there.
+            let segment = if flat {
                 String::new()
             } else {
                 subtask_segment(
@@ -775,7 +777,7 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                     style.remove_modifier(Modifier::CROSSED_OUT),
                 ));
             }
-            // Today only: the List name, trailing the markers/meter. Painted
+            // Flat panes only: the List name, trailing the markers/meter. Painted
             // `muted` — a step below the `subtext` preview that follows it, so the
             // two tails do not compete: the name is context about the row, not the
             // row's own text. Its width comes off the notes-preview budget below
@@ -817,10 +819,10 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         .and_then(|i| model.tasks.get(i))
         .and_then(|sel| ordered.iter().position(|t| t.id == sel.id));
 
-    // Today interleaves the journal spread's header rows, which shifts every
+    // A spread interleaves the journal spread's header rows, which shifts every
     // display index below them — so the cursor is translated in the same place
     // the rows are inserted, and cannot be left behind.
-    let (items, selected) = if today_view {
+    let (items, selected) = if spread {
         journal_spread(items, selected, &ordered, overdue_rows, today, theme)
     } else {
         (items, selected)

@@ -392,7 +392,7 @@ async fn move_task_sends_parent_and_previous_query_params() {
 }
 
 #[tokio::test]
-async fn move_task_to_list_clears_a_synthetically_echoed_parent() {
+async fn move_task_to_list_sends_destination_tasklist_and_clears_a_synthetically_echoed_parent() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/lists/L1/tasks/T3/move"))
@@ -403,11 +403,12 @@ async fn move_task_to_list_clears_a_synthetically_echoed_parent() {
             "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
             // A *synthetic* input, deliberately kept. #86 (2026-07-21) observed
             // this response only for a **top-level** Task, which has no parent
-            // to echo — so it says nothing either way about relocating a
-            // *Subtask*, which is the case this guard is for. Untested is not
-            // disproven: an echoed source parent would name a Task absent from
-            // L2, which `Model::groups` draws as an orphan, so the defensive
-            // `task.parent = None` and this — its only coverage — both stay.
+            // to echo — so it never exercised the echo this guards against, and
+            // relocating a *Subtask* (the plausible way to provoke one) went
+            // untested. Untested is not disproven: an echoed source parent would
+            // name a Task absent from L2, which `Model::groups` draws as an
+            // orphan, so the defensive `task.parent = None` and this — its only
+            // coverage — both stay.
             "position": "00000000000000000000", "parent": "T1"
         })))
         .mount(&server)
@@ -434,7 +435,7 @@ async fn move_task_to_list_clears_a_synthetically_echoed_parent() {
 /// rather than duplicates only while the id is stable.
 ///
 /// Pinned alongside the synthetic case above, not in place of it: that one
-/// covers a Subtask relocation, which this observation does not reach.
+/// covers a synthetic parent echo, which this observation does not reach.
 #[tokio::test]
 async fn move_task_to_list_keeps_the_id_and_gets_no_parent_from_the_wire() {
     let server = MockServer::start().await;

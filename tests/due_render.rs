@@ -157,18 +157,49 @@ async fn an_undated_task_is_not_told_its_date_will_be_cleared() {
     );
 }
 
-/// But once the buffer has been edited, an empty one *is* a deliberate clear —
-/// on a dated Task that is exactly what `Enter` does, and it says so.
+/// A no-op keystroke must not make the message scarier. `Backspace` and `^U` on
+/// an already-empty buffer change nothing, but they do clear `pristine` — which
+/// an earlier version used as a stand-in for "the Task had no date", so the line
+/// flipped to threatening a clear. Backspace-out-of-habit on a just-opened
+/// editor is the likely path.
+#[tokio::test]
+async fn emptying_an_already_empty_buffer_does_not_threaten_a_clear() {
+    for press in [
+        Message::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())),
+        chord('u'),
+    ] {
+        let mut m = model_with_an_undated_task().await;
+        update(&mut m, ch('d'));
+        update(&mut m, press);
+        let rows = rows(&m);
+        assert!(
+            rows.iter().any(|r| r.contains("→ leaves it undated")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("clears the due date")),
+            "still nothing to clear: {rows:?}"
+        );
+    }
+}
+
+/// The converse: on a Task that *does* have a date, an empty buffer really will
+/// clear it, whether the user emptied it deliberately or the editor just opened.
 #[tokio::test]
 async fn an_emptied_buffer_on_a_dated_task_still_announces_the_clear() {
-    let mut m = model_with_due().await;
-    update(&mut m, ch('d'));
-    update(&mut m, chord('u'));
-    let rows = rows(&m);
-    assert!(
-        rows.iter().any(|r| r.contains("→ clears the due date")),
-        "{rows:?}"
-    );
+    for press in [
+        Message::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())),
+        chord('u'),
+    ] {
+        let mut m = model_with_due().await;
+        update(&mut m, ch('d'));
+        update(&mut m, press);
+        let rows = rows(&m);
+        assert!(
+            rows.iter().any(|r| r.contains("→ clears the due date")),
+            "{rows:?}"
+        );
+    }
 }
 
 #[tokio::test]

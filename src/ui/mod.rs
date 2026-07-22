@@ -22,7 +22,9 @@ use std::collections::HashMap;
 
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
-use crate::domain::{due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task};
+use crate::domain::{
+    due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task, TaskId,
+};
 use crate::keymap;
 use crate::links::{self, Link};
 use theme::Theme;
@@ -74,7 +76,7 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
         render_help(frame, area, theme);
     }
     if let Some(overlay) = &model.overlay {
-        render_overlay(frame, area, overlay, model.now, theme);
+        render_overlay(frame, area, overlay, model, theme);
     }
 }
 
@@ -90,13 +92,8 @@ const OVERLAY_BORDERS: u16 = 2;
 /// not — the legend down there is what advertises its own keys.
 const BOTTOM_CHROME_ROWS: u16 = 2;
 
-fn render_overlay(
-    frame: &mut Frame,
-    area: Rect,
-    overlay: &Overlay,
-    now: DateTime<Local>,
-    theme: &Theme,
-) {
+fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Model, theme: &Theme) {
+    let now = model.now;
     // Every overlay but the picker is one or two lines of text in a popup, in
     // two shapes: the add-entry captures grow a second line only when a trailing
     // date is recognised (see `capture_lines`), while the due editor always has
@@ -109,8 +106,13 @@ fn render_overlay(
         // No "(blank clears)" here, unlike the notes editor below: `due_lines`
         // says it live, on the line beneath, exactly when the buffer is empty.
         Overlay::EditDue {
-            buffer, pristine, ..
-        } => ("Edit due date", due_lines(buffer, *pristine, now, theme)),
+            task,
+            buffer,
+            pristine,
+        } => (
+            "Edit due date",
+            due_lines(buffer, *pristine, stored_due(model, task), now, theme),
+        ),
         Overlay::EditNotes { buffer, .. } => {
             ("Edit notes (blank clears)", vec![input_line(buffer)])
         }
@@ -143,6 +145,23 @@ fn input_line(buffer: &str) -> Line<'static> {
     Line::from(format!("{buffer}▏"))
 }
 
+/// The due date the model currently holds for `task`, or `None` if it has none —
+/// or if the Task is no longer there at all.
+///
+/// Read at render time rather than captured when the overlay opened, because it
+/// is the *current* Task the write will land on: a refresh landing mid-edit can
+/// give the Task a due date, and an empty buffer submitted after that really does
+/// clear one. Looking it up by id rather than by index is what makes this safe to
+/// re-read — the hazard `Overlay::MoveToList` documents is stale *indices* into a
+/// list that a `TasksLoaded` can reorder underneath, and an id does not move.
+fn stored_due(model: &Model, task: &TaskId) -> Option<NaiveDate> {
+    model
+        .tasks
+        .iter()
+        .find(|t| t.id == *task)
+        .and_then(|t| t.due)
+}
+
 /// Lines for the due editor: the input line, plus an always-present preview of
 /// what `Enter` will do.
 ///
@@ -157,16 +176,21 @@ fn input_line(buffer: &str) -> Line<'static> {
 /// branching on the raw buffer would render "not a date" in red while `Enter`
 /// cheerfully cleared the date.
 ///
-/// `pristine` splits the empty branch in two. Since `open_edit_due` prefills a
-/// dated Task with its date, an empty *untouched* buffer means the Task had no
-/// due date to begin with — so `Enter` changes nothing visible and the line says
-/// that, rather than threatening to clear a date that does not exist. An empty
-/// buffer the user emptied is a real clear and reads as one. The line is present
-/// either way: it is what fixes the popup's height, so dropping it would make the
-/// frame jump as you type.
+/// The empty branch splits on `stored_due`, the Task's *actual* due date, not on
+/// `pristine`. An earlier version used `pristine` as a stand-in for "the Task had
+/// no date" — true when the overlay opens, but a single `Backspace` on an
+/// already-empty buffer clears the flag without changing anything, and the line
+/// would flip to threatening a clear on a Task with nothing to clear.
+/// Backspace-out-of-habit on a just-opened editor is a likely path, and a no-op
+/// keystroke must not make the message scarier. Keyed off the date itself, the
+/// wording depends only on what `Enter` will actually do.
+///
+/// The line is present either way: it is what fixes the popup's height, so
+/// dropping it would make the frame jump as you type.
 fn due_lines(
     buffer: &str,
     pristine: bool,
+    stored_due: Option<NaiveDate>,
     now: DateTime<Local>,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -183,15 +207,13 @@ fn due_lines(
     };
     let trimmed = buffer.trim();
     let (preview, fg) = if trimmed.is_empty() {
-        // An empty buffer that is still `pristine` is a Task that opened without
-        // a due date — `open_edit_due` prefills a dated one — so there is nothing
-        // to clear, and saying so would announce a destructive outcome the user
-        // has not asked for on a Task it cannot happen to. Once edited, an empty
-        // buffer *is* a deliberate clear and gets named as one.
-        if pristine {
-            ("→ leaves it undated".to_string(), theme.subtext)
-        } else {
+        // Only a Task that *has* a date can have one cleared. On any other,
+        // submitting an empty buffer changes nothing visible, and saying
+        // "clears" would announce a destructive outcome that cannot happen.
+        if stored_due.is_some() {
             ("→ clears the due date".to_string(), theme.subtext)
+        } else {
+            ("→ leaves it undated".to_string(), theme.subtext)
         }
     } else {
         match dateparse::parse_due_relative_to(trimmed, now) {

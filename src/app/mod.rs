@@ -231,9 +231,13 @@ pub enum Overlay {
     /// `pristine` marks the prefill as untouched, i.e. still *selected*: the
     /// first printable character replaces the whole buffer rather than appending
     /// to it, and `Backspace` clears it outright. The view draws it reversed
-    /// while it holds, so the replacement is announced rather than sprung. Any
-    /// edit — a character, a `Backspace`, a chord, a step — clears the flag, and
-    /// it is never set again for the life of the overlay.
+    /// while it holds, so the replacement is announced rather than sprung.
+    ///
+    /// Anything that *changes* the buffer clears the flag — a character, a
+    /// `Backspace`, a chord, a step that moves — and it is never set again for
+    /// the life of the overlay. A step refused at the ends of the calendar is
+    /// the one keystroke that does not: it leaves the buffer byte-identical, so
+    /// the prefill is still untouched and still reads as selected.
     EditDue {
         task: TaskId,
         buffer: String,
@@ -3127,8 +3131,9 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
 /// **The prefill.** While `pristine`, the buffer is the Task's current due date
 /// shown as selected (the view draws it reversed). A printable character
 /// replaces it and `Backspace` clears it, so retyping a date costs one keystroke
-/// instead of ten — the friction this overlay exists to remove. Any edit clears
-/// the flag, after which both keys behave as they do everywhere else.
+/// instead of ten — the friction this overlay exists to remove. Any keystroke
+/// that changes the buffer clears the flag, after which both keys behave as they
+/// do everywhere else; see [`Overlay::EditDue`] for the one that does not.
 ///
 /// **Stepping.** `↑`/`↓` move a day, `PgUp`/`PgDn` a week, resolving whatever is
 /// in the buffer rather than the Task's stored date — so steps compose with

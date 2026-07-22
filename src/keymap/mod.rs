@@ -8,7 +8,7 @@
 //! `legend`, whose cells name `Action`s and resolve their key text through
 //! `bindings()` rather than restating it.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A user-facing verb. Grows as slices add behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,13 +319,56 @@ pub fn bindings() -> &'static [Binding] {
     BINDINGS
 }
 
-/// Resolve a key press to its bound `Action`, if any. Modifiers are ignored for
-/// now — the shell's verbs are all plain keys.
+/// Resolve a key press to its bound `Action`, if any.
+///
+/// The verbs are plain keys, so modifiers are ignored — with one exception:
+/// `^U` and `^W` resolve to nothing, because they are text-editing keys this app
+/// advertises, and `u`/`w` are bound to verbs one of which opens a browser. Every
+/// other Ctrl chord still resolves as if unmodified (see the body).
 pub fn resolve(key: KeyEvent) -> Option<Action> {
+    // `^U` and `^W` are advertised in four overlay legends, so they become
+    // muscle memory — and a press landing just outside an overlay (a beat before
+    // `d` opens it, a beat after `Enter` closes it) arrives here instead. Without
+    // this, `^U` would resolve to `u` → `OpenLink`, which spawns a browser for a
+    // single-link Task, and `^W` to `w` → `ToggleHideDistant`, silently emptying
+    // the pane.
+    //
+    // Scoped to those two keys rather than to every Ctrl chord, deliberately.
+    // This table is modifier-blind throughout — `Ctrl-Q` quits, `Ctrl-C` toggles
+    // Completed — and that is left exactly as it was: gating the lot would
+    // silently change two more keys in a change that neither introduced nor
+    // advertised them. Making the whole table modifier-aware is a decision of its
+    // own, with its own tests, tracked in #105. What is gated here is only what
+    // this app now *teaches* the user to press.
+    if is_control_chord(key.modifiers) && matches!(key.code, KeyCode::Char('u' | 'w')) {
+        return None;
+    }
     bindings()
         .iter()
         .find(|b| b.key == key.code)
         .map(|b| b.action)
+}
+
+/// Whether this keystroke is a `Ctrl` chord rather than text — `CONTROL` on any
+/// key, not just the two this app binds. Callers that care about a *particular*
+/// chord match the key code as well; callers that just need "this is not a
+/// character" (the text overlays, so `^A` does not type an `a`) use it as it is.
+///
+/// `CONTROL` **without** `ALT`, not "either of them":
+///
+/// - `ALT` alongside `CONTROL` is AltGr, which Windows consoles report as
+///   `LEFT_CTRL | RIGHT_ALT`. It is how `@ \ [ ] { } ~ | €` are typed on German,
+///   Polish and Nordic layouts, so it means a character.
+/// - `ALT` alone is left to mean whatever it means today (macOS Option-as-Meta
+///   sends it for `Option`+letter); this predicate does not claim it.
+/// - `SHIFT` is ignored entirely — capitals carry it, and several bindings are
+///   capitals.
+///
+/// Lives here rather than in `app` because [`resolve`] reads it too, and `app`
+/// depends on `keymap` and not the reverse. Deciding whether a keystroke is a
+/// chord is this module's job anyway.
+pub fn is_control_chord(m: KeyModifiers) -> bool {
+    m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT)
 }
 
 /// The cheatsheet's rows: one per distinct `(action, help)` pair, labelled with
@@ -382,8 +425,12 @@ pub fn key_label(code: KeyCode) -> String {
 pub enum LegendContext {
     Tasks,
     Sidebar,
-    /// A text-capture overlay: chars go to the buffer, Enter saves, Esc cancels.
+    /// A text-capture overlay: chars go to the buffer, Enter saves, Esc cancels,
+    /// and the readline chords `^U`/`^W` clear the line and the last word.
     TextInput,
+    /// The due-date editor: like `TextInput`, plus arrows and page keys that step
+    /// the date a day or a week at a time, so the legend advertises them.
+    DueInput,
     /// An add-entry capture (add task / subtask): like `TextInput`, but `Enter`
     /// peels a trailing natural-language date off the title and `Tab` submits it
     /// verbatim, so the legend advertises the extra key.
@@ -394,12 +441,15 @@ pub enum LegendContext {
     LinkPicker,
     /// The move-to-List picker: j/k move, Enter moves, Esc cancels.
     ListPicker,
-    /// The title/notes filter input: characters narrow the pane live, Enter keeps
-    /// the filter applied, Esc clears it.
+    /// The title/notes filter input: characters narrow the pane live, `Enter`
+    /// keeps the filter applied, `Esc` drops it entirely, and `^U` clears just
+    /// the query text. `Esc`'s cell names its scope rather than saying "clear",
+    /// which would read as interchangeable with `^U`'s.
     Filter,
     /// The same input open in **Search**, where `Esc` exits Search rather than
     /// clearing the query — so the `Esc` cell must read "leave search", not
     /// "clear", or the legend promises an affordance the pane does not honour.
+    /// `^U` is the only way to empty the query here, precisely because of that.
     SearchFilter,
 }
 
@@ -574,6 +624,19 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     ];
 
     // Overlay keys live in the reducer, not `bindings()`, so they are literal.
+    //
+    // The two chords go last in every slice they join: the row drops from the
+    // right, and not knowing `^U` costs you a few Backspaces, where not knowing
+    // `Esc` strands you in the overlay.
+    const KILL_LINE: LegendEntry = LegendEntry {
+        keys: LegendKeys::Literal("^U"),
+        label: "clear",
+    };
+    const KILL_WORD: LegendEntry = LegendEntry {
+        keys: LegendKeys::Literal("^W"),
+        label: "word",
+    };
+
     const TEXT_INPUT: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("Enter"),
@@ -583,6 +646,38 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             keys: LegendKeys::Literal("Esc"),
             label: "cancel",
         },
+        KILL_LINE,
+        KILL_WORD,
+    ];
+
+    // The due editor: `Enter`/`Esc` first (the escape hatches outrank
+    // everything), then the stepping keys, then the chords.
+    //
+    // The signs read `-/+` in *key* order: `Up` and `PageUp` step backwards, so
+    // `+/-day` would pair the first key with the wrong sign. ASCII throughout —
+    // `render_legend` takes no `ascii` flag, so a cell has no way to degrade, and
+    // every other `Literal` in this file is ASCII already. `Up/Down` is what
+    // `key_label` would print for those codes; `PgUp/PgDn` deliberately is not,
+    // because `PageUp/PageDown` is 15 cells and would evict a real verb.
+    const DUE_INPUT: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "save",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Up/Down"),
+            label: "-/+day",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("PgUp/PgDn"),
+            label: "-/+week",
+        },
+        KILL_LINE,
+        KILL_WORD,
     ];
 
     // `Tab` submits the title verbatim (no date parsing) — a key the plain
@@ -600,6 +695,8 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             keys: LegendKeys::Literal("Esc"),
             label: "cancel",
         },
+        KILL_LINE,
+        KILL_WORD,
     ];
 
     const CONFIRM: &[LegendEntry] = &[
@@ -651,7 +748,15 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     ];
 
     // The filter narrows live as you type; `Enter` keeps it applied and `Esc`
-    // clears it — neither of which the plain text-input legend would have said.
+    // discards it entirely — neither of which the plain text-input legend would
+    // have said.
+    //
+    // `Esc` reads "drop filter", not "clear": `^U` below also clears, and two
+    // cells reading the same word would assert the keys are interchangeable when
+    // they are not. `Esc` empties the query *and* closes the input *and*
+    // unfilters the pane; `^U` empties it and leaves you typing. Naming the scope
+    // on `Esc` — as `SEARCH_FILTER` already does — keeps `^U clear` reading
+    // identically in all four text legends.
     const FILTER: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("Enter"),
@@ -659,13 +764,20 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
         LegendEntry {
             keys: LegendKeys::Literal("Esc"),
-            label: "clear",
+            label: "drop filter",
         },
+        KILL_LINE,
+        KILL_WORD,
     ];
 
     // The same input in Search: `Esc` exits Search rather than clearing the query,
-    // so this cell reads "leave search" — the pane behind the input is the corpus,
-    // not a List, and "clear" would promise landing on a full result set.
+    // so that cell reads "leave search" — the pane behind the input is the corpus,
+    // not a List, and an `Esc` promising "clear" would promise landing on a full
+    // result set.
+    //
+    // `^U` is the only way to empty the query here, precisely because `Esc`
+    // leaves instead — which is why it earns a cell even though the row is
+    // otherwise the shortest in the file.
     const SEARCH_FILTER: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("Enter"),
@@ -675,12 +787,15 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             keys: LegendKeys::Literal("Esc"),
             label: "leave search",
         },
+        KILL_LINE,
+        KILL_WORD,
     ];
 
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
         LegendContext::TextInput => TEXT_INPUT,
+        LegendContext::DueInput => DUE_INPUT,
         LegendContext::TaskCapture => TASK_CAPTURE,
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,

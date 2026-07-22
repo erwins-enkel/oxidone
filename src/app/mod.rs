@@ -225,8 +225,24 @@ pub enum Overlay {
     AddTask { buffer: String },
     /// Capture a new Subtask's title, to be inserted under `parent`.
     AddSubtask { parent: TaskId, buffer: String },
-    /// Due-date entry for a Task: natural language or ISO, or empty to clear.
-    EditDue { task: TaskId, buffer: String },
+    /// Due-date entry for a Task: natural language, a bare day-of-month, or ISO
+    /// — or empty to clear.
+    ///
+    /// `pristine` marks the prefill as untouched, i.e. still *selected*: the
+    /// first printable character replaces the whole buffer rather than appending
+    /// to it, and `Backspace` clears it outright. The view draws it reversed
+    /// while it holds, so the replacement is announced rather than sprung.
+    ///
+    /// Anything that *changes* the buffer clears the flag — a character, a
+    /// `Backspace`, a chord, a step that moves — and it is never set again for
+    /// the life of the overlay. A step refused at the ends of the calendar is
+    /// the one keystroke that does not: it leaves the buffer byte-identical, so
+    /// the prefill is still untouched and still reads as selected.
+    EditDue {
+        task: TaskId,
+        buffer: String,
+        pristine: bool,
+    },
     /// Inline single-line notes editor — the fallback used when no external
     /// editor is configured. Empty clears the notes.
     EditNotes { task: TaskId, buffer: String },
@@ -267,13 +283,18 @@ impl Overlay {
             Overlay::EditTitle { buffer, .. }
             | Overlay::AddTask { buffer }
             | Overlay::AddSubtask { buffer, .. }
-            | Overlay::EditDue { buffer, .. }
             | Overlay::EditNotes { buffer, .. }
             | Overlay::AddList { buffer }
             | Overlay::RenameList { buffer, .. } => Some(buffer),
             // `Filter` has no buffer of its own — its query lives on `Model::filter`
             // and `overlay_key` routes it through `filter_key` before this path.
+            //
+            // `EditDue` *does* have one, and still answers `None`: `overlay_key`
+            // routes it through `due_editor_key` before this path, because its keys need
+            // `pristine` as well as the buffer. Returning the buffer here would be
+            // an arm nothing can reach.
             Overlay::Filter
+            | Overlay::EditDue { .. }
             | Overlay::Confirm(_)
             | Overlay::OpenLink { .. }
             | Overlay::MoveToList { .. } => None,
@@ -2624,6 +2645,8 @@ fn open_edit_due(model: &mut Model) {
         model.overlay = Some(Overlay::EditDue {
             task: task.id.clone(),
             buffer,
+            // Selected: the first keystroke replaces it.
+            pristine: true,
         });
     }
 }
@@ -2982,17 +3005,29 @@ fn exit_search(model: &mut Model) -> Vec<Command> {
 
 /// Keys for the open filter input. The query lives on `Model::filter` (the single
 /// source of truth the view filter reads), so each edit narrows the pane live and
-/// re-anchors the cursor onto a surviving row. `Enter` keeps the filter and closes
-/// the input — an all-empty query commits to `None`, since a blank filter is no
-/// filter. `Esc` clears the filter and restores the pane. Everything else is
-/// swallowed, as every other overlay does.
+/// re-anchors the cursor onto a surviving row. Characters and `Backspace` edit it,
+/// as do the readline chords `^U` (clear the query) and `^W` (drop its last word)
+/// — which matter most in **Search**, where `Esc` leaves the pane rather than
+/// clearing, so `^U` is the only way to empty the query. `Enter` keeps the filter
+/// and closes the input — an all-empty query commits to `None`, since a blank
+/// filter is no filter. Outside Search, `Esc` clears the filter and restores the
+/// pane; inside it, `Esc` leaves Search altogether (see the arm below).
+/// Everything else is swallowed, as every other overlay does.
 fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // `Some` whenever the Filter overlay is open (`open_filter` seeds it); the
     // fallback keeps this total without asserting that invariant in a panic.
     let query = model.filter.get_or_insert_with(String::new);
+    let chord = keymap::is_control_chord(key.modifiers);
     match key.code {
-        KeyCode::Char(c) => query.push(c),
+        // The chord arms precede `Char(c)`, and `Char(c)` carries the exact
+        // negation — so every `Char` event either edits or is deliberately
+        // ignored, and the AltGr exemption cannot be applied to one and
+        // forgotten on the other. This input needs it as much as any: a filter
+        // query is ordinary text, and `@` is a common thing to search for.
+        KeyCode::Char('u') if chord => query.clear(),
+        KeyCode::Char('w') if chord => kill_word(query),
+        KeyCode::Char(c) if !chord => query.push(c),
         KeyCode::Backspace => {
             query.pop();
         }
@@ -3017,14 +3052,16 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
         }
         _ => return Vec::new(),
     }
-    // A live edit (char/backspace) changed what is visible: keep the cursor on a
-    // row that still shows.
+    // A live edit — a character, `Backspace`, or either chord — changed what is
+    // visible: keep the cursor on a row that still shows. `Enter`, `Esc` and the
+    // swallowed keys all return before this.
     reselect_visible(model);
     Vec::new()
 }
 
-/// Route a key to the active overlay: the filter input, cursor keys for the link
-/// picker, yes/no for `Confirm`, text editing for the input overlays.
+/// Route a key to the active overlay: the filter input, the due editor (text
+/// editing plus stepping — see [`due_editor_key`]), cursor keys for the pickers,
+/// yes/no for `Confirm`, and text editing for the remaining input overlays.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // Three-way on the overlay's kind. "Has a text buffer, else y/n" is not
@@ -3034,6 +3071,10 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // The filter input, routed first: its query lives on `Model::filter`, not
         // a buffer, and its keys narrow the pane live rather than editing text.
         Some(Overlay::Filter) => return filter_key(model, key),
+        // The due editor, routed before the shared text arm: its keys need
+        // `pristine` alongside the buffer, and it binds four stepping keys the
+        // shared arm has no notion of.
+        Some(Overlay::EditDue { .. }) => return due_editor_key(model, key),
         // Both pickers, routed before the `Confirm` and text-buffer arms below:
         // falling through would let `y` dismiss one, or swallow its keys.
         Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {
@@ -3066,8 +3107,13 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     let Some(buffer) = model.overlay.as_mut().and_then(Overlay::input_buffer) else {
         return Vec::new();
     };
+    let chord = keymap::is_control_chord(key.modifiers);
     match key.code {
-        KeyCode::Char(c) => buffer.push(c),
+        // See `filter_key` for why the chord arms precede `Char(c)` and why that
+        // arm carries the exact negation rather than matching bare.
+        KeyCode::Char('u') if chord => buffer.clear(),
+        KeyCode::Char('w') if chord => kill_word(buffer),
+        KeyCode::Char(c) if !chord => buffer.push(c),
         KeyCode::Backspace => {
             buffer.pop();
         }
@@ -3076,6 +3122,112 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         _ => {}
     }
     Vec::new()
+}
+
+/// Keys for the due editor (named for the overlay, not the sort key `due_key`
+/// above). Text editing as the shared arm does it, plus two
+/// things only this overlay has: a *selected* prefill, and stepping.
+///
+/// **The prefill.** While `pristine`, the buffer is the Task's current due date
+/// shown as selected (the view draws it reversed). A printable character
+/// replaces it and `Backspace` clears it, so retyping a date costs one keystroke
+/// instead of ten — the friction this overlay exists to remove. Any keystroke
+/// that changes the buffer clears the flag, after which both keys behave as they
+/// do everywhere else; see [`Overlay::EditDue`] for the one that does not.
+///
+/// **Stepping.** `↑`/`↓` move a day, `PgUp`/`PgDn` a week, resolving whatever is
+/// in the buffer rather than the Task's stored date — so steps compose with
+/// typing (`friday` then `↑` is the Thursday before) and with each other. Down
+/// is *later*: the pane's `Due` sort is ascending, so `↓` already means "further
+/// along" everywhere else in the app, and `PgDn` reads as forward the way paging
+/// through a calendar does.
+///
+/// An empty or unparsable buffer lands *on* **today** — the delta ignored, in
+/// either direction — so the keys are never dead on exactly the undated Tasks
+/// that most need a date, and `↑` on one does not mean yesterday. A step that
+/// would leave the calendar leaves the buffer untouched
+/// ([`dateparse::shift_days`]), so no keystroke can panic the app.
+fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    let today = model.now.date_naive();
+    let Some(Overlay::EditDue {
+        buffer, pristine, ..
+    }) = model.overlay.as_mut()
+    else {
+        return Vec::new();
+    };
+    let chord = keymap::is_control_chord(key.modifiers);
+    // Days per press. `Up`/`PageUp` are negative — see the doc comment.
+    let step = match key.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        KeyCode::PageUp => Some(-7),
+        KeyCode::PageDown => Some(7),
+        _ => None,
+    };
+    if let Some(delta) = step {
+        let stepped = match dateparse::parse_due_relative_to(buffer, model.now) {
+            // The buffer is the base, so steps compose with what was typed.
+            Ok(base) => dateparse::shift_days(base, delta),
+            // Nothing to step from: land *on* today, ignoring the delta, so the
+            // first press in either direction reaches today and later presses
+            // move from there. Stepping to tomorrow from an empty buffer would
+            // make `↑` mean yesterday on a Task that has no date at all.
+            Err(_) => Some(today),
+        };
+        if let Some(date) = stepped {
+            *buffer = date.format("%Y-%m-%d").to_string();
+            *pristine = false;
+        }
+        // On `None` the buffer is left exactly as it was: clamping would report a
+        // date the key did not ask for, where a visible no-op is the honest
+        // reading of "there is no next day".
+        return Vec::new();
+    }
+    match key.code {
+        // Chord arms precede `Char(c)`, which carries the exact negation — see
+        // `filter_key`.
+        KeyCode::Char('u') if chord => {
+            buffer.clear();
+            *pristine = false;
+        }
+        KeyCode::Char('w') if chord => {
+            kill_word(buffer);
+            *pristine = false;
+        }
+        KeyCode::Char(c) if !chord => {
+            if *pristine {
+                buffer.clear();
+                *pristine = false;
+            }
+            buffer.push(c);
+        }
+        KeyCode::Backspace => {
+            // Deleting a selection deletes all of it, which is what the reversed
+            // prefill invokes; once edited, it pops one character as usual.
+            if *pristine {
+                buffer.clear();
+                *pristine = false;
+            } else {
+                buffer.pop();
+            }
+        }
+        KeyCode::Enter => return submit_input(model, false),
+        KeyCode::Esc => model.overlay = None,
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Delete the word before the cursor, readline's `unix-word-rubout`: drop any
+/// trailing whitespace, then the run of non-whitespace behind it.
+/// `"call Bob re: the invoice"` → `"call Bob re: the "`.
+fn kill_word(buffer: &mut String) {
+    buffer.truncate(buffer.trim_end().len());
+    let keep = buffer.rfind(char::is_whitespace).map_or(0, |i| {
+        i + buffer[i..].chars().next().map_or(1, char::len_utf8)
+    });
+    buffer.truncate(keep);
 }
 
 /// Keys shared by both pickers: `j`/`k` move the cursor, `Esc` cancels, and
@@ -3143,7 +3295,7 @@ fn submit_input(model: &mut Model, literal: bool) -> Vec<Command> {
         Some(Overlay::AddSubtask { parent, buffer }) => {
             finish_add_subtask(model, parent, buffer, literal)
         }
-        Some(Overlay::EditDue { task, buffer }) => finish_edit_due(model, task, buffer),
+        Some(Overlay::EditDue { task, buffer, .. }) => finish_edit_due(model, task, buffer),
         Some(Overlay::EditNotes { task, buffer }) => finish_edit_notes(model, task, Some(buffer)),
         Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),
         Some(Overlay::RenameList { list, buffer }) => finish_rename_list(model, list, buffer),
@@ -3206,7 +3358,13 @@ fn finish_edit_due(model: &mut Model, task: TaskId, buffer: String) -> Vec<Comma
             Err(_) => {
                 model.status_line = Some(format!("could not parse due date: {trimmed:?}"));
                 // Keep the overlay open so the user can fix the input.
-                model.overlay = Some(Overlay::EditDue { task, buffer });
+                // Not pristine: this is the user's own text, being corrected,
+                // so the next character must append rather than wipe it.
+                model.overlay = Some(Overlay::EditDue {
+                    task,
+                    buffer,
+                    pristine: false,
+                });
                 return Vec::new();
             }
         }

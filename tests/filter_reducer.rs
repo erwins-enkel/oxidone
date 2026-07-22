@@ -72,6 +72,19 @@ fn titles(tasks: &[&Task]) -> Vec<String> {
     tasks.iter().map(|t| t.title.clone()).collect()
 }
 
+/// A `Ctrl`-chord: CONTROL alone.
+fn chord(c: char) -> Message {
+    Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+}
+
+/// AltGr, as a Windows console reports it: CONTROL and ALT together.
+fn altgr(c: char) -> Message {
+    Message::Key(KeyEvent::new(
+        KeyCode::Char(c),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+}
+
 /// Type each character of `s` into the model in order.
 fn typed(m: &mut Model, s: &str) {
     for c in s.chars() {
@@ -305,4 +318,97 @@ fn matches_the_display_title_not_the_raw_glyph() {
     update(&mut m, ch('/'));
     typed(&mut m, "standup");
     assert_eq!(titles(&m.visible_tasks()), vec!["○ standup"]);
+}
+
+// ---- Kill chords in the query input ----
+//
+// `filter_key` owns its own chord arms, so it can carry the bare-`contains`
+// defect independently of the shared text arm — hence the AltGr case here too.
+// `^U` matters most in **Search**, where `Esc` leaves the pane rather than
+// clearing (since the global Search pane landed), so it is the only way to empty
+// the query short of holding Backspace.
+
+#[test]
+fn control_u_empties_the_query_and_rewidens_the_pane() {
+    let mut m = model_with(vec![
+        task_in("L", "report", None),
+        task_in("L", "standup", None),
+    ]);
+    update(&mut m, ch('/'));
+    typed(&mut m, "rep");
+    assert_eq!(m.filter.as_deref(), Some("rep"));
+    assert_eq!(titles(&m.visible_tasks()), vec!["report"], "narrowed");
+
+    update(&mut m, chord('u'));
+    assert_eq!(m.filter.as_deref(), Some(""), "^U empties the query");
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["report", "standup"],
+        "and the pane widens back — an empty query matches everything"
+    );
+    // Emptied, not closed: the input is still open for a fresh query.
+    assert!(m.overlay.is_some());
+}
+
+/// The case `^U` exists for. In **Search** `Esc` leaves the pane rather than
+/// clearing the query, so short of holding Backspace the chord is the only way
+/// to empty it — which is why `SEARCH_FILTER` spends a legend cell on it.
+#[test]
+fn control_u_is_the_only_clear_in_search() {
+    let mut m = model_with(vec![]);
+    update(&mut m, ch('S'));
+    update(
+        &mut m,
+        Message::SearchLoaded {
+            tasks: vec![task_in("L", "report", None), task_in("L", "standup", None)],
+            failed: Vec::new(),
+            live: true,
+        },
+    );
+    assert!(m.search_active());
+
+    typed(&mut m, "rep");
+    assert_eq!(titles(&m.visible_tasks()), vec!["report"], "narrowed");
+
+    update(&mut m, chord('u'));
+    assert_eq!(m.filter.as_deref(), Some(""), "^U empties the query");
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["report", "standup"],
+        "the corpus is visible again"
+    );
+    assert!(
+        m.search_active(),
+        "^U clears and stays; only Esc leaves Search"
+    );
+}
+
+#[test]
+fn control_w_deletes_a_word_and_types_no_literal() {
+    let mut m = model_with(vec![task_in("L", "weekly report", None)]);
+    update(&mut m, ch('/'));
+    typed(&mut m, "weekly rep");
+
+    update(&mut m, chord('w'));
+    assert_eq!(
+        m.filter.as_deref(),
+        Some("weekly "),
+        "^W deletes the last word, and must not append a literal 'w'"
+    );
+}
+
+#[test]
+fn altgr_types_into_the_query_even_on_a_chord_letter() {
+    let mut m = model_with(vec![task_in("L", "mail", None)]);
+    update(&mut m, ch('/'));
+    typed(&mut m, "a");
+
+    update(&mut m, altgr('u'));
+    update(&mut m, altgr('w'));
+    update(&mut m, altgr('@'));
+    assert_eq!(
+        m.filter.as_deref(),
+        Some("auw@"),
+        "AltGr must type into a filter query — `@` is a common thing to search for"
+    );
 }

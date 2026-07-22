@@ -27,6 +27,11 @@ a Tasks costume.
 - Move a task to another list (`M`), from a list or from Today
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
+- The due editor (`d`) opens with the current date selected, so the first
+  keystroke replaces it: a bare `15` means the next 15th, `↑`/`↓` step a day and
+  `PgUp`/`PgDn` a week, and a live preview names the weekday and how far off it
+  is before you commit. `^U` clears the line and `^W` the last word, in every
+  text input
 - Bullet Journal entry types — Task, Event (`○`), Note (`—`) — flipped with
   `t`/`T`, and migration (`m`) to push an entry forward a day
 - Notes edited in your `$EDITOR`

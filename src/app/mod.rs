@@ -3014,7 +3014,7 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
     // `Some` whenever the Filter overlay is open (`open_filter` seeds it); the
     // fallback keeps this total without asserting that invariant in a panic.
     let query = model.filter.get_or_insert_with(String::new);
-    let chord = keymap::is_kill_chord(key.modifiers);
+    let chord = keymap::is_control_chord(key.modifiers);
     match key.code {
         // The chord arms precede `Char(c)`, and `Char(c)` carries the exact
         // negation — so every `Char` event either edits or is deliberately
@@ -3103,7 +3103,7 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     let Some(buffer) = model.overlay.as_mut().and_then(Overlay::input_buffer) else {
         return Vec::new();
     };
-    let chord = keymap::is_kill_chord(key.modifiers);
+    let chord = keymap::is_control_chord(key.modifiers);
     match key.code {
         // See `filter_key` for why the chord arms precede `Char(c)` and why that
         // arm carries the exact negation rather than matching bare.
@@ -3151,7 +3151,7 @@ fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Com
     else {
         return Vec::new();
     };
-    let chord = keymap::is_kill_chord(key.modifiers);
+    let chord = keymap::is_control_chord(key.modifiers);
     // Days per press. `Up`/`PageUp` are negative — see the doc comment.
     let step = match key.code {
         KeyCode::Up => Some(-1),

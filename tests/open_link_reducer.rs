@@ -337,6 +337,10 @@ async fn the_picker_shows_links_before_notes_urls_with_their_descriptions() {
 /// the binding table exactly as before. That exemption is behaviourally
 /// load-bearing in the text overlays, where swallowing it would stop `@ \ ~ |`
 /// being typable; it is asserted there, not here.
+///
+/// It is also scoped to `u`/`w`: every other Ctrl chord still resolves as it
+/// always has, which the `Ctrl-Q` case below pins so the narrowing cannot widen
+/// by accident.
 #[tokio::test]
 async fn a_kill_chord_in_the_task_pane_is_not_a_pane_verb() {
     let mut m = model_with_notes("see https://a.dev/1").await;
@@ -353,5 +357,29 @@ async fn a_kill_chord_in_the_task_pane_is_not_a_pane_verb() {
     assert_eq!(
         m.hide_distant, distant_before,
         "^W must not toggle the distant-due filter"
+    );
+}
+
+/// The other side of that narrowing. The binding table is modifier-blind
+/// throughout, so `Ctrl-Q` has always quit and `Ctrl-C` has always toggled
+/// Completed; this change leaves both exactly as they were rather than silently
+/// gating keys it neither introduced nor advertised. Making the whole table
+/// modifier-aware is tracked separately (#105) — until then, this pins that the
+/// `u`/`w` gate did not quietly become a blanket one.
+#[tokio::test]
+async fn other_control_chords_still_resolve_as_before() {
+    let mut m = model_with_notes("plain").await;
+    let completed_before = m.show_completed;
+
+    update(&mut m, chord('c'));
+    assert_ne!(
+        m.show_completed, completed_before,
+        "^C still reaches `c` → ToggleShowCompleted, as it always has"
+    );
+
+    update(&mut m, chord('q'));
+    assert!(
+        m.should_quit,
+        "^Q still reaches `q` → Quit, as it always has"
     );
 }

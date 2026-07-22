@@ -321,18 +321,26 @@ pub fn bindings() -> &'static [Binding] {
 
 /// Resolve a key press to its bound `Action`, if any.
 ///
-/// The verbs are plain keys, so modifiers are ignored — with one exception: a
-/// kill chord ([`is_kill_chord`]) resolves to nothing, because `^U` and `^W` are
-/// text-editing keys this app advertises, and `u`/`w` are bound to verbs one of
-/// which opens a browser.
+/// The verbs are plain keys, so modifiers are ignored — with one exception:
+/// `^U` and `^W` resolve to nothing, because they are text-editing keys this app
+/// advertises, and `u`/`w` are bound to verbs one of which opens a browser. Every
+/// other Ctrl chord still resolves as if unmodified (see the body).
 pub fn resolve(key: KeyEvent) -> Option<Action> {
-    // A kill chord is text editing, never a pane verb. `^U` and `^W` are
-    // advertised in four overlay legends, so they become muscle memory — and a
-    // press landing just outside an overlay (a beat before `d` opens it, a beat
-    // after `Enter` closes it) arrives here instead. Without this, `^U` would
-    // resolve to `u` → `OpenLink`, which spawns a browser for a single-link
-    // Task, and `^W` to `w` → `ToggleHideDistant`, silently emptying the pane.
-    if is_kill_chord(key.modifiers) {
+    // `^U` and `^W` are advertised in four overlay legends, so they become
+    // muscle memory — and a press landing just outside an overlay (a beat before
+    // `d` opens it, a beat after `Enter` closes it) arrives here instead. Without
+    // this, `^U` would resolve to `u` → `OpenLink`, which spawns a browser for a
+    // single-link Task, and `^W` to `w` → `ToggleHideDistant`, silently emptying
+    // the pane.
+    //
+    // Scoped to those two keys rather than to every Ctrl chord, deliberately.
+    // This table is modifier-blind throughout — `Ctrl-Q` quits, `Ctrl-C` toggles
+    // Completed — and that is left exactly as it was: gating the lot would
+    // silently change two more keys in a change that neither introduced nor
+    // advertised them. Making the whole table modifier-aware is a decision of its
+    // own, with its own tests, tracked in #105. What is gated here is only what
+    // this app now *teaches* the user to press.
+    if is_control_chord(key.modifiers) && matches!(key.code, KeyCode::Char('u' | 'w')) {
         return None;
     }
     bindings()
@@ -341,8 +349,10 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         .map(|b| b.action)
 }
 
-/// Whether this keystroke is a kill chord (`^U`, `^W`) rather than text or a
-/// pane verb.
+/// Whether this keystroke is a `Ctrl` chord rather than text — `CONTROL` on any
+/// key, not just the two this app binds. Callers that care about a *particular*
+/// chord match the key code as well; callers that just need "this is not a
+/// character" (the text overlays, so `^A` does not type an `a`) use it as it is.
 ///
 /// `CONTROL` **without** `ALT`, not "either of them":
 ///
@@ -357,7 +367,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
 /// Lives here rather than in `app` because [`resolve`] reads it too, and `app`
 /// depends on `keymap` and not the reverse. Deciding whether a keystroke is a
 /// chord is this module's job anyway.
-pub fn is_kill_chord(m: KeyModifiers) -> bool {
+pub fn is_control_chord(m: KeyModifiers) -> bool {
     m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT)
 }
 

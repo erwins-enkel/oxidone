@@ -282,23 +282,38 @@ fn the_open_input_legend_says_leave_search_not_clear() {
     let line = legend(&m, WIDTH);
     assert!(
         line.contains("Esc leave search"),
-        "Search's filter legend must not promise clear: {line:?}"
+        "Search's filter legend must say what Esc really does: {line:?}"
     );
+    // `Esc` must not promise clearing — it leaves the pane. The row does offer a
+    // clear, on `^U`, which is the only way to empty the query here precisely
+    // because `Esc` leaves instead.
     assert!(
         !line.contains("Esc clear"),
-        "and it must not say clear: {line:?}"
+        "Esc must not promise clear: {line:?}"
+    );
+    assert!(
+        line.contains("^U clear"),
+        "^U is Search's only clear-the-query affordance: {line:?}"
     );
 }
 
 #[test]
-fn a_list_pane_filter_still_says_clear() {
-    // The `/` legend from #96 is untouched in a List pane.
+fn a_list_pane_filter_names_the_scope_esc_acts_on() {
+    // A List-pane `/` still offers a way out that unfilters the pane — but it is
+    // labelled "drop filter", not "clear", now that `^U` also clears. Two cells
+    // reading "clear" would assert the keys are interchangeable: `Esc` empties
+    // the query *and* closes the input *and* unfilters the pane, where `^U`
+    // empties it and leaves you typing.
     let mut m = list_model(&[("work", "WORK")], vec![undated("a", "work")]);
     update(&mut m, press('/'));
     let line = legend(&m, WIDTH);
     assert!(
-        line.contains("Esc clear"),
-        "a List-pane filter keeps the clear affordance: {line:?}"
+        line.contains("Esc drop filter"),
+        "a List-pane filter keeps its unfilter affordance: {line:?}"
+    );
+    assert!(
+        line.contains("^U clear"),
+        "and gains the text-level clear: {line:?}"
     );
 }
 

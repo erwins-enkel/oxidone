@@ -16,6 +16,11 @@ fn ch(c: char) -> Message {
     key(KeyCode::Char(c))
 }
 
+/// A `Ctrl`-chord: CONTROL alone.
+fn chord(c: char) -> Message {
+    Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+}
+
 /// A single Task carrying `notes`, with the task pane focused.
 async fn model_with_notes(notes: &str) -> Model {
     model_with(notes, Vec::new()).await
@@ -319,4 +324,34 @@ async fn the_picker_shows_links_before_notes_urls_with_their_descriptions() {
         }
         other => panic!("expected OpenLink overlay, got {other:?}"),
     }
+}
+
+/// `^U` and `^W` are advertised in four overlay legends (clear line / delete
+/// word), so they become muscle memory. A press landing just outside an overlay
+/// reaches `keymap::resolve`, where `u` is `OpenLink` and `w` is
+/// `ToggleHideDistant` — and `resolve` matched on `key.code` alone until the
+/// guard landed. Without it, a stray `^U` on a single-link Task launches a
+/// browser: the one outcome this file's header promises no test here produces.
+///
+/// The guard is CONTROL *alone*, so AltGr (CONTROL|ALT) still falls through to
+/// the binding table exactly as before. That exemption is behaviourally
+/// load-bearing in the text overlays, where swallowing it would stop `@ \ ~ |`
+/// being typable; it is asserted there, not here.
+#[tokio::test]
+async fn a_kill_chord_in_the_task_pane_is_not_a_pane_verb() {
+    let mut m = model_with_notes("see https://a.dev/1").await;
+    // Exactly one openable link, so a bare `u` would open it with no picker.
+    assert!(matches!(update(&mut m, ch('u'))[..], [Command::OpenUrl(_)]));
+
+    let distant_before = m.hide_distant;
+    let cmds = update(&mut m, chord('u'));
+    assert!(cmds.is_empty(), "^U must not open a link: {cmds:?}");
+    assert!(m.overlay.is_none());
+
+    let cmds = update(&mut m, chord('w'));
+    assert!(cmds.is_empty());
+    assert_eq!(
+        m.hide_distant, distant_before,
+        "^W must not toggle the distant-due filter"
+    );
 }

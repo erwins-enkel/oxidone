@@ -1,16 +1,19 @@
-//! Pure due-date parsing and display. Parsing accepts natural language (`today`,
-//! `tomorrow`, `mon`, `+3d`) via `interim` and ISO `YYYY-MM-DD`, resolves
-//! everything in the caller's reference timezone, and strips any time component
-//! down to a `chrono::NaiveDate` (CONTEXT.md: a due date is a date, never a
-//! time). Display is the inverse: a date rendered relative to a reference day.
+//! Pure due-date parsing, arithmetic and display. Parsing accepts a bare
+//! day-of-month (`15`), natural language (`today`, `tomorrow`, `mon`, `+3d`) via
+//! `interim`, and ISO `YYYY-MM-DD`; it resolves everything in the caller's
+//! reference timezone and strips any time component down to a
+//! `chrono::NaiveDate` (CONTEXT.md: a due date is a date, never a time). Display
+//! is the inverse: a date rendered relative to a reference day. Between them sits
+//! one computation *over* dates, [`shift_days`], for callers nudging a date a day
+//! or a week at a time.
 //!
-//! No I/O and no clock of its own: both entry points take an explicit reference
-//! (`now` / `today`), so relative expressions, local-boundary behaviour and
-//! relative rendering are resolved by the caller (the runtime stamps the clock at
-//! the impure edge) and are deterministically testable without touching the
-//! machine clock.
+//! No I/O and no clock of its own: the entry points that need a reference take an
+//! explicit one (`now` / `today`), so relative expressions, local-boundary
+//! behaviour and relative rendering are resolved by the caller (the runtime
+//! stamps the clock at the impure edge) and are deterministically testable
+//! without touching the machine clock.
 
-use chrono::{DateTime, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone};
 use interim::{parse_date_string, Dialect};
 
 /// The input could not be understood as a due date. Carries the offending text
@@ -24,9 +27,10 @@ pub struct DueParseError(pub String);
 /// (in any `TimeZone`) to exercise natural-language and local-boundary cases
 /// deterministically.
 ///
-/// Recognises, in order: ISO `YYYY-MM-DD` (unambiguous, date-only fast path),
-/// then `interim`'s natural language (`today`, `tomorrow`, weekday names, `+3d`,
-/// month names, …). Any time component the parser infers is discarded.
+/// Recognises, in order: a bare day-of-month 1–31 (`15` → the next 15th, on or
+/// after today), ISO `YYYY-MM-DD` (unambiguous, date-only fast path), then
+/// `interim`'s natural language (`today`, `tomorrow`, weekday names, `+3d`, month
+/// names, …). Any time component the parser infers is discarded.
 pub fn parse_due_relative_to<Tz: TimeZone>(
     input: &str,
     now: DateTime<Tz>,
@@ -34,6 +38,24 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(DueParseError(input.to_string()));
+    }
+    // Bare day-of-month, ahead of the `+` strip below so a signed number keeps
+    // whatever the paths after it make of it rather than becoming a day-of-month
+    // (`+15` stays `interim`'s reading, year 15 — odd, but long-standing and not
+    // this branch's to change). Two guards, deliberately:
+    //
+    //   * the ASCII-digit test, because `u32::from_str` accepts a leading sign —
+    //     `"+15".parse()` succeeds, so a parse-only guard would swallow `+15`
+    //     and `+3` into this branch;
+    //   * the *fallible* parse, because the digit test bounds shape and not
+    //     magnitude: an all-digit string can still overflow `u32`, and must fall
+    //     through rather than reach an `unwrap`.
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(day) = trimmed.parse::<u32>() {
+            if let Some(date) = next_day_of_month(now.date_naive(), day) {
+                return Ok(date);
+            }
+        }
     }
     // ISO fast path: unambiguous and already date-only, so it never depends on
     // `now` or the dialect.
@@ -49,6 +71,50 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
     parse_date_string(relative, now, Dialect::Uk)
         .map(|dt| dt.date_naive())
         .map_err(|_| DueParseError(input.to_string()))
+}
+
+/// The next occurrence of `day` as a day-of-month, on or after `today` —
+/// `None` if `day` is not a possible day-of-month at all.
+///
+/// Rolls forward: on 2026-07-22, `15` is 2026-08-15 while `25` is 2026-07-25 and
+/// `22` is today. Due dates are overwhelmingly future-facing, so a bare number
+/// that has already passed this month means next month's.
+///
+/// Month length is handled by `from_ymd_opt` returning `None` for a day the month
+/// does not have, which makes the rule "the next month that *has* that day":
+/// on 2026-02-05, `31` is 2026-03-31.
+fn next_day_of_month(today: NaiveDate, day: u32) -> Option<NaiveDate> {
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    let (mut year, mut month) = (today.year(), today.month());
+    // Bounded rather than looping until it lands: every day in 1..=31 occurs
+    // within twelve months, and the bound keeps this total if the calendar (or
+    // the range above) ever stops guaranteeing that.
+    for _ in 0..12 {
+        if let Some(candidate) = NaiveDate::from_ymd_opt(year, month, day) {
+            if candidate >= today {
+                return Some(candidate);
+            }
+        }
+        (year, month) = if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        };
+    }
+    None
+}
+
+/// The date `delta` days from `base`, or `None` at the ends of the calendar.
+///
+/// Checked because callers step a date the *user* typed: `NaiveDate`'s `Add`
+/// panics on overflow, and `+262143-12-31` parses (chrono's `%Y` takes a leading
+/// sign for years outside `0..=9999`), so an unchecked `+ Duration::days(1)`
+/// there would take the whole TUI down on a keystroke. A caller that cannot
+/// move simply does not move.
+pub fn shift_days(base: NaiveDate, delta: i64) -> Option<NaiveDate> {
+    base.checked_add_signed(chrono::Duration::days(delta))
 }
 
 /// Split a capture buffer into a display title and an optional due date by
@@ -98,12 +164,18 @@ fn word_start_offsets(s: &str) -> Vec<usize> {
 }
 
 /// The false-positive gate for [`split_title_and_due`]: is this trailing
-/// candidate specific enough to *mean* a date? `interim` will happily read a
-/// bare month name as the first of that month and a bare number as a (year)
-/// date, which would silently eat ordinary title words (`Prep for May`, `Buy
-/// milk 2`). So a **single** token that is a bare month name or all digits is
-/// rejected; every other single token (`3d`, `friday`, `tomorrow`, an ISO date)
-/// and every multi-token candidate is left for the parser to accept or reject.
+/// candidate specific enough to *mean* a date? A bare month name and a bare
+/// number both parse — `interim` reads a month name as the first of that month,
+/// and [`parse_due_relative_to`] reads `15` as the next 15th — so without this
+/// gate they would silently eat ordinary title words (`Prep for May`, `Buy milk
+/// 2`, `Sprint 17`). So a **single** token that is a bare month name or all
+/// digits is rejected; every other single token (`3d`, `friday`, `tomorrow`, an
+/// ISO date) and every multi-token candidate is left for the parser to accept or
+/// reject.
+///
+/// This is the only thing keeping the bare-day-of-month rule out of title
+/// splitting, which is why it stays even though the reason it was first written
+/// (`interim` reading a bare number as a year) is now the lesser one.
 fn looks_like_date_phrase(candidate: &str) -> bool {
     let mut tokens = candidate.split_whitespace();
     let (Some(first), None) = (tokens.next(), tokens.next()) else {
@@ -211,6 +283,115 @@ mod tests {
                 "input {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_bare_number_is_the_next_day_of_that_month() {
+        // `now()` is 2026-07-20.
+        let cases = [
+            // Already past this month, so it rolls forward.
+            ("15", ymd(2026, 8, 15)),
+            // Still to come this month.
+            ("25", ymd(2026, 7, 25)),
+            // Today itself — "on or after", not "strictly after".
+            ("20", ymd(2026, 7, 20)),
+            ("31", ymd(2026, 7, 31)),
+            ("1", ymd(2026, 8, 1)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_due_relative_to(input, now()),
+                Ok(expected),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_number_skips_a_month_that_lacks_that_day() {
+        // 2026-02-05: February has no 31st, so the next 31st is in March.
+        let february = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 2, 5, 12, 0, 0)
+            .unwrap();
+        assert_eq!(parse_due_relative_to("31", february), Ok(ymd(2026, 3, 31)));
+        // 2026 is not a leap year, so February has no 30th either.
+        assert_eq!(parse_due_relative_to("30", february), Ok(ymd(2026, 3, 30)));
+        // 28 does exist in February, and is still to come.
+        assert_eq!(parse_due_relative_to("28", february), Ok(ymd(2026, 2, 28)));
+    }
+
+    /// A signed number must not reach the day-of-month branch. `u32::from_str`
+    /// accepts a leading sign, so `"+15".parse()` succeeds — a parse-only guard
+    /// would read `+15` as the 15th. The ASCII-digit test is what stops it.
+    ///
+    /// What `+15` *does* mean is `interim`'s business and unchanged by this
+    /// module: it strips the `+` and reads the bare number as a year. That is
+    /// long-standing behaviour, asserted here only to pin that the new branch
+    /// left it alone — the year reading is what makes it unmistakably *not* a
+    /// day-of-month.
+    #[test]
+    fn a_signed_number_never_reaches_the_day_of_month_branch() {
+        assert_eq!(parse_due_relative_to("+15", now()), Ok(ymd(15, 1, 1)));
+        assert_eq!(parse_due_relative_to("+3", now()), Ok(ymd(3, 1, 1)));
+        // The day-of-month reading these would have had, for contrast.
+        assert_ne!(parse_due_relative_to("+15", now()), Ok(ymd(2026, 8, 15)));
+    }
+
+    /// Digits outside 1–31 fall through the day-of-month branch untouched.
+    /// `interim` then reads them as years, exactly as before this branch existed
+    /// — the assertion is "unchanged", not "rejected".
+    #[test]
+    fn an_out_of_range_number_is_not_a_day_of_month() {
+        for (input, expected) in [
+            ("0", ymd(0, 1, 1)),
+            ("32", ymd(32, 1, 1)),
+            ("99", ymd(99, 1, 1)),
+        ] {
+            assert_eq!(
+                parse_due_relative_to(input, now()),
+                Ok(expected),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// All digits and far past `u32`. The fallible parse is what keeps this a
+    /// parse error rather than a panic — the case that fails loudly if the guard
+    /// is ever rewritten as an `unwrap` on "already-validated digits".
+    #[test]
+    fn an_oversized_all_digit_string_is_an_error_not_a_panic() {
+        assert!(parse_due_relative_to("99999999999999999999", now()).is_err());
+        assert!(parse_due_relative_to(&"9".repeat(400), now()).is_err());
+    }
+
+    #[test]
+    fn shift_days_moves_by_whole_days() {
+        let base = ymd(2026, 7, 20);
+        assert_eq!(shift_days(base, 1), Some(ymd(2026, 7, 21)));
+        assert_eq!(shift_days(base, -1), Some(ymd(2026, 7, 19)));
+        assert_eq!(shift_days(base, 7), Some(ymd(2026, 7, 27)));
+        assert_eq!(shift_days(base, -7), Some(ymd(2026, 7, 13)));
+        // Across a month and a year boundary.
+        assert_eq!(shift_days(ymd(2026, 7, 31), 1), Some(ymd(2026, 8, 1)));
+        assert_eq!(shift_days(ymd(2026, 12, 31), 1), Some(ymd(2027, 1, 1)));
+        assert_eq!(shift_days(base, 0), Some(base));
+    }
+
+    /// The unconditional boundary proof. A reducer-level test cannot stand in
+    /// for this: it depends on chrono accepting a wide-year buffer, and if it
+    /// declines the step simply falls back to today and the test passes for the
+    /// wrong reason.
+    #[test]
+    fn shift_days_declines_at_the_ends_of_the_calendar() {
+        assert_eq!(shift_days(NaiveDate::MAX, 1), None);
+        assert_eq!(shift_days(NaiveDate::MIN, -1), None);
+        assert_eq!(shift_days(NaiveDate::MAX, 7), None);
+        assert_eq!(shift_days(NaiveDate::MIN, -7), None);
+        // The ends themselves are still reachable, so this is a boundary and
+        // not an off-by-one.
+        assert_eq!(shift_days(NaiveDate::MAX, 0), Some(NaiveDate::MAX));
+        assert_eq!(shift_days(NaiveDate::MAX, -1), NaiveDate::MAX.pred_opt());
     }
 
     #[test]

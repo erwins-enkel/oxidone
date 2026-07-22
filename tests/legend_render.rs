@@ -168,3 +168,66 @@ fn the_new_cells_do_not_evict_link_at_the_width_where_it_fits() {
     assert!(legend.contains("u link"), "link evicted at 120: {legend}");
     assert!(legend.contains("m migrate"), "{legend}");
 }
+
+// --- The due editor's legend -------------------------------------------------
+//
+// Its cells total 76 columns (10 + 10 + 14 + 17 + 8 + 7, plus five 2-column
+// gaps), so the whole row fits the default terminal — but "it fits" is the
+// weaker half. The row drops from the right, so the *order* is the drop order,
+// and only a narrow width can observe it. A wide-only assertion would pass
+// against a row that evicts `Esc cancel` first.
+
+/// The due overlay, open on a Task with no due date (so the buffer is empty and
+/// nothing about the prefill matters here).
+fn model_with_due_editor() -> Model {
+    let mut model = Model::new();
+    model.overlay = Some(oxidone::app::Overlay::EditDue {
+        task: oxidone::domain::TaskId("t".into()),
+        buffer: String::new(),
+        pristine: false,
+    });
+    model
+}
+
+#[test]
+fn the_due_editor_legend_fits_the_default_terminal() {
+    let model = model_with_due_editor();
+    let row = rows(&model).last().expect("a legend row").clone();
+    for cell in [
+        "Enter save",
+        "Esc cancel",
+        "Up/Down -/+day",
+        "PgUp/PgDn -/+week",
+        "^U clear",
+        "^W word",
+    ] {
+        assert!(
+            row.contains(cell),
+            "{cell:?} missing at 80 columns: {row:?}"
+        );
+    }
+}
+
+/// Narrowing evicts from the right, in order: `^W`, then `^U`, then the stepping
+/// keys — and `Enter`/`Esc` survive longest, because not knowing them strands
+/// you in the overlay while not knowing `^U` costs a few Backspaces.
+#[test]
+fn the_due_editor_legend_drops_the_chords_before_the_escape_hatches() {
+    let model = model_with_due_editor();
+
+    let narrow = rows_at(&model, 70).last().expect("a legend row").clone();
+    assert!(
+        !narrow.contains("^W word"),
+        "^W should drop first at 70 columns: {narrow:?}"
+    );
+    assert!(narrow.contains("Enter save"), "{narrow:?}");
+    assert!(narrow.contains("Esc cancel"), "{narrow:?}");
+
+    let narrower = rows_at(&model, 30).last().expect("a legend row").clone();
+    assert!(!narrower.contains("^U clear"), "{narrower:?}");
+    assert!(!narrower.contains("Up/Down"), "{narrower:?}");
+    assert!(
+        narrower.contains("Enter save") && narrower.contains("Esc cancel"),
+        "the escape hatches are the last to go: {narrower:?}"
+    );
+}

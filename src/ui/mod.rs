@@ -21,7 +21,7 @@ use ratatui::Frame;
 use std::collections::HashMap;
 
 use crate::app::{renders_as_subtask, Focus, Model, Overlay};
-use crate::dateparse::{format_due_relative, split_title_and_due};
+use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task};
 use crate::keymap;
 use crate::links::{self, Link};
@@ -97,16 +97,20 @@ fn render_overlay(
     now: DateTime<Local>,
     theme: &Theme,
 ) {
-    // Every overlay but the picker is one or two lines of text in a popup. The
-    // add-entry captures grow to a second line when a trailing date is
-    // recognised (see `capture_lines`); the rest are always a single line.
+    // Every overlay but the picker is one or two lines of text in a popup, in
+    // two shapes: the add-entry captures grow a second line only when a trailing
+    // date is recognised (see `capture_lines`), while the due editor always has
+    // one (see `due_lines`) because its whole job is to say what `Enter` will do.
+    // The rest are a single line.
     let (title, lines): (&str, Vec<Line>) = match overlay {
         Overlay::EditTitle { buffer, .. } => ("Edit title", vec![input_line(buffer)]),
         Overlay::AddTask { buffer } => ("Add task", capture_lines(buffer, now, theme)),
         Overlay::AddSubtask { buffer, .. } => ("Add subtask", capture_lines(buffer, now, theme)),
-        Overlay::EditDue { buffer, .. } => {
-            ("Edit due date (blank clears)", vec![input_line(buffer)])
-        }
+        // No "(blank clears)" here, unlike the notes editor below: `due_lines`
+        // says it live, on the line beneath, exactly when the buffer is empty.
+        Overlay::EditDue {
+            buffer, pristine, ..
+        } => ("Edit due date", due_lines(buffer, *pristine, now, theme)),
         Overlay::EditNotes { buffer, .. } => {
             ("Edit notes (blank clears)", vec![input_line(buffer)])
         }
@@ -137,6 +141,74 @@ fn render_overlay(
 /// The editable line of a text overlay: the buffer trailed by a cursor bar.
 fn input_line(buffer: &str) -> Line<'static> {
     Line::from(format!("{buffer}▏"))
+}
+
+/// Lines for the due editor: the input line, plus an always-present preview of
+/// what `Enter` will do.
+///
+/// While `pristine` the buffer is drawn reversed — the terminal's own selection
+/// idiom — because the next character replaces it. The trailing cursor bar stays
+/// *outside* that span: reversed it would render as a filled block, reading as a
+/// second cursor or a stray cell of highlight past the end of the selection.
+///
+/// The preview branches on `buffer.trim()`, matching `finish_edit_due`'s own
+/// trim. That is load-bearing, not tidiness: a whitespace-only buffer is a
+/// *clear* to the reducer but a parse error to `parse_due_relative_to`, so
+/// branching on the raw buffer would render "not a date" in red while `Enter`
+/// cheerfully cleared the date.
+fn due_lines(
+    buffer: &str,
+    pristine: bool,
+    now: DateTime<Local>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let input = if pristine {
+        Line::from(vec![
+            Span::styled(
+                buffer.to_string(),
+                Style::new().add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw("▏"),
+        ])
+    } else {
+        input_line(buffer)
+    };
+    let trimmed = buffer.trim();
+    let (preview, fg) = if trimmed.is_empty() {
+        ("→ clears the due date".to_string(), theme.subtext)
+    } else {
+        match dateparse::parse_due_relative_to(trimmed, now) {
+            Ok(due) => (
+                format!("→ {}", format_due_preview(due, now.date_naive())),
+                theme.subtext,
+            ),
+            Err(_) => ("→ not a date".to_string(), theme.overdue),
+        }
+    };
+    vec![input, Line::styled(preview, Style::new().fg(fg))]
+}
+
+/// A resolved due date, for the editor's preview: weekday, ISO date, and how far
+/// off it is — `Fri 2026-08-14 · in 23d`.
+///
+/// Deliberately not [`format_due_relative`], which serves the task pane's fixed
+/// due column and is capped at `MAX_RENDERED_WIDTH`; that cap is why it must drop
+/// the distance in favour of the ISO date past a week, showing one fact or the
+/// other. The preview has the width for both, and needs both: the ISO date
+/// answers "which day", the distance answers "how soon", and a date typed as
+/// `friday` or `15` gives you neither until it is echoed back.
+///
+/// The distance words match `format_due_relative`'s where they overlap, so one
+/// date never reads two ways with the pane on screen behind the popup.
+fn format_due_preview(due: NaiveDate, today: NaiveDate) -> String {
+    let distance = match (due - today).num_days() {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        -1 => "yesterday".to_string(),
+        d if d > 0 => format!("in {d}d"),
+        d => format!("{}d ago", -d),
+    };
+    format!("{} · {distance}", due.format("%a %Y-%m-%d"))
 }
 
 /// Lines for an add-entry capture: the input line, plus — only when a trailing
@@ -1167,9 +1239,11 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
-        // The same overlay in Search advertises `Esc leave search`, not `Esc
-        // clear` — the pane behind it is the corpus, so "clear" would promise the
-        // wrong affordance (matching `filter_key`'s Search-aware `Esc`).
+        // The same overlay in Search advertises `Esc leave search` rather than
+        // `Esc drop filter`: the pane behind it is the corpus, not a List, so
+        // `Esc` leaves Search outright (matching `filter_key`'s Search-aware
+        // `Esc`) instead of unfiltering a pane you would stay in. `^U clear` is
+        // what empties the query in both.
         Some(Overlay::Filter) if model.search_active() => keymap::LegendContext::SearchFilter,
         Some(Overlay::Filter) => keymap::LegendContext::Filter,
         // The add-entry captures parse a trailing date and bind `Tab` for a
@@ -1177,9 +1251,11 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::AddTask { .. } | Overlay::AddSubtask { .. }) => {
             keymap::LegendContext::TaskCapture
         }
+        // The due editor binds four stepping keys on top of the text ones, so it
+        // declares its own legend rather than advertising `TextInput`'s.
+        Some(Overlay::EditDue { .. }) => keymap::LegendContext::DueInput,
         Some(
             Overlay::EditTitle { .. }
-            | Overlay::EditDue { .. }
             | Overlay::EditNotes { .. }
             | Overlay::AddList { .. }
             | Overlay::RenameList { .. },
@@ -2141,12 +2217,14 @@ mod tests {
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::TaskCapture);
 
-        // A different capture (edit due) keeps the plain text-input legend.
+        // The due editor declares its own legend: it binds stepping keys and
+        // `^U`/`^W`, none of which `TextInput`'s two cells would have said.
         model.overlay = Some(Overlay::EditDue {
             task: TaskId("t".into()),
             buffer: String::new(),
+            pristine: false,
         });
-        assert_eq!(legend_context(&model), keymap::LegendContext::TextInput);
+        assert_eq!(legend_context(&model), keymap::LegendContext::DueInput);
 
         model.overlay = Some(Overlay::Confirm(crate::app::Confirm {
             prompt: "sure?".into(),

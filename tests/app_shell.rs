@@ -220,10 +220,11 @@ fn key_ev(code: KeyCode) -> KeyEvent {
 // inline) and `tests/legend_render.rs`.
 
 /// Every context, so a new one can't skip the guards below.
-const CONTEXTS: [LegendContext; 9] = [
+const CONTEXTS: [LegendContext; 10] = [
     LegendContext::Tasks,
     LegendContext::Sidebar,
     LegendContext::TextInput,
+    LegendContext::DueInput,
     LegendContext::TaskCapture,
     LegendContext::Confirm,
     LegendContext::LinkPicker,
@@ -260,6 +261,7 @@ fn contexts_covers_every_legend_context() {
             LegendContext::Tasks
             | LegendContext::Sidebar
             | LegendContext::TextInput
+            | LegendContext::DueInput
             | LegendContext::TaskCapture
             | LegendContext::Confirm
             | LegendContext::LinkPicker
@@ -337,7 +339,27 @@ fn overlay_legends_advertise_only_keys_the_overlay_handles() {
         .iter()
         .map(|c| c.text())
         .collect();
-    assert_eq!(text, ["Enter save", "Esc cancel"]);
+    assert_eq!(text, ["Enter save", "Esc cancel", "^U clear", "^W word"]);
+
+    // The due editor declares its own, naming every key it binds that the plain
+    // text legend would not have: the stepping keys and both chords. `Backspace`
+    // is deliberately absent — the reversed prefill is its affordance, and the
+    // row is already 76 of 80 columns.
+    let due: Vec<String> = keymap::legend(LegendContext::DueInput)
+        .iter()
+        .map(|c| c.text())
+        .collect();
+    assert_eq!(
+        due,
+        [
+            "Enter save",
+            "Esc cancel",
+            "Up/Down -/+day",
+            "PgUp/PgDn -/+week",
+            "^U clear",
+            "^W word",
+        ]
+    );
 
     let confirm: Vec<String> = keymap::legend(LegendContext::Confirm)
         .iter()

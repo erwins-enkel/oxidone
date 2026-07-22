@@ -108,10 +108,12 @@ fn next_day_of_month(today: NaiveDate, day: u32) -> Option<NaiveDate> {
 
 /// The date `delta` days from `base`, or `None` at the ends of the calendar.
 ///
-/// Checked because callers step a date the *user* typed: `NaiveDate`'s `Add`
-/// panics on overflow, and `+262143-12-31` parses (chrono's `%Y` takes a leading
-/// sign for years outside `0..=9999`), so an unchecked `+ Duration::days(1)`
-/// there would take the whole TUI down on a keystroke. A caller that cannot
+/// Checked, not `+ Duration::days(delta)`, because `NaiveDate`'s `Add` panics on
+/// overflow and callers step dates that came from outside this module — a parsed
+/// buffer, a Task Google sent us. Whether any particular input can actually reach
+/// `NaiveDate::MAX` is a property of whatever produced the date, not something a
+/// step should have to know: the ends of the calendar are reachable in principle,
+/// and a keystroke must never be able to take the TUI down. A caller that cannot
 /// move simply does not move.
 pub fn shift_days(base: NaiveDate, delta: i64) -> Option<NaiveDate> {
     base.checked_add_signed(chrono::Duration::days(delta))

@@ -72,7 +72,6 @@ fn titles(tasks: &[&Task]) -> Vec<String> {
     tasks.iter().map(|t| t.title.clone()).collect()
 }
 
-/// Type each character of `s` into the model in order.
 /// A `Ctrl`-chord: CONTROL alone.
 fn chord(c: char) -> Message {
     Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
@@ -86,6 +85,7 @@ fn altgr(c: char) -> Message {
     ))
 }
 
+/// Type each character of `s` into the model in order.
 fn typed(m: &mut Model, s: &str) {
     for c in s.chars() {
         update(m, ch(c));

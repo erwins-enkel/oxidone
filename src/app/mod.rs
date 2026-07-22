@@ -3001,10 +3001,13 @@ fn exit_search(model: &mut Model) -> Vec<Command> {
 
 /// Keys for the open filter input. The query lives on `Model::filter` (the single
 /// source of truth the view filter reads), so each edit narrows the pane live and
-/// re-anchors the cursor onto a surviving row. `Enter` keeps the filter and closes
-/// the input — an all-empty query commits to `None`, since a blank filter is no
-/// filter. `Esc` clears the filter and restores the pane. Everything else is
-/// swallowed, as every other overlay does.
+/// re-anchors the cursor onto a surviving row. Characters and `Backspace` edit it,
+/// as do the readline chords `^U` (clear the query) and `^W` (drop its last word)
+/// — which matter most in **Search**, where `Esc` leaves the pane rather than
+/// clearing, so `^U` is the only way to empty the query. `Enter` keeps the filter
+/// and closes the input — an all-empty query commits to `None`, since a blank
+/// filter is no filter. `Esc` clears the filter and restores the pane. Everything
+/// else is swallowed, as every other overlay does.
 fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // `Some` whenever the Filter overlay is open (`open_filter` seeds it); the
@@ -3044,8 +3047,9 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
         }
         _ => return Vec::new(),
     }
-    // A live edit (char/backspace) changed what is visible: keep the cursor on a
-    // row that still shows.
+    // A live edit — a character, `Backspace`, or either chord — changed what is
+    // visible: keep the cursor on a row that still shows. `Enter`, `Esc` and the
+    // swallowed keys all return before this.
     reselect_visible(model);
     Vec::new()
 }

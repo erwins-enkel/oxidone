@@ -564,12 +564,17 @@ async fn a_step_then_enter_writes_the_stepped_date() {
     );
 }
 
-/// A crash guard, not a boundary proof. The plan expected chrono's `%Y` to
-/// accept `+262143-12-31` and reach `NaiveDate::MAX`; it does not — the string
-/// fails to parse, so the step falls back to today. Either way the point stands:
-/// a keystroke on an extreme buffer must not panic the TUI. The unconditional
-/// boundary proof is `dateparse::shift_days`' own unit tests, which is exactly
-/// why that helper is separately testable.
+/// A crash guard, not a boundary proof.
+///
+/// `+262143-12-31` is `NaiveDate::MAX` spelled out, and looks like the way to
+/// drive a step off the end of the calendar from the keyboard. It is not: the
+/// parser rejects it, so the step falls back to today. That makes this a weak
+/// assertion by construction — it cannot distinguish "the step was checked" from
+/// "the buffer never reached the boundary" — and it is kept only because a
+/// keystroke on an extreme buffer must not panic the TUI whichever way that
+/// goes. The real boundary proof is `dateparse::shift_days`' own unit tests,
+/// which reach `NaiveDate::MAX` directly and do not depend on any string
+/// parsing; that is why the helper is separately testable.
 #[tokio::test]
 async fn stepping_on_an_extreme_buffer_does_not_panic() {
     let (mut m, _l, _t) = model_with_tasks().await;

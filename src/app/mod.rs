@@ -3006,8 +3006,9 @@ fn exit_search(model: &mut Model) -> Vec<Command> {
 /// — which matter most in **Search**, where `Esc` leaves the pane rather than
 /// clearing, so `^U` is the only way to empty the query. `Enter` keeps the filter
 /// and closes the input — an all-empty query commits to `None`, since a blank
-/// filter is no filter. `Esc` clears the filter and restores the pane. Everything
-/// else is swallowed, as every other overlay does.
+/// filter is no filter. Outside Search, `Esc` clears the filter and restores the
+/// pane; inside it, `Esc` leaves Search altogether (see the arm below).
+/// Everything else is swallowed, as every other overlay does.
 fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // `Some` whenever the Filter overlay is open (`open_filter` seeds it); the

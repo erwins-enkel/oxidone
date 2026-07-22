@@ -337,11 +337,50 @@ fn control_u_empties_the_query_and_rewidens_the_pane() {
     update(&mut m, ch('/'));
     typed(&mut m, "rep");
     assert_eq!(m.filter.as_deref(), Some("rep"));
+    assert_eq!(titles(&m.visible_tasks()), vec!["report"], "narrowed");
 
     update(&mut m, chord('u'));
     assert_eq!(m.filter.as_deref(), Some(""), "^U empties the query");
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["report", "standup"],
+        "and the pane widens back — an empty query matches everything"
+    );
     // Emptied, not closed: the input is still open for a fresh query.
     assert!(m.overlay.is_some());
+}
+
+/// The case `^U` exists for. In **Search** `Esc` leaves the pane rather than
+/// clearing the query, so short of holding Backspace the chord is the only way
+/// to empty it — which is why `SEARCH_FILTER` spends a legend cell on it.
+#[test]
+fn control_u_is_the_only_clear_in_search() {
+    let mut m = model_with(vec![]);
+    update(&mut m, ch('S'));
+    update(
+        &mut m,
+        Message::SearchLoaded {
+            tasks: vec![task_in("L", "report", None), task_in("L", "standup", None)],
+            failed: Vec::new(),
+            live: true,
+        },
+    );
+    assert!(m.search_active());
+
+    typed(&mut m, "rep");
+    assert_eq!(titles(&m.visible_tasks()), vec!["report"], "narrowed");
+
+    update(&mut m, chord('u'));
+    assert_eq!(m.filter.as_deref(), Some(""), "^U empties the query");
+    assert_eq!(
+        titles(&m.visible_tasks()),
+        vec!["report", "standup"],
+        "the corpus is visible again"
+    );
+    assert!(
+        m.search_active(),
+        "^U clears and stays; only Esc leaves Search"
+    );
 }
 
 #[test]

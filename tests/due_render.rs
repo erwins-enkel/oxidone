@@ -124,6 +124,53 @@ async fn model_with_due() -> Model {
     m
 }
 
+/// The same fixture with a second, undated Task ("beta") below the dated one.
+async fn model_with_an_undated_task() -> Model {
+    let mut m = model_with_due().await;
+    let mut tasks = m.tasks.clone();
+    let mut beta = tasks[0].clone();
+    beta.id = oxidone::domain::TaskId("beta".into());
+    beta.title = "beta".to_string();
+    beta.due = None;
+    tasks.push(beta);
+    m.tasks = tasks;
+    update(&mut m, key(KeyCode::Down)); // select "beta"
+    m
+}
+
+/// Opening `d` on a Task that has no due date must not announce a clear: there
+/// is nothing to clear, and `Enter` changes nothing visible. This is the same
+/// objection that ruled out never prefilling at all — an editor that greets you
+/// with a destructive-sounding outcome you did not ask for.
+#[tokio::test]
+async fn an_undated_task_is_not_told_its_date_will_be_cleared() {
+    let mut m = model_with_an_undated_task().await;
+    update(&mut m, ch('d'));
+    let rows = rows(&m);
+    assert!(
+        rows.iter().any(|r| r.contains("→ leaves it undated")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("clears the due date")),
+        "nothing to clear on an undated Task: {rows:?}"
+    );
+}
+
+/// But once the buffer has been edited, an empty one *is* a deliberate clear —
+/// on a dated Task that is exactly what `Enter` does, and it says so.
+#[tokio::test]
+async fn an_emptied_buffer_on_a_dated_task_still_announces_the_clear() {
+    let mut m = model_with_due().await;
+    update(&mut m, ch('d'));
+    update(&mut m, chord('u'));
+    let rows = rows(&m);
+    assert!(
+        rows.iter().any(|r| r.contains("→ clears the due date")),
+        "{rows:?}"
+    );
+}
+
 #[tokio::test]
 async fn the_untouched_prefill_is_drawn_selected() {
     let mut m = model_with_due().await;

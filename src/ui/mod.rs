@@ -156,6 +156,14 @@ fn input_line(buffer: &str) -> Line<'static> {
 /// *clear* to the reducer but a parse error to `parse_due_relative_to`, so
 /// branching on the raw buffer would render "not a date" in red while `Enter`
 /// cheerfully cleared the date.
+///
+/// `pristine` splits the empty branch in two. Since `open_edit_due` prefills a
+/// dated Task with its date, an empty *untouched* buffer means the Task had no
+/// due date to begin with — so `Enter` changes nothing visible and the line says
+/// that, rather than threatening to clear a date that does not exist. An empty
+/// buffer the user emptied is a real clear and reads as one. The line is present
+/// either way: it is what fixes the popup's height, so dropping it would make the
+/// frame jump as you type.
 fn due_lines(
     buffer: &str,
     pristine: bool,
@@ -175,7 +183,16 @@ fn due_lines(
     };
     let trimmed = buffer.trim();
     let (preview, fg) = if trimmed.is_empty() {
-        ("→ clears the due date".to_string(), theme.subtext)
+        // An empty buffer that is still `pristine` is a Task that opened without
+        // a due date — `open_edit_due` prefills a dated one — so there is nothing
+        // to clear, and saying so would announce a destructive outcome the user
+        // has not asked for on a Task it cannot happen to. Once edited, an empty
+        // buffer *is* a deliberate clear and gets named as one.
+        if pristine {
+            ("→ leaves it undated".to_string(), theme.subtext)
+        } else {
+            ("→ clears the due date".to_string(), theme.subtext)
+        }
     } else {
         match dateparse::parse_due_relative_to(trimmed, now) {
             Ok(due) => (

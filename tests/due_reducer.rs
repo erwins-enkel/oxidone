@@ -148,8 +148,7 @@ async fn submitting_a_valid_date_sets_due_optimistically_and_emits_setdue() {
 async fn an_empty_buffer_clears_the_due_date() {
     let (mut m, l, tasks) = model_with_tasks().await;
     update(&mut m, ch('d')); // "alpha", due 2026-08-01
-                             // The prefill is selected, so one Backspace empties the buffer outright.
-    update(&mut m, key(KeyCode::Backspace));
+    update(&mut m, key(KeyCode::Backspace)); // selected prefill: clears it outright
     let cmds = update(&mut m, key(KeyCode::Enter));
     assert!(m.overlay.is_none());
     assert_eq!(m.tasks[0].due, None); // cleared optimistically

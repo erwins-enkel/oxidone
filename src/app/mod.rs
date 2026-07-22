@@ -3054,8 +3054,9 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
     Vec::new()
 }
 
-/// Route a key to the active overlay: the filter input, cursor keys for the link
-/// picker, yes/no for `Confirm`, text editing for the input overlays.
+/// Route a key to the active overlay: the filter input, the due editor (text
+/// editing plus stepping — see [`due_editor_key`]), cursor keys for the pickers,
+/// yes/no for `Confirm`, and text editing for the remaining input overlays.
 fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
     // Three-way on the overlay's kind. "Has a text buffer, else y/n" is not

@@ -934,3 +934,83 @@ fn a_command_that_changes_the_frame_says_nothing() {
     assert!(model.ascii);
     assert_eq!(model.status_line, None);
 }
+
+/// A no-op report must not outlive the state it described. Firing a command that
+/// *does* change something clears it — otherwise `ascii already off` stays on
+/// screen while `ascii` is now on, and the status line contradicts the frame.
+#[test]
+fn an_observable_command_clears_a_stale_no_op_report() {
+    let mut model = open_with(&[]);
+    model.ascii = false;
+    fire(&mut model, "ascii off");
+    assert!(model.status_line.is_some(), "the no-op reported itself");
+
+    let mut model2 = open_with(&[]);
+    model2.ascii = false;
+    model2.status_line = model.status_line.clone();
+    fire(&mut model2, "ascii on");
+    assert!(model2.ascii);
+    assert_eq!(
+        model2.status_line, None,
+        "a stale report survived the change"
+    );
+
+    // Same for the other two — `:horizon`'s stale sentence would also name the
+    // wrong number.
+    let mut model = open_with(&[]);
+    model.flavor = Flavor::Mocha;
+    model.status_line = Some("already mocha".into());
+    fire(&mut model, "flavor latte");
+    assert_eq!(model.status_line, None);
+
+    let mut model = open_with(&["work"]);
+    model.selected = Selection::List(0);
+    // `Model::new()`'s clock is the epoch, and `within_horizon` measures from it —
+    // a task dated off the real clock would sit beyond every horizon.
+    model.now = chrono::Local::now();
+    model.hide_distant = true;
+    model.horizon_days = 14;
+    // A `Message` while the overlay is open is fine — only keys route into it,
+    // which is why the Omnibox needs its stale-index clamp at all.
+    update(
+        &mut model,
+        Message::TasksLoaded(ListId("work".into()), vec![dated_task("far", 30)]),
+    );
+    model.status_line = Some("horizon 14 — no entry crosses it".into());
+    fire(&mut model, "horizon 60");
+    assert_eq!(
+        model.status_line, None,
+        "the row became visible, so the stale sentence had to go"
+    );
+}
+
+/// The refusal names every flavor the enum holds, derived rather than spelled
+/// out — a fifth variant must not leave it listing four.
+#[test]
+fn the_flavor_refusal_lists_every_flavor() {
+    let model = open_with(&[]);
+    let reason = match &commands(&model, "flavor purple")[0].1 {
+        CommandState::Invalid { reason } => reason.clone(),
+        other => panic!("{other:?}"),
+    };
+    for f in Flavor::ALL {
+        assert!(reason.contains(f.as_str()), "{reason:?} omits {f:?}");
+    }
+}
+
+fn dated_task(id: &str, days_out: i64) -> oxidone::domain::Task {
+    oxidone::domain::Task {
+        id: oxidone::domain::TaskId(id.into()),
+        list: ListId("work".into()),
+        parent: None,
+        title: id.into(),
+        notes: None,
+        status: oxidone::domain::Status::NeedsAction,
+        due: Some(chrono::Local::now().date_naive() + chrono::Duration::days(days_out)),
+        completed_at: None,
+        links: Vec::new(),
+        position: format!("{id:0>20}"),
+        etag: String::new(),
+        updated: Utc.timestamp_opt(0, 0).unwrap(),
+    }
+}

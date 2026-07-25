@@ -407,3 +407,23 @@ fn the_popup_clears_the_status_line_and_the_legend() {
         "still open"
     );
 }
+
+/// A command row echoes the argument it was built from, so the row names what it
+/// will act on rather than the bare verb — `:flavor purple`, not `:flavor`. Only
+/// `NeedsArgument` shows the `‹arg›` placeholder.
+#[test]
+fn a_command_row_echoes_its_typed_argument() {
+    let mut model = open_with(&["work"]);
+    typed(&mut model, "flavor purple");
+    assert!(shows(&model, ":flavor purple"), "{:#?}", popup_rows(&model));
+
+    let mut model = open_with(&["work"]);
+    model.horizon_days = 14;
+    typed(&mut model, "horizon 30");
+    assert!(shows(&model, ":horizon 30"), "{:#?}", popup_rows(&model));
+
+    // No argument yet: the placeholder, not an echo.
+    let mut model = open_with(&["work"]);
+    typed(&mut model, "horizon");
+    assert!(shows(&model, ":horizon ‹arg›"), "{:#?}", popup_rows(&model));
+}

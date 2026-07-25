@@ -31,7 +31,9 @@ pub enum Flavor {
 }
 
 impl Flavor {
-    /// Every flavor, for the `:flavor` command's valid set and for tests.
+    /// Every flavor, in the order the `:flavor` row's refusal lists them —
+    /// that message is built from this, so a fifth variant cannot leave it
+    /// naming four.
     pub const ALL: [Flavor; 4] = [
         Flavor::Latte,
         Flavor::Frappe,

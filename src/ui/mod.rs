@@ -21,8 +21,8 @@ use ratatui::Frame;
 use std::collections::HashMap;
 
 use crate::app::{
-    omnibox_rows, renders_as_subtask, CaptureRow, CommandState, Focus, JumpTarget, Model,
-    OmniCommand, OmniRow, Overlay,
+    omnibox_rows, renders_as_subtask, split_command, CaptureRow, CommandState, Focus, JumpTarget,
+    Model, OmniCommand, OmniRow, Overlay,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
@@ -349,7 +349,9 @@ fn render_omnibox(
         if i == selected.min(rows.len().saturating_sub(1)) {
             drawn_selected = Some(items.len());
         }
-        items.push(ListItem::new(omnibox_line(model, row, text_width, theme)));
+        items.push(ListItem::new(omnibox_line(
+            model, row, query, text_width, theme,
+        )));
     }
 
     let popup = centered(body, width, picker_height(items.len(), body.height));
@@ -406,7 +408,13 @@ fn omnibox_title(query: &str, text_width: usize) -> String {
 /// The same shape `legend_spans` uses for its pinned help cell: reserve the part
 /// that must survive, spend the rest. What shortens is the echo of what the user
 /// typed — never the reason they need to read.
-fn omnibox_line(model: &Model, row: &OmniRow, width: usize, theme: &Theme) -> Line<'static> {
+fn omnibox_line(
+    model: &Model,
+    row: &OmniRow,
+    query: &str,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let (lead, trail) = match row {
         OmniRow::Jump(JumpTarget::Today) => ("Today".to_string(), String::new()),
         OmniRow::Jump(JumpTarget::List { id, title }) => (
@@ -434,11 +442,12 @@ fn omnibox_line(model: &Model, row: &OmniRow, width: usize, theme: &Theme) -> Li
                 trail.push(' ');
                 trail.push_str(advisory);
             }
+            let arg = split_command(query.trim()).1;
             (
                 format!(
                     ":{}{}",
                     command.command.verb(),
-                    command_arg_suffix(&command.state)
+                    command_arg_suffix(&command.state, arg)
                 ),
                 trail,
             )
@@ -472,13 +481,17 @@ fn omnibox_line(model: &Model, row: &OmniRow, width: usize, theme: &Theme) -> Li
 }
 
 /// The typed argument, echoed after the verb, or the placeholder when there is
-/// none — so the row shows what it will act on.
-fn command_arg_suffix(state: &CommandState) -> String {
+/// none — so the row shows what it will act on rather than the bare verb.
+///
+/// `arg` is the one the row was built from, re-split from the query here rather
+/// than carried on `CommandState`: only the renderer wants it, and the states
+/// that have one already carry what it *means* (a reason, or an effect).
+fn command_arg_suffix(state: &CommandState, arg: Option<&str>) -> String {
     match state {
         CommandState::NeedsArgument { .. } => " ‹arg›".to_string(),
         CommandState::Invalid { .. }
         | CommandState::RefusedHere { .. }
-        | CommandState::Valid { .. } => String::new(),
+        | CommandState::Valid { .. } => arg.map(|a| format!(" {a}")).unwrap_or_default(),
     }
 }
 
@@ -1558,15 +1571,15 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
+        // Its own legend: `j`/`k` type, movement is `Up`/`Down`, and `Enter`
+        // runs a row rather than saving a buffer — none of which `TextInput`
+        // would have said.
+        Some(Overlay::Omnibox { .. }) => keymap::LegendContext::Omnibox,
         // The same overlay in Search advertises `Esc leave search` rather than
         // `Esc drop filter`: the pane behind it is the corpus, not a List, so
         // `Esc` leaves Search outright (matching `filter_key`'s Search-aware
         // `Esc`) instead of unfiltering a pane you would stay in. `^U clear` is
         // what empties the query in both.
-        // Its own legend: `j`/`k` type, movement is `Up`/`Down`, and `Enter`
-        // runs a row rather than saving a buffer — none of which `TextInput`
-        // would have said.
-        Some(Overlay::Omnibox { .. }) => keymap::LegendContext::Omnibox,
         Some(Overlay::Filter) if model.search_active() => keymap::LegendContext::SearchFilter,
         Some(Overlay::Filter) => keymap::LegendContext::Filter,
         // The add-entry captures parse a trailing date and bind `Tab` for a

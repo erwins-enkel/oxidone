@@ -3301,7 +3301,7 @@ fn capture_row(model: &Model, query: &str) -> Option<CaptureRow> {
 /// `horizon ` and `horizon   ` all mean "argument missing", and `horizon  30`
 /// parses like `horizon 30`. Without that, a query that looks correct would read
 /// invalid.
-fn split_command(trimmed: &str) -> (&str, Option<&str>) {
+pub fn split_command(trimmed: &str) -> (&str, Option<&str>) {
     let (verb, rest) = match trimmed.split_once(' ') {
         Some((verb, rest)) => (verb, Some(rest.trim())),
         None => (trimmed, None),
@@ -3370,8 +3370,17 @@ fn command_state(
             Some(flavor) => CommandState::Valid {
                 effect: format!("{} → {}", model.flavor.as_str(), flavor.as_str()),
             },
+            // Derived from `Flavor::ALL`, never spelled out: a fifth flavor
+            // would otherwise leave this refusal naming four and silently wrong.
             None => CommandState::Invalid {
-                reason: "unknown — latte|frappe|macchiato|mocha".to_string(),
+                reason: format!(
+                    "unknown — {}",
+                    Flavor::ALL
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
             },
         },
         OmniCommand::Ascii => match parse_on_off(arg) {
@@ -3745,24 +3754,28 @@ fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Comm
                 } else {
                     format!("horizon {days} — filter off, w applies it")
                 });
+            } else {
+                // Cleared, not just left: a no-op report from a previous command
+                // would otherwise outlive the state it described and then
+                // contradict it — `horizon 30 — filter off` still on screen while
+                // the pane visibly re-filters at 60.
+                model.status_line = None;
             }
         }
         OmniCommand::Flavor => {
             let Some(flavor) = Flavor::from_name(arg) else {
                 return Vec::new();
             };
-            if flavor == model.flavor {
-                model.status_line = Some(format!("already {}", flavor.as_str()));
-            }
+            model.status_line =
+                (flavor == model.flavor).then(|| format!("already {}", flavor.as_str()));
             model.flavor = flavor;
         }
         OmniCommand::Ascii => {
             let Some(on) = parse_on_off(arg) else {
                 return Vec::new();
             };
-            if on == model.ascii {
-                model.status_line = Some(format!("ascii already {}", on_off(on)));
-            }
+            model.status_line =
+                (on == model.ascii).then(|| format!("ascii already {}", on_off(on)));
             model.ascii = on;
         }
     }

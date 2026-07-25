@@ -784,3 +784,153 @@ fn firing_the_capture_row_creates_and_closes() {
     assert!(!commands.is_empty(), "the insert was requested");
     assert!(model.tasks.iter().any(|t| t.title == "buy bread"));
 }
+
+// ─── COMMAND dispatch ───────────────────────────────────────────────────────
+
+/// Type `q` into a freshly opened Omnibox and press Enter on its first COMMAND
+/// row.
+fn fire(model: &mut Model, q: &str) {
+    for c in q.chars() {
+        update(model, ch(c));
+    }
+    let at = rows(model)
+        .iter()
+        .position(|r| matches!(r, OmniRow::Command(_)))
+        .expect("a COMMAND row");
+    for _ in 0..at {
+        update(model, key(KeyCode::Down));
+    }
+    update(model, key(KeyCode::Enter));
+}
+
+/// Completion is one-shot: `hor` grows into `horizon `, and a second Enter has
+/// nothing to add, so it is inert rather than rewriting the query to itself.
+#[test]
+fn enter_completes_once_then_waits_for_an_argument() {
+    let mut model = open_with(&[]);
+    fire(&mut model, "hor");
+
+    assert_eq!(query(&model), "horizon ");
+    assert!(matches!(model.overlay, Some(Overlay::Omnibox { .. })));
+
+    update(&mut model, key(KeyCode::Enter));
+    assert_eq!(query(&model), "horizon ", "a second Enter is inert");
+    assert!(matches!(model.overlay, Some(Overlay::Omnibox { .. })));
+
+    for c in "30".chars() {
+        update(&mut model, ch(c));
+    }
+    update(&mut model, key(KeyCode::Enter));
+    assert_eq!(model.horizon_days, 30);
+    assert!(model.overlay.is_none(), "firing closes it");
+}
+
+/// A typed `:` survives the rewrite — completion only ever grows the query.
+#[test]
+fn completion_keeps_a_typed_colon() {
+    let mut model = open_with(&[]);
+    fire(&mut model, ":hor");
+    assert_eq!(query(&model), ":horizon ");
+}
+
+/// The three unfireable shapes change nothing and keep the overlay, so the typo
+/// is one `Backspace` from fixed rather than retyped from a closed surface.
+#[test]
+fn an_unfireable_command_row_changes_nothing_and_stays_open() {
+    for (q, setup) in [
+        ("flavor purple", false),
+        ("horizon abc", false),
+        ("horizon 70000", false),
+        ("horizon 30", true), // valid, but refused in Search
+    ] {
+        let mut model = open_with(&["work"]);
+        if setup {
+            update(&mut model, key(KeyCode::Esc));
+            model.selected = Selection::List(0);
+            update(&mut model, ch('S'));
+            update(&mut model, key(KeyCode::Enter));
+            update(&mut model, ch('p'));
+        }
+        let before = (model.horizon_days, model.flavor, model.ascii);
+
+        fire(&mut model, q);
+
+        assert_eq!(
+            (model.horizon_days, model.flavor, model.ascii),
+            before,
+            "{q:?} mutated the model"
+        );
+        assert_eq!(query(&model), q, "{q:?} lost the query");
+        assert!(
+            matches!(model.overlay, Some(Overlay::Omnibox { .. })),
+            "{q:?} closed the overlay"
+        );
+    }
+}
+
+#[test]
+fn horizon_zero_is_accepted() {
+    let mut model = open_with(&[]);
+    fire(&mut model, "horizon 0");
+    assert_eq!(model.horizon_days, 0);
+}
+
+/// Sets the number and re-anchors, but never touches the flag: switching it on
+/// would *subtract* rows from someone who asked to see further out.
+#[test]
+fn horizon_never_touches_the_hide_distant_flag() {
+    let mut model = open_with(&[]);
+    model.hide_distant = false;
+    fire(&mut model, "horizon 30");
+    assert_eq!(model.horizon_days, 30);
+    assert!(!model.hide_distant);
+}
+
+/// A command that leaves the frame unchanged says so — the overlay is gone, so
+/// the status line is its only channel, and silence would be indistinguishable
+/// from a dropped keystroke.
+#[test]
+fn a_no_op_command_reports_that_nothing_changed() {
+    // `:horizon` with the filter off: the count cannot move.
+    let mut model = open_with(&[]);
+    model.hide_distant = false;
+    fire(&mut model, "horizon 30");
+    let off = model.status_line.clone().expect("a no-op says so");
+    assert!(off.contains('w'), "{off:?} should name `w`");
+
+    // With the filter already on but no row crossing: still a no-op, and naming
+    // `w` there would tell the user to switch the filter *off*.
+    let mut model = open_with(&[]);
+    model.hide_distant = true;
+    fire(&mut model, "horizon 30");
+    let on = model.status_line.clone().expect("a no-op says so");
+    assert!(!on.contains('w'), "{on:?} must not name `w`");
+
+    // The other two, already at the value asked for.
+    let mut model = open_with(&[]);
+    model.flavor = Flavor::Mocha;
+    fire(&mut model, "flavor mocha");
+    assert!(model.status_line.is_some());
+
+    let mut model = open_with(&[]);
+    model.ascii = false;
+    fire(&mut model, "ascii off");
+    assert!(model.status_line.is_some());
+}
+
+/// A command that *does* change the frame stays quiet: the frame is the report.
+#[test]
+fn a_command_that_changes_the_frame_says_nothing() {
+    let mut model = open_with(&[]);
+    model.flavor = Flavor::Mocha;
+    fire(&mut model, "flavor latte");
+
+    assert_eq!(model.flavor, Flavor::Latte);
+    assert_eq!(model.status_line, None);
+
+    let mut model = open_with(&[]);
+    model.ascii = false;
+    fire(&mut model, "ascii on");
+    assert!(model.ascii);
+    assert_eq!(model.status_line, None);
+}

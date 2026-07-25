@@ -3671,9 +3671,23 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
                 OmniRow::Capture(CaptureRow::Ready { .. }) => {
                     return finish_add_task(model, query, false)
                 }
-                // Dispatch arrives with its own step; until then Enter on a
-                // COMMAND row keeps the overlay, as its unfireable states will.
-                OmniRow::Command(_) => {}
+                OmniRow::Command(row) => match row.state {
+                    // The completion the row already computed — not re-derived
+                    // here, so "fires only when it would change the query" stays
+                    // one decision made where the canonical verb is in hand.
+                    CommandState::NeedsArgument {
+                        completion: Some(target),
+                    } => query = target,
+                    // The three unfireable shapes, plus a whole verb with nothing
+                    // left to add: each keeps the overlay with the query and the
+                    // selection untouched, because closing would discard a query
+                    // the user is mid-way through fixing, and the row is already
+                    // saying why on screen.
+                    CommandState::NeedsArgument { completion: None }
+                    | CommandState::Invalid { .. }
+                    | CommandState::RefusedHere { .. } => {}
+                    CommandState::Valid { .. } => return run_command(model, row.command, &query),
+                },
             }
         }
         _ => {}
@@ -3684,6 +3698,74 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
 
     // (d)
     model.overlay = Some(Overlay::Omnibox { query, selected });
+    Vec::new()
+}
+
+/// Apply a `Valid` COMMAND row.
+///
+/// Re-parses the argument rather than carrying it on the row: `Valid` proved it
+/// parses, and threading the value through the row would put the parse in two
+/// places for three commands. A `None` here is unreachable by construction and
+/// simply does nothing, rather than an `unwrap` that would panic the TUI.
+///
+/// Every command reports **when it changed nothing observable**. The overlay is
+/// gone by now, so a command that also leaves the frame untouched is
+/// indistinguishable from a dropped keystroke — which is what the house rules'
+/// "no zero count masquerading as success" forbids. Keyed on the frame, not on
+/// any one flag: `:horizon` crossing no row, `:ascii off` when already off and
+/// `:flavor mocha` on the default all repaint identically.
+fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Command> {
+    let (_, arg) = split_command(query.trim());
+    let Some(arg) = arg else {
+        return Vec::new();
+    };
+
+    match command {
+        OmniCommand::Horizon => {
+            let Ok(days) = arg.parse::<u16>() else {
+                return Vec::new();
+            };
+            // An exact proxy, not an approximation: a horizon change is
+            // monotonic — widening only reveals, narrowing only hides — so the
+            // count moves if and only if the visible set does. With
+            // `hide_distant` off it never moves, which is how that case falls out
+            // of the general rule instead of being special-cased.
+            let before = model.visible_tasks().len();
+            model.horizon_days = days;
+            // `within_horizon` reads `horizon_days`, so a smaller horizon can
+            // strand the cursor on a row it just hid — the same reason
+            // `Action::ToggleHideDistant` re-anchors.
+            reselect_visible(model);
+            if model.visible_tasks().len() == before {
+                // Two texts, on the same condition the row-level advisory uses.
+                // Naming `w` when the filter is already on would be wrong twice
+                // over: it is on, and pressing it would switch it *off*.
+                model.status_line = Some(if model.hide_distant {
+                    format!("horizon {days} — no entry crosses it")
+                } else {
+                    format!("horizon {days} — filter off, w applies it")
+                });
+            }
+        }
+        OmniCommand::Flavor => {
+            let Some(flavor) = Flavor::from_name(arg) else {
+                return Vec::new();
+            };
+            if flavor == model.flavor {
+                model.status_line = Some(format!("already {}", flavor.as_str()));
+            }
+            model.flavor = flavor;
+        }
+        OmniCommand::Ascii => {
+            let Some(on) = parse_on_off(arg) else {
+                return Vec::new();
+            };
+            if on == model.ascii {
+                model.status_line = Some(format!("ascii already {}", on_off(on)));
+            }
+            model.ascii = on;
+        }
+    }
     Vec::new()
 }
 

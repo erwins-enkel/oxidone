@@ -447,21 +447,33 @@ fn a_short_title_survives_beside_a_long_destination() {
     );
 }
 
-/// The floor still does its job where it was meant to: a title long enough to
-/// need truncating, with too little room to say anything useful, drops whole
-/// rather than rendering as `→ …`.
+/// The floor still does its job where it was meant to: a title with too little
+/// room to say anything useful drops **whole** rather than rendering as `→ …`,
+/// and the destination survives at its floor.
+///
+/// Driven at **38 columns**, because the branch does not exist above it. The
+/// popup caps at `OMNIBOX_WIDTH`, so at 80 columns a row has 68 cells; with the
+/// destination floored at 24 the title still gets 40 and renders truncated. The
+/// budget only falls under the floor once the frame does — 40 columns leaves
+/// exactly 8, and 38 leaves 6. Narrow frames are supported and exercised:
+/// `legend_render` drives 30 and 22.
 #[test]
 fn a_long_title_with_no_room_drops_whole_rather_than_eliding() {
     let mut model = open_with(&["a list with a really quite long name indeed"]);
     typed(&mut model, "renew the passport before the trip abroad");
 
-    let rows = popup_rows(&model);
-    let capture = rows
+    let drawn = rows_at(&model, 38, HEIGHT);
+    let capture = drawn
         .iter()
-        .find(|r| r.contains("Create task in"))
-        .expect("a CAPTURE row");
+        .find(|r| r.contains("Create task"))
+        .unwrap_or_else(|| panic!("no CAPTURE row at 38 columns: {drawn:#?}"));
+
     assert!(
-        !capture.contains("→ …"),
-        "elided to nothing useful: {capture:?}"
+        !capture.contains('→'),
+        "the title should be dropped whole, not elided: {capture:?}"
+    );
+    assert!(
+        capture.contains("Create task in"),
+        "the destination must survive at its floor: {capture:?}"
     );
 }

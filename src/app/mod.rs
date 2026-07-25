@@ -3768,8 +3768,11 @@ fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Comm
             let Some(flavor) = Flavor::from_name(arg) else {
                 return Vec::new();
             };
+            // Names its subject, like `ascii already off` and `horizon 30 — …`:
+            // on the status line a bare `already mocha` is an orphan, with
+            // nothing to say what is already mocha.
             model.status_line =
-                (flavor == model.flavor).then(|| format!("already {}", flavor.as_str()));
+                (flavor == model.flavor).then(|| format!("flavor already {}", flavor.as_str()));
             model.flavor = flavor;
         }
         OmniCommand::Ascii => {

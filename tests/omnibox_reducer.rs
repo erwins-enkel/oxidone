@@ -907,15 +907,18 @@ fn a_no_op_command_reports_that_nothing_changed() {
     assert!(!on.contains('w'), "{on:?} must not name `w`");
 
     // The other two, already at the value asked for.
+    // Each names its subject: on a status line a bare `already mocha` is an
+    // orphan, with nothing to say what is already mocha. Pinned as strings,
+    // because `is_some()` would let that parity rot.
     let mut model = open_with(&[]);
     model.flavor = Flavor::Mocha;
     fire(&mut model, "flavor mocha");
-    assert!(model.status_line.is_some());
+    assert_eq!(model.status_line.as_deref(), Some("flavor already mocha"));
 
     let mut model = open_with(&[]);
     model.ascii = false;
     fire(&mut model, "ascii off");
-    assert!(model.status_line.is_some());
+    assert_eq!(model.status_line.as_deref(), Some("ascii already off"));
 }
 
 /// A command that *does* change the frame stays quiet: the frame is the report.

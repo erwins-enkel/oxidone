@@ -231,3 +231,67 @@ fn the_due_editor_legend_drops_the_chords_before_the_escape_hatches() {
         "the escape hatches are the last to go: {narrower:?}"
     );
 }
+
+// The Omnibox legend. Nothing else pins it: `tests/app_shell.rs`'s exhaustive
+// match proves only that the variant exists, and `every_derived_legend_action_is_bound`
+// reaches nothing here because every Omnibox cell is a `LegendKeys::Literal` — a
+// literal cell can say anything at all and no build guard objects.
+//
+// That matters more than usual: dropping `^N`/`^P` rests partly on the legend
+// never having advertised them, which an unpinned row leaves unfalsifiable.
+
+fn model_with_omnibox() -> Model {
+    let mut model = Model::new();
+    model.overlay = Some(oxidone::app::Overlay::Omnibox {
+        query: String::new(),
+        selected: 0,
+    });
+    model
+}
+
+#[test]
+fn the_omnibox_legend_fits_the_default_terminal() {
+    let model = model_with_omnibox();
+    let row = rows(&model).last().expect("a legend row").clone();
+    for cell in [
+        "Enter run",
+        "Esc close",
+        "Up/Down move",
+        "^U clear",
+        "^W word",
+    ] {
+        assert!(
+            row.contains(cell),
+            "{cell:?} missing at 80 columns: {row:?}"
+        );
+    }
+    // Never advertised, because never bound — a `^N` a beat after the overlay
+    // closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.
+    assert!(!row.contains("^N"), "{row:?}");
+    assert!(!row.contains("^P"), "{row:?}");
+}
+
+/// Same drop order as the due editor's: the chords go first, the escape hatches
+/// last, because not knowing `Esc` strands you in the overlay.
+#[test]
+fn the_omnibox_legend_drops_the_chords_before_the_escape_hatches() {
+    let model = model_with_omnibox();
+
+    let narrow = rows_at(&model, 34).last().expect("a legend row").clone();
+    assert!(
+        !narrow.contains("^W word"),
+        "^W should drop first: {narrow:?}"
+    );
+    assert!(
+        narrow.contains("Enter run") && narrow.contains("Esc close"),
+        "{narrow:?}"
+    );
+
+    let narrower = rows_at(&model, 22).last().expect("a legend row").clone();
+    assert!(!narrower.contains("^U clear"), "{narrower:?}");
+    assert!(!narrower.contains("Up/Down"), "{narrower:?}");
+    assert!(
+        narrower.contains("Enter run") && narrower.contains("Esc close"),
+        "the escape hatches are the last to go: {narrower:?}"
+    );
+}

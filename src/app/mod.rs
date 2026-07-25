@@ -228,6 +228,138 @@ struct PendingListMove {
     task: Task,
 }
 
+/// Which band of the Omnibox a row belongs to. Derived from the row's own
+/// variant, never stored beside it — a stored group would make
+/// `Group::Jump`-with-a-`CommandRow` representable.
+///
+/// "Group", the Journal spread's word for a labelled band of rows, not
+/// "section" (`CONTEXT.md` avoids that). The **List** entry avoids "group" as a
+/// *synonym for a List*; this is the other sense, and `Jump` grouping rows that
+/// happen to be Lists is the one place they meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Jump,
+    Command,
+    Search,
+    Capture,
+}
+
+impl Group {
+    /// The group header's text. `Command` carries the session-only caveat here
+    /// rather than on every row: it would otherwise cost the same dozen cells on
+    /// each, competing with the effect and the advisory for one budget.
+    pub fn header(self) -> &'static str {
+        match self {
+            Group::Jump => "JUMP",
+            Group::Command => "COMMAND · session only",
+            Group::Search => "SEARCH",
+            Group::Capture => "CAPTURE",
+        }
+    }
+}
+
+/// Which keyless command a COMMAND row names.
+///
+/// `OmniCommand`, not `Cmd`: [`Command`] is the side-effect enum in this same
+/// module, and a `Cmd`/`Command` pair a scroll apart is the collision this
+/// codebase avoids elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmniCommand {
+    Horizon,
+    Flavor,
+    Ascii,
+}
+
+impl OmniCommand {
+    /// Table order — which is also the order the rows appear in, and therefore
+    /// which one `selected == 0` names when a prefix matches more than one.
+    pub const ALL: [OmniCommand; 3] = [
+        OmniCommand::Horizon,
+        OmniCommand::Flavor,
+        OmniCommand::Ascii,
+    ];
+
+    /// The canonical verb, without the display-only `:`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            OmniCommand::Horizon => "horizon",
+            OmniCommand::Flavor => "flavor",
+            OmniCommand::Ascii => "ascii",
+        }
+    }
+}
+
+/// What a COMMAND row's argument amounts to. Decided in the row builder, so the
+/// row states its own validity and dispatch only acts on what it already says.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandState {
+    /// Verb matched, argument absent. `completion` is the query `Enter` rewrites
+    /// to, and is `None` exactly when that target equals the current query —
+    /// which is what makes a second `Enter` inert. A bare `horizon` is
+    /// `Some("horizon ")`: appending the space is a real change.
+    NeedsArgument { completion: Option<String> },
+    /// Argument present and unparseable. Carries the range or the valid set.
+    Invalid { reason: String },
+    /// Argument valid, but the command cannot act in this pane (`:horizon` in
+    /// Search). Distinct from `Invalid`: fix the pane, not the text.
+    RefusedHere { reason: &'static str },
+    /// Parsed and ready. `effect` is the row's `14 → 30`.
+    Valid { effect: String },
+}
+
+/// One COMMAND row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRow {
+    pub command: OmniCommand,
+    pub state: CommandState,
+    /// A caveat true of the row whatever its *state* — today only ":horizon
+    /// while `hide_distant` is off, outside Search". Row-level rather than
+    /// per-state, because it applies to `horizon`, `horizon ` and `horizon 30`
+    /// alike. Set iff `command == Horizon && !search_active() && !hide_distant`;
+    /// the command predicate is what keeps it off the `:flavor`/`:ascii` rows,
+    /// which `w` has nothing to do with.
+    pub advisory: Option<&'static str>,
+}
+
+/// Where a JUMP row goes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JumpTarget {
+    /// The pinned cross-List view. Its own variant, not a sentinel `ListId`:
+    /// Today is not a List, and [`Selection`] already models it this way.
+    Today,
+    /// `id` is resolved to an index at `Enter` time, never stored as one — a
+    /// `ListsLoaded` can reorder `lists` between the render and the press, and a
+    /// stale index would open a *different* List, silently.
+    List { id: ListId, title: String },
+}
+
+/// One row of the Omnibox, and the group it sits under.
+///
+/// An enum rather than a struct with a `Group` field, so an invalid pairing is
+/// unrepresentable and both the renderer's match and [`OmniRow::group`] are
+/// exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OmniRow {
+    Jump(JumpTarget),
+    Command(CommandRow),
+    /// Carries the query rather than letting the renderer re-read it from the
+    /// overlay: two readers of one string can disagree, and this one is echoed
+    /// in the row's label.
+    Search {
+        query: String,
+    },
+}
+
+impl OmniRow {
+    pub fn group(&self) -> Group {
+        match self {
+            OmniRow::Jump(_) => Group::Jump,
+            OmniRow::Command(_) => Group::Command,
+            OmniRow::Search { .. } => Group::Search,
+        }
+    }
+}
+
 /// A modal overlay drawn over the panes.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -274,6 +406,14 @@ pub enum Overlay {
     /// notes URLs. Only raised for more than one; a single link opens without
     /// asking.
     OpenLink { links: Vec<Link>, selected: usize },
+    /// The **Omnibox** (`p`): one query over a grouped result list.
+    ///
+    /// `selected` indexes [`omnibox_rows`]'s output, which holds **only
+    /// selectable rows** — group headers are not in it, so the cursor cannot
+    /// land on one. It can go stale: `update` routes only `Message::Key` here,
+    /// so a `ListsLoaded` can shrink the rows underneath an open Omnibox. Every
+    /// reader therefore clamps or `get`s rather than indexing blindly.
+    Omnibox { query: String, selected: usize },
     /// Pick the List to relocate a Task to.
     ///
     /// `task` and `source` are captured when the picker opens rather than re-read
@@ -305,8 +445,16 @@ impl Overlay {
             // routes it through `due_editor_key` before this path, because its keys need
             // `pristine` as well as the buffer. Returning the buffer here would be
             // an arm nothing can reach.
+            //
+            // `Omnibox` likewise: `overlay_key` routes it to `omnibox_key`
+            // first. Answering `Some` here would be worse than redundant —
+            // `overlay_key`'s routing match ends in `_ => {}`, so a forgotten
+            // route is not a build error, and the fall-through would silently
+            // hand the Omnibox this arm's `Enter` → `submit_input`. `None` makes
+            // that fall-through inert instead, which is visible at once.
             Overlay::Filter
             | Overlay::EditDue { .. }
+            | Overlay::Omnibox { .. }
             | Overlay::Confirm(_)
             | Overlay::OpenLink { .. }
             | Overlay::MoveToList { .. } => None,
@@ -1965,6 +2113,17 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
                 reselect_visible(model);
             }
         }
+        // Sets the overlay and nothing else — deliberately unlike `open_filter`
+        // and `enter_search`, which move focus because the surface they open
+        // *narrows that pane*. The Omnibox narrows nothing: it floats over both,
+        // its own keys drive it, and whichever pane you opened it from is where
+        // `Esc` should leave you. Focus moves on a JUMP, at that call site.
+        Action::Omnibox => {
+            model.overlay = Some(Overlay::Omnibox {
+                query: String::new(),
+                selected: 0,
+            })
+        }
         Action::Filter => open_filter(model),
         // In Search already, `S` reopens the query input over the existing query
         // (like `/`), never re-entering: `enter_search` would clear the corpus,
@@ -2964,6 +3123,174 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
+/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH.
+///
+/// A pure function of the `Model` and the query — no `Overlay` in sight — so
+/// every row-level property is assertable without a terminal and without driving
+/// `update`. `omnibox_key` keeps it that way by copying the query out of the
+/// overlay before calling.
+///
+/// Returns **only selectable rows**; the renderer emits a group header wherever
+/// [`OmniRow::group`] changes.
+///
+/// Matching runs on the **trimmed** query throughout — the leading trim is what
+/// keeps `" hor"` from splitting to an empty verb that prefix-matches all three
+/// commands and puts an `Invalid` row at `selected == 0`.
+pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
+    let trimmed = query.trim();
+    let needle = trimmed.to_lowercase();
+    let matches = |candidate: &str| candidate.to_lowercase().contains(&needle);
+
+    let mut rows = Vec::new();
+
+    // JUMP — Today first, then the Lists, mirroring the sidebar's own order
+    // (`move_list_selection` gives Today slot 0). Today is filtered like any
+    // other row: pinning it would make it `selected == 0` on *every* query,
+    // shadowing the row the user meant.
+    if matches("Today") {
+        rows.push(OmniRow::Jump(JumpTarget::Today));
+    }
+    for list in &model.lists {
+        if matches(&list.title) {
+            rows.push(OmniRow::Jump(JumpTarget::List {
+                id: list.id.clone(),
+                title: list.title.clone(),
+            }));
+        }
+    }
+
+    // COMMAND — split at the first space, strip one display-only `:`, match the
+    // verb by *prefix*. Substring would fire `:horizon` for `zon` and match two
+    // commands for `a`, landing an invalid row at `selected == 0`.
+    let (verb, arg) = split_command(trimmed);
+    for command in OmniCommand::ALL {
+        if !command.verb().starts_with(&verb.to_lowercase()) {
+            continue;
+        }
+        rows.push(OmniRow::Command(command_row(model, command, query, arg)));
+    }
+
+    // SEARCH and CAPTURE need something to act on; CAPTURE lands with
+    // `capture_target`. An empty query matches every JUMP candidate, which is
+    // right there and wrong here.
+    if !trimmed.is_empty() {
+        rows.push(OmniRow::Search {
+            query: trimmed.to_string(),
+        });
+    }
+
+    rows
+}
+
+/// Split a query into `(verb, arg)` at the first space, stripping one optional
+/// leading `:` from the verb.
+///
+/// `arg` is **trimmed**, and empty-after-trim is `None` — so `horizon`,
+/// `horizon ` and `horizon   ` all mean "argument missing", and `horizon  30`
+/// parses like `horizon 30`. Without that, a query that looks correct would read
+/// invalid.
+fn split_command(trimmed: &str) -> (&str, Option<&str>) {
+    let (verb, rest) = match trimmed.split_once(' ') {
+        Some((verb, rest)) => (verb, Some(rest.trim())),
+        None => (trimmed, None),
+    };
+    (
+        verb.strip_prefix(':').unwrap_or(verb),
+        rest.filter(|a| !a.is_empty()),
+    )
+}
+
+/// Build one COMMAND row: its state, and the advisory that outlives the state.
+fn command_row(model: &Model, command: OmniCommand, query: &str, arg: Option<&str>) -> CommandRow {
+    // The `w` caveat is about the horizon and only the horizon: `hide_distant`
+    // and `search_active()` are properties of the *pane*, so a condition built
+    // from them alone would tell the user that `w` applies a palette change.
+    let advisory =
+        (command == OmniCommand::Horizon && !model.search_active() && !model.hide_distant)
+            .then_some("· filter off (w)");
+
+    CommandRow {
+        command,
+        state: command_state(model, command, query, arg),
+        advisory,
+    }
+}
+
+fn command_state(
+    model: &Model,
+    command: OmniCommand,
+    query: &str,
+    arg: Option<&str>,
+) -> CommandState {
+    let Some(arg) = arg else {
+        // The target is built rather than appended to, so a typed `:` survives
+        // and leading whitespace is normalised away.
+        //
+        // Compared against the **left**-trimmed query, not the fully trimmed
+        // one: the target ends in a space, so trimming both sides would hide the
+        // one case that must answer `None` — `"horizon "`, already its own
+        // target — and Enter would rewrite the query to itself forever.
+        let typed = query.trim_start();
+        let colon = if typed.starts_with(':') { ":" } else { "" };
+        let target = format!("{colon}{} ", command.verb());
+        return CommandState::NeedsArgument {
+            completion: (target != typed).then_some(target),
+        };
+    };
+
+    match command {
+        OmniCommand::Horizon => match arg.parse::<u16>() {
+            // Refused in Search exactly as `w` is, and for the same reason:
+            // `within_horizon` returns early there, so the change would be
+            // invisible where it was made yet persist into the List pane you
+            // return to.
+            Ok(_) if model.search_active() => CommandState::RefusedHere {
+                reason: "not in Search — every match shows",
+            },
+            Ok(days) => CommandState::Valid {
+                effect: format!("{} → {days}", model.horizon_days),
+            },
+            Err(_) => CommandState::Invalid {
+                reason: "0–65535".to_string(),
+            },
+        },
+        OmniCommand::Flavor => match Flavor::from_name(arg) {
+            Some(flavor) => CommandState::Valid {
+                effect: format!("{} → {}", model.flavor.as_str(), flavor.as_str()),
+            },
+            None => CommandState::Invalid {
+                reason: "unknown — latte|frappe|macchiato|mocha".to_string(),
+            },
+        },
+        OmniCommand::Ascii => match parse_on_off(arg) {
+            Some(on) => CommandState::Valid {
+                effect: format!("{} → {}", on_off(model.ascii), on_off(on)),
+            },
+            None => CommandState::Invalid {
+                reason: "on|off".to_string(),
+            },
+        },
+    }
+}
+
+/// Case-insensitive, like every other command argument — `:flavor` inherits it
+/// from `Theme::from_flavor`, and one parse table wants one case rule.
+fn parse_on_off(arg: &str) -> Option<bool> {
+    match arg.to_ascii_lowercase().as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 /// Open the title/notes filter input (`/`). Focuses the task pane — the filter
 /// narrows it, so acting on the results wants that pane — and seeds an empty query
 /// only when none is active, so `/` on a persisted filter reopens it for
@@ -3089,6 +3416,9 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // `pristine` alongside the buffer, and it binds four stepping keys the
         // shared arm has no notion of.
         Some(Overlay::EditDue { .. }) => return due_editor_key(model, key),
+        // Routed before the shared text arm: it owns a selection alongside its
+        // buffer, and `j`/`k` must type rather than move.
+        Some(Overlay::Omnibox { .. }) => return omnibox_key(model, key),
         // Both pickers, routed before the `Confirm` and text-buffer arms below:
         // falling through would let `y` dismiss one, or swallow its keys.
         Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {
@@ -3135,6 +3465,88 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         KeyCode::Esc => model.overlay = None,
         _ => {}
     }
+    Vec::new()
+}
+
+/// Keys for the **Omnibox**.
+///
+/// Four phases, in this order, and the order is the design:
+///
+/// **(a) copy out.** The query and the selection live inside `model.overlay`,
+/// but [`omnibox_rows`] takes the whole `&Model` — holding `&mut` on the overlay
+/// while calling it would not compile. Copying out ends the borrow and keeps the
+/// row builder a function of `(&Model, &str)`, testable with no `Overlay` in
+/// sight, rather than letting it drift to `omnibox_rows(&Overlay, &Model)` at
+/// first compile. One `String` clone per keystroke, on a query bounded by what a
+/// human types.
+///
+/// **(b) re-clamp, before the key match.** `update` routes only `Message::Key`
+/// here, so a `ListsLoaded` can have shrunk the rows since the last keystroke.
+/// The renderer clamps for *drawing*, but that is invisible to the reducer:
+/// without this, `Up`'s `saturating_sub` would work on a stale index and the
+/// drawn highlight and the fired row would disagree. It runs on **every** key,
+/// including one that turns out inert — it repairs stale state rather than
+/// enacting the keystroke, which is why the unfireable rows promise "nothing
+/// beyond the clamp".
+///
+/// **(c) the key match.** `j`/`k` **type**, as in every other overlay with a
+/// buffer (`picker_key` moves on them only because its overlays have none).
+/// Movement is `Up`/`Down`; `^N`/`^P` are deliberately unbound, because
+/// `resolve` is modifier-blind and a `^N` landing a beat after the overlay
+/// closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.
+/// `Backspace`/`^W`/`^U` all edit, as the three existing text paths do — a
+/// surface where a typo cost the whole query would be quoting the text-overlay
+/// rule, not following it.
+///
+/// **(d) write back, conditionally.** Reached by every branch that leaves the
+/// *Omnibox* open — which is most of them, the edits included, since this is the
+/// only thing that persists an edited query. Branches that leave return from
+/// inside the match; gating on "did `model.overlay` end up `None`" instead would
+/// leak the SEARCH rows, which end at `Some(Overlay::Filter)` and would have it
+/// clobbered by a resurrected Omnibox.
+fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+
+    // (a)
+    let Some(Overlay::Omnibox { query, selected }) = &model.overlay else {
+        return Vec::new();
+    };
+    let (mut query, mut selected) = (query.clone(), *selected);
+
+    // (b)
+    let len = omnibox_rows(model, &query).len();
+    selected = selected.min(len.saturating_sub(1));
+
+    // (c). `before` is the whole reset rule: `selected` returns to 0 when the
+    // *query string changes*, not when a particular key is pressed — a
+    // `Backspace` on an empty query leaves the buffer byte-identical and must
+    // leave the highlight alone, the distinction `Overlay::EditDue` already
+    // draws for a step refused at the ends of the calendar.
+    let before = query.clone();
+    let chord = keymap::is_control_chord(key.modifiers);
+    match key.code {
+        KeyCode::Char('u') if chord => query.clear(),
+        KeyCode::Char('w') if chord => kill_word(&mut query),
+        KeyCode::Char(c) if !chord => query.push(c),
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Down => selected = (selected + 1).min(len.saturating_sub(1)),
+        KeyCode::Up => selected = selected.saturating_sub(1),
+        KeyCode::Esc => {
+            model.overlay = None;
+            return Vec::new();
+        }
+        // Dispatch arrives with its targets; until then `Enter` falls here and
+        // is swallowed like any unbound key.
+        _ => {}
+    }
+    if query != before {
+        selected = 0;
+    }
+
+    // (d)
+    model.overlay = Some(Overlay::Omnibox { query, selected });
     Vec::new()
 }
 

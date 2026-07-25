@@ -50,6 +50,10 @@ pub enum Action {
     /// narrowed live by the `/` query. When Search is already active, reopens the
     /// query input over the existing query.
     Search,
+    /// Open the **Omnibox** (`p`): one grouped list over a query, offering the
+    /// Lists to jump to, the keyless commands, a hand-off to Search, and — last —
+    /// capturing the query as a Task.
+    Omnibox,
     /// Open a URL found in the selected Task's notes.
     OpenLink,
     ClearCompleted,
@@ -253,6 +257,21 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('S'),
             action: Action::Search,
             help: "search all lists",
+        },
+        // Beside `/` and `S`, the other query surfaces, and mid-table for the
+        // reason they and `m`/`w`/`M` each give: `help_layout` drops cheatsheet
+        // rows from the tail, so a new verb appended after the sidebar capitals
+        // would be first to vanish on a short pane. No always-visible legend
+        // cell — the 80-column TASKS row is already full through `c completed`
+        // (see `legend`); this lives in `?`.
+        //
+        // `Ctrl-P` opens it too, free: `resolve` is modifier-blind, exactly as
+        // `Ctrl-Q` already quits. Unadvertised, because the table cannot express
+        // a chord (#105) and `p` is the key the cheatsheet teaches.
+        Binding {
+            key: KeyCode::Char('p'),
+            action: Action::Omnibox,
+            help: "jump, run or capture",
         },
         Binding {
             key: KeyCode::Char('C'),

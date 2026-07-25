@@ -148,6 +148,9 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
         // The filter input draws no popup — the pane header carries its query and
         // caret (see `header_title`), so the narrowed pane stays fully visible.
         Overlay::Filter => return,
+        // No popup yet — `render_omnibox` replaces this arm. `Overlay::Filter`
+        // above is the precedent for an overlay that draws none.
+        Overlay::Omnibox { .. } => return,
     };
     let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
     let popup = centered(area, OVERLAY_WIDTH, height + OVERLAY_BORDERS);
@@ -1301,6 +1304,10 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         // `Esc` leaves Search outright (matching `filter_key`'s Search-aware
         // `Esc`) instead of unfiltering a pane you would stay in. `^U clear` is
         // what empties the query in both.
+        // Its own legend: `j`/`k` type, movement is `Up`/`Down`, and `Enter`
+        // runs a row rather than saving a buffer — none of which `TextInput`
+        // would have said.
+        Some(Overlay::Omnibox { .. }) => keymap::LegendContext::Omnibox,
         Some(Overlay::Filter) if model.search_active() => keymap::LegendContext::SearchFilter,
         Some(Overlay::Filter) => keymap::LegendContext::Filter,
         // The add-entry captures parse a trailing date and bind `Tab` for a
@@ -2308,6 +2315,15 @@ mod tests {
             selected: 0,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::ListPicker);
+
+        // The Omnibox *does* have a buffer, and still declares its own: `j`/`k`
+        // type but movement is `Up`/`Down`, and `Enter` runs a row rather than
+        // saving — none of which `TextInput`'s two cells would have said.
+        model.overlay = Some(Overlay::Omnibox {
+            query: String::new(),
+            selected: 0,
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::Omnibox);
     }
 
     #[test]

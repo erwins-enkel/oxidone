@@ -310,7 +310,6 @@ fn horizon_is_refused_in_search() {
     update(&mut model, key(KeyCode::Esc));
     model.selected = Selection::List(0);
     update(&mut model, ch('S'));
-    update(&mut model, ch('p'));
 
     assert!(matches!(
         commands(&model, "horizon 30")[0].1,
@@ -357,7 +356,6 @@ fn the_advisory_is_horizons_alone_and_absent_in_search() {
     update(&mut model, key(KeyCode::Esc));
     model.selected = Selection::List(0);
     update(&mut model, ch('S'));
-    update(&mut model, ch('p'));
     for q in ["horizon", "horizon 30"] {
         assert!(commands(&model, q)[0].2.is_none(), "{q:?} in Search");
     }
@@ -494,4 +492,135 @@ fn a_shrinking_lists_loaded_is_repaired_on_the_next_keystroke() {
 
     update(&mut model, key(KeyCode::Up));
     assert_eq!(selected(&model), shrunk - 2);
+}
+
+// ─── JUMP and SEARCH dispatch ───────────────────────────────────────────────
+
+/// A JUMP lands with the task pane focused — asserted from `Focus::Sidebar`,
+/// because from `Focus::Tasks` it would pass even with the line deleted. That
+/// line sits at the call site, deliberately outside `open_selection`, so this is
+/// the only thing standing between it and every sidebar `j`/`k` stealing focus.
+#[test]
+fn a_jump_focuses_the_task_pane() {
+    let mut model = open_with(&["work"]);
+    model.focus = Focus::Sidebar;
+    for c in "work".chars() {
+        update(&mut model, ch(c));
+    }
+
+    update(&mut model, key(KeyCode::Enter));
+
+    assert_eq!(model.selected, Selection::List(0));
+    assert_eq!(model.focus, Focus::Tasks);
+    assert!(model.overlay.is_none());
+}
+
+/// Naming the pane you are already parked on is not inert — it is how you leave
+/// Search for the List you came from. `move_list_selection`'s no-movement guard
+/// is for a clamped cursor and deliberately not shared.
+#[test]
+fn a_jump_to_the_parked_list_still_leaves_search() {
+    let mut model = open_with(&["work"]);
+    update(&mut model, key(KeyCode::Esc));
+    model.selected = Selection::List(0);
+    update(&mut model, ch('S'));
+    // `Enter`, not `Esc`: `S` leaves its query input open, and `Esc` *there*
+    // exits Search outright — which would make the assertion below vacuous.
+    update(&mut model, key(KeyCode::Enter));
+    assert!(model.search_active());
+
+    update(&mut model, ch('p'));
+    for c in "work".chars() {
+        update(&mut model, ch(c));
+    }
+    let commands = update(&mut model, key(KeyCode::Enter));
+
+    assert!(!model.search_active(), "a named jump is never inert");
+    assert_eq!(model.selected, Selection::List(0));
+    assert!(!commands.is_empty(), "the pane reloads");
+}
+
+/// Through `enter_search`, never `Command::LoadSearch` directly — that is the
+/// only path that arms `search_pending` and clears the inherited cursor.
+#[test]
+fn the_search_row_enters_search_with_the_trimmed_query() {
+    let mut model = open_with(&["work"]);
+    update(&mut model, key(KeyCode::Esc));
+    model.selected = Selection::List(0);
+    update(&mut model, ch('p'));
+    for c in "  work  ".chars() {
+        update(&mut model, ch(c));
+    }
+    // JUMP matches `work` too, so step past it to the SEARCH row.
+    let search = rows(&model)
+        .iter()
+        .position(|r| matches!(r, OmniRow::Search { .. }))
+        .expect("a SEARCH row");
+    for _ in 0..search {
+        update(&mut model, key(KeyCode::Down));
+    }
+    update(&mut model, key(KeyCode::Enter));
+
+    assert!(model.search_active());
+    assert!(model.search_pending);
+    assert!(model.tasks.is_empty(), "the inherited cursor is cleared");
+    assert_eq!(model.focus, Focus::Tasks);
+    // Trimmed: `matches_filter` never trims, so a raw needle would hide a Task
+    // titled exactly `work`.
+    assert_eq!(model.filter.as_deref(), Some("work"));
+    assert!(matches!(model.overlay, Some(Overlay::Filter)));
+}
+
+/// Already in Search: no reload, the corpus survives — and the cursor
+/// re-anchors, which `Action::Search`'s own arm has no need to do because
+/// `open_filter` never changes the query.
+#[test]
+fn the_search_row_inside_search_reloads_nothing() {
+    let mut model = open_with(&["work"]);
+    update(&mut model, key(KeyCode::Esc));
+    model.selected = Selection::List(0);
+    update(&mut model, ch('S'));
+    // As above: `Enter` closes the query input and stays in Search.
+    update(&mut model, key(KeyCode::Enter));
+    assert!(model.search_active());
+    update(&mut model, ch('p'));
+    for c in "zz".chars() {
+        update(&mut model, ch(c));
+    }
+    let search = rows(&model)
+        .iter()
+        .position(|r| matches!(r, OmniRow::Search { .. }))
+        .expect("a SEARCH row");
+    for _ in 0..search {
+        update(&mut model, key(KeyCode::Down));
+    }
+
+    let commands = update(&mut model, key(KeyCode::Enter));
+
+    assert!(commands.is_empty(), "no redundant LoadSearch");
+    assert!(model.search_active());
+    assert_eq!(model.filter.as_deref(), Some("zz"));
+    assert!(matches!(model.overlay, Some(Overlay::Filter)));
+}
+
+/// Enter fires `rows[len - 1]` after a shrink — the row the renderer will draw.
+/// Not "fires nothing": phase (b) has already clamped, and `omnibox_rows` is
+/// never empty, so `rows.get` is always `Some`.
+#[test]
+fn enter_after_a_shrink_fires_the_clamped_row() {
+    let mut model = open_with(&["a", "b", "c"]);
+    let last = rows(&model).len() - 1;
+    for _ in 0..last {
+        update(&mut model, key(KeyCode::Down));
+    }
+
+    update(&mut model, Message::ListsLoaded(vec![list("a"), list("b")]));
+    // The last row is `:ascii`, a COMMAND row: it keeps the overlay rather than
+    // firing, which is exactly what the clamped index should reach.
+    update(&mut model, key(KeyCode::Enter));
+
+    assert!(
+        matches!(model.overlay, Some(Overlay::Omnibox { .. })),
+        "the clamped row was fired, not a stale one"
+    );
 }

@@ -3537,8 +3537,25 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
             model.overlay = None;
             return Vec::new();
         }
-        // Dispatch arrives with its targets; until then `Enter` falls here and
-        // is swallowed like any unbound key.
+        KeyCode::Enter => {
+            // Take the overlay first, as `submit_input` does, so closing is the
+            // default: a branch that leaves the Omnibox needs no code, and one
+            // that keeps it says so by falling through to (d).
+            model.overlay = None;
+            // `get`, not an index: the rows were rebuilt above from the live
+            // `Model`, so this is `Some` by construction, but a stale index must
+            // fire nothing rather than the wrong row if that ever stops holding.
+            let Some(row) = omnibox_rows(model, &query).into_iter().nth(selected) else {
+                return Vec::new();
+            };
+            match row {
+                OmniRow::Jump(target) => return jump_to(model, target),
+                OmniRow::Search { query } => return omnibox_search(model, query),
+                // Dispatch arrives with its own step; until then Enter on a
+                // COMMAND row keeps the overlay, as its unfireable states will.
+                OmniRow::Command(_) => {}
+            }
+        }
         _ => {}
     }
     if query != before {
@@ -3548,6 +3565,61 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     // (d)
     model.overlay = Some(Overlay::Omnibox { query, selected });
     Vec::new()
+}
+
+/// Open the pane a JUMP row names.
+///
+/// The `ListId` is resolved to an index **here**, not stored as one when the row
+/// was built: a `ListsLoaded` can reorder `lists` between the render and the
+/// press, and a stale index would open a *different* List — silently, and
+/// plausibly enough to go unnoticed. An id that no longer resolves fires
+/// nothing.
+///
+/// Calls [`open_selection`] **unconditionally**, unlike `move_list_selection`,
+/// which guards on having actually moved. That guard is for a clamped cursor at
+/// the sidebar's edge; naming the pane you are already in is a deliberate
+/// choice, and it is how you leave Search for the List you came from.
+fn jump_to(model: &mut Model, target: JumpTarget) -> Vec<Command> {
+    model.selected = match target {
+        JumpTarget::Today => Selection::Today,
+        JumpTarget::List { id, .. } => match model.lists.iter().position(|l| l.id == id) {
+            Some(index) => Selection::List(index),
+            None => return Vec::new(),
+        },
+    };
+    let commands = open_selection(model);
+    // Set here rather than inside `open_selection`: a landing chosen by name
+    // wants the pane focused, a sidebar `j`/`k` does not.
+    model.focus = Focus::Tasks;
+    commands
+}
+
+/// Hand the query off to the **Search** pane.
+///
+/// Routes through [`enter_search`] rather than emitting `Command::LoadSearch`:
+/// `request_selected` documents itself as that Command's single choke point, and
+/// is the only place that arms `search_pending` and normalises a carried-in
+/// `Manual` lens; `enter_search` additionally clears the inherited cursor.
+///
+/// The **trimmed** query, because `matches_filter` does not trim: a raw `work `
+/// would be a literal needle hiding a Task titled exactly `work`. `Overlay::Filter`
+/// is left open — that is precisely the state `S`-then-type produces.
+fn omnibox_search(model: &mut Model, query: String) -> Vec<Command> {
+    if model.search_active() {
+        // Already there: mirror `Action::Search`, which refuses to re-enter, so
+        // the corpus is neither cleared nor re-fetched. But re-anchor, which that
+        // arm has no need to — `open_filter` reopens the input over an unchanged
+        // query, while this *replaces* it with `tasks` deliberately preserved, and
+        // `is_visible` ANDs in `matches_filter`, so the new query can hide the row
+        // the cursor is on.
+        model.filter = Some(query);
+        open_filter(model);
+        reselect_visible(model);
+        return Vec::new();
+    }
+    let commands = enter_search(model);
+    model.filter = Some(query);
+    commands
 }
 
 /// Keys for the due editor (named for the overlay, not the sort key `due_key`
@@ -4095,6 +4167,24 @@ fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     // move is the "open the List instead" gesture, so it leaves Search — here, not
     // inside `request_selected`, which `refresh()` also calls (with
     // `clear_pane == false`) and must keep Search for `r`.
+    open_selection(model)
+}
+
+/// Load whatever `model.selected` now names, leaving Search on the way.
+///
+/// The tail of [`move_list_selection`], shared with the Omnibox's JUMP — and
+/// **only** the tail. Two things stay at each call site:
+///
+/// - the assignment to `model.selected`, which each caller computes differently
+///   (a clamped step there, a named row here);
+/// - `focus`. Setting it here would make every sidebar `j`/`k` steal focus to
+///   the task pane, and `jk_with_the_sidebar_focused_leaves_search_and_loads_the_list`
+///   asserts the commands but not the focus, so nothing would catch it.
+///
+/// The no-movement guard stays behind too: it is `move_list_selection`'s alone,
+/// because an Omnibox jump is an explicit choice of a named row rather than a
+/// cursor that may not have moved.
+fn open_selection(model: &mut Model) -> Vec<Command> {
     leave_search(model);
     request_selected(model, true)
 }

@@ -2261,22 +2261,75 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
 /// List, refused up front (fail closed) when that is not yet known rather than
 /// opening an overlay that discards.
 fn open_add_task(model: &mut Model) {
-    if model.today_active() || model.search_active() {
-        if model.default_list.is_none() {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
-            return;
+    if let Err(refusal) = capture_target(model) {
+        // Assigned only when there is something to say. `= message().map(..)`
+        // reads tidier and is a regression: it writes `None` on the silent arm,
+        // clearing a status line this function has always left alone.
+        if let Some(message) = refusal.message() {
+            model.status_line = Some(message.to_string());
         }
-        model.overlay = Some(Overlay::AddTask {
-            buffer: String::new(),
-        });
         return;
     }
-    if model.selected_list_id().is_some() {
-        model.overlay = Some(Overlay::AddTask {
-            buffer: String::new(),
+    model.overlay = Some(Overlay::AddTask {
+        buffer: String::new(),
+    });
+}
+
+/// Where a capture would go, and what date it would carry.
+///
+/// The three-way resolution `finish_add_task` and `open_add_task` were each
+/// doing, in one place — so the Omnibox's CAPTURE row cannot disagree with `a`
+/// about whether a capture is even possible.
+struct CaptureTarget {
+    list: ListId,
+    /// Today defaults a dateless capture to today, so the entry stays on the page
+    /// it was created on; the other two panes leave it undated rather than
+    /// inventing a schedule.
+    due_default: Option<NaiveDate>,
+}
+
+/// Why a capture cannot happen.
+enum CaptureRefusal {
+    /// Today or Search, with `default_list` unresolved.
+    NoDefaultList,
+    /// A List pane whose selection resolves to no List — Lists not loaded yet, or
+    /// a stale index. Degenerate rather than ordinary, and **silent**.
+    NoSelectedList,
+}
+
+impl CaptureRefusal {
+    /// What to put on the status line, or `None` where this has always been
+    /// silent. An `Option` rather than a `&str` precisely so the silent arm stays
+    /// silent through the fold.
+    fn message(&self) -> Option<&'static str> {
+        match self {
+            CaptureRefusal::NoDefaultList => {
+                Some("can't capture: default list not resolved (connect to Google)")
+            }
+            CaptureRefusal::NoSelectedList => None,
+        }
+    }
+}
+
+fn capture_target(model: &Model) -> Result<CaptureTarget, CaptureRefusal> {
+    if model.today_active() || model.search_active() {
+        let list = model
+            .default_list
+            .clone()
+            .ok_or(CaptureRefusal::NoDefaultList)?;
+        return Ok(CaptureTarget {
+            list,
+            due_default: model.today_active().then(|| model.now.date_naive()),
         });
     }
+    let list = model
+        .selected_list_id()
+        .cloned()
+        .ok_or(CaptureRefusal::NoSelectedList)?;
+    Ok(CaptureTarget {
+        list,
+        due_default: None,
+    })
 }
 
 /// Optimistically insert a placeholder Task at the top of **stored** order
@@ -2290,38 +2343,25 @@ fn open_add_task(model: &mut Model) {
 /// buffer is the title and no due date is parsed off it.
 fn finish_add_task(model: &mut Model, buffer: String, literal: bool) -> Vec<Command> {
     let (title, due) = capture_title_and_due(model, &buffer, literal);
+    // **Before** the target resolves, and it must stay there: an empty submit on
+    // Today while offline is silent today, and resolving first would newly print
+    // "can't capture" for a submit that was never going to create anything.
     if title.is_empty() {
         return Vec::new();
     }
-    if model.today_active() {
-        // Capture into the resolved default List. Default the due date to today so a
-        // dateless capture stays on the page it was created on (Today membership); a
-        // trailing date parsed off the title (#80) is honoured instead, so an entry
-        // the user explicitly scheduled for later correctly leaves the Today set.
-        let Some(list) = model.default_list.clone() else {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
+    let target = match capture_target(model) {
+        Ok(target) => target,
+        Err(refusal) => {
+            if let Some(message) = refusal.message() {
+                model.status_line = Some(message.to_string());
+            }
             return Vec::new();
-        };
-        let due = due.or_else(|| Some(model.now.date_naive()));
-        return add_task_placeholder(model, list, title, None, 0, due);
-    }
-    if model.search_active() {
-        // Also the default List, but **undated**: Search has no membership to
-        // preserve (unlike Today's `due <= today`), so forcing a due date would
-        // invent a schedule the user did not ask for. A trailing parsed date is
-        // still honoured, exactly as in a List pane.
-        let Some(list) = model.default_list.clone() else {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
-            return Vec::new();
-        };
-        return add_task_placeholder(model, list, title, None, 0, due);
-    }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
+        }
     };
-    add_task_placeholder(model, list, title, None, 0, due)
+    // A trailing date parsed off the title (#80) wins over the pane's default, so
+    // an entry explicitly scheduled for later correctly leaves the Today set.
+    let due = due.or(target.due_default);
+    add_task_placeholder(model, target.list, title, None, 0, due)
 }
 
 /// Resolve a capture buffer into `(title, due)`. `literal` keeps the raw trimmed

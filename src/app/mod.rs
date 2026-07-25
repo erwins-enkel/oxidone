@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 
+use crate::config::Flavor;
 use crate::dateparse;
 use crate::domain::{
     due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
@@ -71,6 +72,17 @@ pub struct Model {
     /// than this many days out is hidden while the filter is on. Held separately
     /// from the flag so the cutoff survives toggling the filter off and on.
     pub horizon_days: u16,
+    /// The Catppuccin flavor the frame is painted in, seeded from `config.theme`.
+    /// Held here rather than in the runtime so the Omnibox's `:flavor` command can
+    /// change it: `ui::draw` builds the `Theme` from this on every frame.
+    ///
+    /// Session-only, like `ascii` — nothing writes it back to `config.toml`.
+    pub flavor: Flavor,
+    /// Whether braille data widgets degrade to ASCII, seeded from
+    /// `config.ascii_fallback`. Was a runtime parameter to `ui::view`; it moves
+    /// here for the same reason `flavor` does, and reaches the renderer the same
+    /// way.
+    pub ascii: bool,
     /// The active title/notes filter (`/`), or `None` when off. A case-insensitive
     /// substring matched against each row's display title and notes body — a local,
     /// read-only view filter like `show_completed`/`hide_distant`, never mutating
@@ -216,6 +228,165 @@ struct PendingListMove {
     task: Task,
 }
 
+/// Which band of the Omnibox a row belongs to. Derived from the row's own
+/// variant, never stored beside it — a stored group would make
+/// `Group::Jump`-with-a-`CommandRow` representable.
+///
+/// "Group", the Journal spread's word for a labelled band of rows, not
+/// "section" (`CONTEXT.md` avoids that). The **List** entry avoids "group" as a
+/// *synonym for a List*; this is the other sense, and `Jump` grouping rows that
+/// happen to be Lists is the one place they meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Jump,
+    Command,
+    Search,
+    Capture,
+}
+
+impl Group {
+    /// The group header's text. `Command` carries the session-only caveat here
+    /// rather than on every row: it would otherwise cost the same dozen cells on
+    /// each, competing with the effect and the advisory for one budget.
+    pub fn header(self) -> &'static str {
+        match self {
+            Group::Jump => "JUMP",
+            Group::Command => "COMMAND · session only",
+            Group::Search => "SEARCH",
+            Group::Capture => "CAPTURE",
+        }
+    }
+}
+
+/// Which keyless command a COMMAND row names.
+///
+/// `OmniCommand`, not `Cmd`: [`Command`] is the side-effect enum in this same
+/// module, and a `Cmd`/`Command` pair a scroll apart is the collision this
+/// codebase avoids elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmniCommand {
+    Horizon,
+    Flavor,
+    Ascii,
+}
+
+impl OmniCommand {
+    /// Table order — which is also the order the rows appear in, and therefore
+    /// which one `selected == 0` names when a prefix matches more than one.
+    pub const ALL: [OmniCommand; 3] = [
+        OmniCommand::Horizon,
+        OmniCommand::Flavor,
+        OmniCommand::Ascii,
+    ];
+
+    /// The canonical verb, without the display-only `:`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            OmniCommand::Horizon => "horizon",
+            OmniCommand::Flavor => "flavor",
+            OmniCommand::Ascii => "ascii",
+        }
+    }
+}
+
+/// What a COMMAND row's argument amounts to. Decided in the row builder, so the
+/// row states its own validity and dispatch only acts on what it already says.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandState {
+    /// Verb matched, argument absent. `completion` is the query `Enter` rewrites
+    /// to, and is `None` exactly when that target equals the current query —
+    /// which is what makes a second `Enter` inert. A bare `horizon` is
+    /// `Some("horizon ")`: appending the space is a real change.
+    NeedsArgument { completion: Option<String> },
+    /// Argument present and unparseable. Carries the range or the valid set.
+    Invalid { reason: String },
+    /// Argument valid, but the command cannot act in this pane (`:horizon` in
+    /// Search). Distinct from `Invalid`: fix the pane, not the text.
+    RefusedHere { reason: &'static str },
+    /// Parsed and ready. `effect` is the row's `14 → 30`.
+    Valid { effect: String },
+}
+
+/// One COMMAND row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRow {
+    pub command: OmniCommand,
+    pub state: CommandState,
+    /// A caveat true of the row whatever its *state* — today only ":horizon
+    /// while `hide_distant` is off, outside Search". Row-level rather than
+    /// per-state, because it applies to `horizon`, `horizon ` and `horizon 30`
+    /// alike. Set iff `command == Horizon && !search_active() && !hide_distant`;
+    /// the command predicate is what keeps it off the `:flavor`/`:ascii` rows,
+    /// which `w` has nothing to do with.
+    pub advisory: Option<&'static str>,
+}
+
+/// The CAPTURE row: what `Enter` would create, or why it cannot.
+///
+/// Validity-or-reason like [`CommandState`], not a flat struct of fields that
+/// only mean anything when the capture can happen — a `Refused` row has no
+/// destination to name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureRow {
+    Ready {
+        list_title: String,
+        /// The **peeled** title, from the same `capture_title_and_due` the write
+        /// calls, so the row and the Task cannot disagree.
+        title: String,
+        /// The peeled date, or the pane's default — what the Task will carry.
+        due: Option<NaiveDate>,
+    },
+    Refused {
+        /// A row constant, deliberately **not** `CaptureRefusal::message()`: that
+        /// wording is what the status line preserves byte-for-byte, and at 55
+        /// cells it leaves a row no room beside its label. Kept true of every
+        /// cause — `default_list` is `None` while online at startup too, so an
+        /// "offline" claim would be wrong in the case it most often names.
+        reason: &'static str,
+    },
+}
+
+/// Where a JUMP row goes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JumpTarget {
+    /// The pinned cross-List view. Its own variant, not a sentinel `ListId`:
+    /// Today is not a List, and [`Selection`] already models it this way.
+    Today,
+    /// `id` is resolved to an index at `Enter` time, never stored as one — a
+    /// `ListsLoaded` can reorder `lists` between the render and the press, and a
+    /// stale index would open a *different* List, silently.
+    List { id: ListId, title: String },
+}
+
+/// One row of the Omnibox, and the group it sits under.
+///
+/// An enum rather than a struct with a `Group` field, so an invalid pairing is
+/// unrepresentable and both the renderer's match and [`OmniRow::group`] are
+/// exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OmniRow {
+    Jump(JumpTarget),
+    Command(CommandRow),
+    /// Carries the query rather than letting the renderer re-read it from the
+    /// overlay: two readers of one string can disagree, and this one is echoed
+    /// in the row's label.
+    Search {
+        query: String,
+    },
+    Capture(CaptureRow),
+}
+
+impl OmniRow {
+    pub fn group(&self) -> Group {
+        match self {
+            OmniRow::Jump(_) => Group::Jump,
+            OmniRow::Command(_) => Group::Command,
+            OmniRow::Search { .. } => Group::Search,
+            OmniRow::Capture(_) => Group::Capture,
+        }
+    }
+}
+
 /// A modal overlay drawn over the panes.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -262,6 +433,14 @@ pub enum Overlay {
     /// notes URLs. Only raised for more than one; a single link opens without
     /// asking.
     OpenLink { links: Vec<Link>, selected: usize },
+    /// The **Omnibox** (`p`): one query over a grouped result list.
+    ///
+    /// `selected` indexes [`omnibox_rows`]'s output, which holds **only
+    /// selectable rows** — group headers are not in it, so the cursor cannot
+    /// land on one. It can go stale: `update` routes only `Message::Key` here,
+    /// so a `ListsLoaded` can shrink the rows underneath an open Omnibox. Every
+    /// reader therefore clamps or `get`s rather than indexing blindly.
+    Omnibox { query: String, selected: usize },
     /// Pick the List to relocate a Task to.
     ///
     /// `task` and `source` are captured when the picker opens rather than re-read
@@ -293,8 +472,16 @@ impl Overlay {
             // routes it through `due_editor_key` before this path, because its keys need
             // `pristine` as well as the buffer. Returning the buffer here would be
             // an arm nothing can reach.
+            //
+            // `Omnibox` likewise: `overlay_key` routes it to `omnibox_key`
+            // first. Answering `Some` here would be worse than redundant —
+            // `overlay_key`'s routing match ends in `_ => {}`, so a forgotten
+            // route is not a build error, and the fall-through would silently
+            // hand the Omnibox this arm's `Enter` → `submit_input`. `None` makes
+            // that fall-through inert instead, which is visible at once.
             Overlay::Filter
             | Overlay::EditDue { .. }
+            | Overlay::Omnibox { .. }
             | Overlay::Confirm(_)
             | Overlay::OpenLink { .. }
             | Overlay::MoveToList { .. } => None,
@@ -341,6 +528,8 @@ impl Default for Model {
             sort: SortView::Due,
             hide_distant: false,
             horizon_days: 14,
+            flavor: Flavor::default(),
+            ascii: false,
             filter: None,
             search: false,
             search_pending: false,
@@ -1951,6 +2140,17 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
                 reselect_visible(model);
             }
         }
+        // Sets the overlay and nothing else — deliberately unlike `open_filter`
+        // and `enter_search`, which move focus because the surface they open
+        // *narrows that pane*. The Omnibox narrows nothing: it floats over both,
+        // its own keys drive it, and whichever pane you opened it from is where
+        // `Esc` should leave you. Focus moves on a JUMP, at that call site.
+        Action::Omnibox => {
+            model.overlay = Some(Overlay::Omnibox {
+                query: String::new(),
+                selected: 0,
+            })
+        }
         Action::Filter => open_filter(model),
         // In Search already, `S` reopens the query input over the existing query
         // (like `/`), never re-entering: `enter_search` would clear the corpus,
@@ -2088,22 +2288,75 @@ fn cycle_type(model: &mut Model, step: fn(EntryType) -> EntryType) -> Vec<Comman
 /// List, refused up front (fail closed) when that is not yet known rather than
 /// opening an overlay that discards.
 fn open_add_task(model: &mut Model) {
-    if model.today_active() || model.search_active() {
-        if model.default_list.is_none() {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
-            return;
+    if let Err(refusal) = capture_target(model) {
+        // Assigned only when there is something to say. `= message().map(..)`
+        // reads tidier and is a regression: it writes `None` on the silent arm,
+        // clearing a status line this function has always left alone.
+        if let Some(message) = refusal.message() {
+            model.status_line = Some(message.to_string());
         }
-        model.overlay = Some(Overlay::AddTask {
-            buffer: String::new(),
-        });
         return;
     }
-    if model.selected_list_id().is_some() {
-        model.overlay = Some(Overlay::AddTask {
-            buffer: String::new(),
+    model.overlay = Some(Overlay::AddTask {
+        buffer: String::new(),
+    });
+}
+
+/// Where a capture would go, and what date it would carry.
+///
+/// The three-way resolution `finish_add_task` and `open_add_task` were each
+/// doing, in one place — so the Omnibox's CAPTURE row cannot disagree with `a`
+/// about whether a capture is even possible.
+struct CaptureTarget {
+    list: ListId,
+    /// Today defaults a dateless capture to today, so the entry stays on the page
+    /// it was created on; the other two panes leave it undated rather than
+    /// inventing a schedule.
+    due_default: Option<NaiveDate>,
+}
+
+/// Why a capture cannot happen.
+enum CaptureRefusal {
+    /// Today or Search, with `default_list` unresolved.
+    NoDefaultList,
+    /// A List pane whose selection resolves to no List — Lists not loaded yet, or
+    /// a stale index. Degenerate rather than ordinary, and **silent**.
+    NoSelectedList,
+}
+
+impl CaptureRefusal {
+    /// What to put on the status line, or `None` where this has always been
+    /// silent. An `Option` rather than a `&str` precisely so the silent arm stays
+    /// silent through the fold.
+    fn message(&self) -> Option<&'static str> {
+        match self {
+            CaptureRefusal::NoDefaultList => {
+                Some("can't capture: default list not resolved (connect to Google)")
+            }
+            CaptureRefusal::NoSelectedList => None,
+        }
+    }
+}
+
+fn capture_target(model: &Model) -> Result<CaptureTarget, CaptureRefusal> {
+    if model.today_active() || model.search_active() {
+        let list = model
+            .default_list
+            .clone()
+            .ok_or(CaptureRefusal::NoDefaultList)?;
+        return Ok(CaptureTarget {
+            list,
+            due_default: model.today_active().then(|| model.now.date_naive()),
         });
     }
+    let list = model
+        .selected_list_id()
+        .cloned()
+        .ok_or(CaptureRefusal::NoSelectedList)?;
+    Ok(CaptureTarget {
+        list,
+        due_default: None,
+    })
 }
 
 /// Optimistically insert a placeholder Task at the top of **stored** order
@@ -2117,38 +2370,25 @@ fn open_add_task(model: &mut Model) {
 /// buffer is the title and no due date is parsed off it.
 fn finish_add_task(model: &mut Model, buffer: String, literal: bool) -> Vec<Command> {
     let (title, due) = capture_title_and_due(model, &buffer, literal);
+    // **Before** the target resolves, and it must stay there: an empty submit on
+    // Today while offline is silent today, and resolving first would newly print
+    // "can't capture" for a submit that was never going to create anything.
     if title.is_empty() {
         return Vec::new();
     }
-    if model.today_active() {
-        // Capture into the resolved default List. Default the due date to today so a
-        // dateless capture stays on the page it was created on (Today membership); a
-        // trailing date parsed off the title (#80) is honoured instead, so an entry
-        // the user explicitly scheduled for later correctly leaves the Today set.
-        let Some(list) = model.default_list.clone() else {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
+    let target = match capture_target(model) {
+        Ok(target) => target,
+        Err(refusal) => {
+            if let Some(message) = refusal.message() {
+                model.status_line = Some(message.to_string());
+            }
             return Vec::new();
-        };
-        let due = due.or_else(|| Some(model.now.date_naive()));
-        return add_task_placeholder(model, list, title, None, 0, due);
-    }
-    if model.search_active() {
-        // Also the default List, but **undated**: Search has no membership to
-        // preserve (unlike Today's `due <= today`), so forcing a due date would
-        // invent a schedule the user did not ask for. A trailing parsed date is
-        // still honoured, exactly as in a List pane.
-        let Some(list) = model.default_list.clone() else {
-            model.status_line =
-                Some("can't capture: default list not resolved (connect to Google)".to_string());
-            return Vec::new();
-        };
-        return add_task_placeholder(model, list, title, None, 0, due);
-    }
-    let Some(list) = model.selected_list_id().cloned() else {
-        return Vec::new();
+        }
     };
-    add_task_placeholder(model, list, title, None, 0, due)
+    // A trailing date parsed off the title (#80) wins over the pane's default, so
+    // an entry explicitly scheduled for later correctly leaves the Today set.
+    let due = due.or(target.due_default);
+    add_task_placeholder(model, target.list, title, None, 0, due)
 }
 
 /// Resolve a capture buffer into `(title, due)`. `literal` keeps the raw trimmed
@@ -2950,6 +3190,232 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
+/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH,
+/// CAPTURE — the four [`Group::header`] names, and the order `selected == 0`
+/// resolves against, so a write is always the last thing `Enter` can reach.
+///
+/// A pure function of the `Model` and the query — no `Overlay` in sight — so
+/// every row-level property is assertable without a terminal and without driving
+/// `update`. `omnibox_key` keeps it that way by copying the query out of the
+/// overlay before calling.
+///
+/// Returns **only selectable rows**; the renderer emits a group header wherever
+/// [`OmniRow::group`] changes.
+///
+/// Matching runs on the **trimmed** query throughout — the leading trim is what
+/// keeps `" hor"` from splitting to an empty verb that prefix-matches all three
+/// commands and puts an `Invalid` row at `selected == 0`.
+pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
+    let trimmed = query.trim();
+    let needle = trimmed.to_lowercase();
+    let matches = |candidate: &str| candidate.to_lowercase().contains(&needle);
+
+    let mut rows = Vec::new();
+
+    // JUMP — Today first, then the Lists, mirroring the sidebar's own order
+    // (`move_list_selection` gives Today slot 0). Today is filtered like any
+    // other row: pinning it would make it `selected == 0` on *every* query,
+    // shadowing the row the user meant.
+    if matches("Today") {
+        rows.push(OmniRow::Jump(JumpTarget::Today));
+    }
+    for list in &model.lists {
+        if matches(&list.title) {
+            rows.push(OmniRow::Jump(JumpTarget::List {
+                id: list.id.clone(),
+                title: list.title.clone(),
+            }));
+        }
+    }
+
+    // COMMAND — split at the first space, strip one display-only `:`, match the
+    // verb by *prefix*. Substring would fire `:horizon` for `zon` and match two
+    // commands for `a`, landing an invalid row at `selected == 0`.
+    let (verb, arg) = split_command(trimmed);
+    for command in OmniCommand::ALL {
+        if !command.verb().starts_with(&verb.to_lowercase()) {
+            continue;
+        }
+        rows.push(OmniRow::Command(command_row(model, command, query, arg)));
+    }
+
+    // SEARCH and CAPTURE need something to act on; CAPTURE lands with
+    // `capture_target`. An empty query matches every JUMP candidate, which is
+    // right there and wrong here.
+    if !trimmed.is_empty() {
+        rows.push(OmniRow::Search {
+            query: trimmed.to_string(),
+        });
+        if let Some(capture) = capture_row(model, query) {
+            rows.push(OmniRow::Capture(capture));
+        }
+    }
+
+    rows
+}
+
+/// The CAPTURE row, or `None` where there is nothing honest to draw.
+///
+/// Absent — not a disabled row — in the two **nameless** cases: a
+/// `NoSelectedList` refusal, which has no reason to print either, and a resolved
+/// `default_list` whose `ListId` is not in `model.lists`. The latter is a real
+/// state: `Message::DefaultListResolved` never cross-checks, so a cache-seeded
+/// list set racing resolution leaves an id that names no title. Drawing "Create
+/// task…" with nowhere to put it is the one thing that would be a lie.
+///
+/// That title lookup lives **here, not in `capture_target`**: `finish_add_task`
+/// and `open_add_task` need only the id and capture happily without a title, so
+/// moving it would make them start refusing what they do today. `a` therefore
+/// keeps working while this row is absent, and the next `ListsLoaded` closes the
+/// window.
+fn capture_row(model: &Model, query: &str) -> Option<CaptureRow> {
+    let target = match capture_target(model) {
+        Ok(target) => target,
+        Err(refusal) => {
+            return refusal.message().map(|_| CaptureRow::Refused {
+                reason: "default list unresolved",
+            })
+        }
+    };
+    let list_title = model
+        .lists
+        .iter()
+        .find(|l| l.id == target.list)?
+        .title
+        .clone();
+    // The same helper the write calls, so the row cannot promise a title the
+    // Task will not carry.
+    let (title, due) = capture_title_and_due(model, query, false);
+    if title.is_empty() {
+        return None;
+    }
+    Some(CaptureRow::Ready {
+        list_title,
+        title,
+        due: due.or(target.due_default),
+    })
+}
+
+/// Split a query into `(verb, arg)` at the first space, stripping one optional
+/// leading `:` from the verb.
+///
+/// `arg` is **trimmed**, and empty-after-trim is `None` — so `horizon`,
+/// `horizon ` and `horizon   ` all mean "argument missing", and `horizon  30`
+/// parses like `horizon 30`. Without that, a query that looks correct would read
+/// invalid.
+pub fn split_command(trimmed: &str) -> (&str, Option<&str>) {
+    let (verb, rest) = match trimmed.split_once(' ') {
+        Some((verb, rest)) => (verb, Some(rest.trim())),
+        None => (trimmed, None),
+    };
+    (
+        verb.strip_prefix(':').unwrap_or(verb),
+        rest.filter(|a| !a.is_empty()),
+    )
+}
+
+/// Build one COMMAND row: its state, and the advisory that outlives the state.
+fn command_row(model: &Model, command: OmniCommand, query: &str, arg: Option<&str>) -> CommandRow {
+    // The `w` caveat is about the horizon and only the horizon: `hide_distant`
+    // and `search_active()` are properties of the *pane*, so a condition built
+    // from them alone would tell the user that `w` applies a palette change.
+    let advisory =
+        (command == OmniCommand::Horizon && !model.search_active() && !model.hide_distant)
+            .then_some("· filter off (w)");
+
+    CommandRow {
+        command,
+        state: command_state(model, command, query, arg),
+        advisory,
+    }
+}
+
+fn command_state(
+    model: &Model,
+    command: OmniCommand,
+    query: &str,
+    arg: Option<&str>,
+) -> CommandState {
+    let Some(arg) = arg else {
+        // The target is built rather than appended to, so a typed `:` survives
+        // and leading whitespace is normalised away.
+        //
+        // Compared against the **left**-trimmed query, not the fully trimmed
+        // one: the target ends in a space, so trimming both sides would hide the
+        // one case that must answer `None` — `"horizon "`, already its own
+        // target — and Enter would rewrite the query to itself forever.
+        let typed = query.trim_start();
+        let colon = if typed.starts_with(':') { ":" } else { "" };
+        let target = format!("{colon}{} ", command.verb());
+        return CommandState::NeedsArgument {
+            completion: (target != typed).then_some(target),
+        };
+    };
+
+    match command {
+        OmniCommand::Horizon => match arg.parse::<u16>() {
+            // Refused in Search exactly as `w` is, and for the same reason:
+            // `within_horizon` returns early there, so the change would be
+            // invisible where it was made yet persist into the List pane you
+            // return to.
+            Ok(_) if model.search_active() => CommandState::RefusedHere {
+                reason: "not in Search — every match shows",
+            },
+            Ok(days) => CommandState::Valid {
+                effect: format!("{} → {days}", model.horizon_days),
+            },
+            Err(_) => CommandState::Invalid {
+                reason: "0–65535".to_string(),
+            },
+        },
+        OmniCommand::Flavor => match Flavor::from_name(arg) {
+            Some(flavor) => CommandState::Valid {
+                effect: format!("{} → {}", model.flavor.as_str(), flavor.as_str()),
+            },
+            // Derived from `Flavor::ALL`, never spelled out: a fifth flavor
+            // would otherwise leave this refusal naming four and silently wrong.
+            None => CommandState::Invalid {
+                reason: format!(
+                    "unknown — {}",
+                    Flavor::ALL
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+            },
+        },
+        OmniCommand::Ascii => match parse_on_off(arg) {
+            Some(on) => CommandState::Valid {
+                effect: format!("{} → {}", on_off(model.ascii), on_off(on)),
+            },
+            None => CommandState::Invalid {
+                reason: "on|off".to_string(),
+            },
+        },
+    }
+}
+
+/// Case-insensitive, like every other command argument — `:flavor` inherits it
+/// from `Theme::from_flavor`, and one parse table wants one case rule.
+fn parse_on_off(arg: &str) -> Option<bool> {
+    match arg.to_ascii_lowercase().as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// `on`/`off`, shared with the renderer so the row's `now off` and this
+/// module's `ascii already off` can never drift apart.
+pub fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 /// Open the title/notes filter input (`/`). Focuses the task pane — the filter
 /// narrows it, so acting on the results wants that pane — and seeds an empty query
 /// only when none is active, so `/` on a persisted filter reopens it for
@@ -3075,6 +3541,9 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // `pristine` alongside the buffer, and it binds four stepping keys the
         // shared arm has no notion of.
         Some(Overlay::EditDue { .. }) => return due_editor_key(model, key),
+        // Routed before the shared text arm: it owns a selection alongside its
+        // buffer, and `j`/`k` must type rather than move.
+        Some(Overlay::Omnibox { .. }) => return omnibox_key(model, key),
         // Both pickers, routed before the `Confirm` and text-buffer arms below:
         // falling through would let `y` dismiss one, or swallow its keys.
         Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {
@@ -3122,6 +3591,257 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         _ => {}
     }
     Vec::new()
+}
+
+/// Keys for the **Omnibox**.
+///
+/// Four phases, in this order, and the order is the design:
+///
+/// **(a) copy out.** The query and the selection live inside `model.overlay`,
+/// but [`omnibox_rows`] takes the whole `&Model` — holding `&mut` on the overlay
+/// while calling it would not compile. Copying out ends the borrow and keeps the
+/// row builder a function of `(&Model, &str)`, testable with no `Overlay` in
+/// sight, rather than letting it drift to `omnibox_rows(&Overlay, &Model)` at
+/// first compile. One `String` clone per keystroke, on a query bounded by what a
+/// human types.
+///
+/// **(b) re-clamp, before the key match.** `update` routes only `Message::Key`
+/// here, so a `ListsLoaded` can have shrunk the rows since the last keystroke.
+/// The renderer clamps for *drawing*, but that is invisible to the reducer:
+/// without this, `Up`'s `saturating_sub` would work on a stale index and the
+/// drawn highlight and the fired row would disagree. It runs on **every** key,
+/// including one that turns out inert — it repairs stale state rather than
+/// enacting the keystroke, which is why the unfireable rows promise "nothing
+/// beyond the clamp".
+///
+/// **(c) the key match.** `j`/`k` **type**, as in every other overlay with a
+/// buffer (`picker_key` moves on them only because its overlays have none).
+/// Movement is `Up`/`Down`; `^N`/`^P` are deliberately unbound, because
+/// `resolve` is modifier-blind and a `^N` landing a beat after the overlay
+/// closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.
+/// `Backspace`/`^W`/`^U` all edit, as the three existing text paths do — a
+/// surface where a typo cost the whole query would be quoting the text-overlay
+/// rule, not following it.
+///
+/// **(d) write back, conditionally.** Reached by every branch that leaves the
+/// *Omnibox* open — which is most of them, the edits included, since this is the
+/// only thing that persists an edited query. Branches that leave return from
+/// inside the match; gating on "did `model.overlay` end up `None`" instead would
+/// leak the SEARCH rows, which end at `Some(Overlay::Filter)` and would have it
+/// clobbered by a resurrected Omnibox.
+fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+
+    // (a)
+    let Some(Overlay::Omnibox { query, selected }) = &model.overlay else {
+        return Vec::new();
+    };
+    let (mut query, mut selected) = (query.clone(), *selected);
+
+    // (b)
+    let len = omnibox_rows(model, &query).len();
+    selected = selected.min(len.saturating_sub(1));
+
+    // (c). `before` is the whole reset rule: `selected` returns to 0 when the
+    // *query string changes*, not when a particular key is pressed — a
+    // `Backspace` on an empty query leaves the buffer byte-identical and must
+    // leave the highlight alone, the distinction `Overlay::EditDue` already
+    // draws for a step refused at the ends of the calendar.
+    let before = query.clone();
+    let chord = keymap::is_control_chord(key.modifiers);
+    match key.code {
+        KeyCode::Char('u') if chord => query.clear(),
+        KeyCode::Char('w') if chord => kill_word(&mut query),
+        KeyCode::Char(c) if !chord => query.push(c),
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Down => selected = (selected + 1).min(len.saturating_sub(1)),
+        KeyCode::Up => selected = selected.saturating_sub(1),
+        KeyCode::Esc => {
+            model.overlay = None;
+            return Vec::new();
+        }
+        KeyCode::Enter => {
+            // Take the overlay first, as `submit_input` does, so closing is the
+            // default: a branch that leaves the Omnibox needs no code, and one
+            // that keeps it says so by falling through to (d).
+            model.overlay = None;
+            // `get`, not an index: the rows were rebuilt above from the live
+            // `Model`, so this is `Some` by construction, but a stale index must
+            // fire nothing rather than the wrong row if that ever stops holding.
+            let Some(row) = omnibox_rows(model, &query).into_iter().nth(selected) else {
+                return Vec::new();
+            };
+            match row {
+                OmniRow::Jump(target) => return jump_to(model, target),
+                OmniRow::Search { query } => return omnibox_search(model, query),
+                // Reads the refusal and returns *before* delegating: letting
+                // `finish_add_task` discover it would write `model.status_line`,
+                // which breaks the rule that an unfireable row changes nothing —
+                // and would duplicate a reason already on screen in the row.
+                OmniRow::Capture(CaptureRow::Refused { .. }) => {}
+                OmniRow::Capture(CaptureRow::Ready { .. }) => {
+                    return finish_add_task(model, query, false)
+                }
+                OmniRow::Command(row) => match row.state {
+                    // The completion the row already computed — not re-derived
+                    // here, so "fires only when it would change the query" stays
+                    // one decision made where the canonical verb is in hand.
+                    CommandState::NeedsArgument {
+                        completion: Some(target),
+                    } => query = target,
+                    // The three unfireable shapes, plus a whole verb with nothing
+                    // left to add: each keeps the overlay with the query and the
+                    // selection untouched, because closing would discard a query
+                    // the user is mid-way through fixing, and the row is already
+                    // saying why on screen.
+                    CommandState::NeedsArgument { completion: None }
+                    | CommandState::Invalid { .. }
+                    | CommandState::RefusedHere { .. } => {}
+                    CommandState::Valid { .. } => return run_command(model, row.command, &query),
+                },
+            }
+        }
+        _ => {}
+    }
+    if query != before {
+        selected = 0;
+    }
+
+    // (d)
+    model.overlay = Some(Overlay::Omnibox { query, selected });
+    Vec::new()
+}
+
+/// Apply a `Valid` COMMAND row.
+///
+/// Re-parses the argument rather than carrying it on the row: `Valid` proved it
+/// parses, and threading the value through the row would put the parse in two
+/// places for three commands. A `None` here is unreachable by construction and
+/// simply does nothing, rather than an `unwrap` that would panic the TUI.
+///
+/// Every command reports **when it changed nothing observable**. The overlay is
+/// gone by now, so a command that also leaves the frame untouched is
+/// indistinguishable from a dropped keystroke — which is what the house rules'
+/// "no zero count masquerading as success" forbids. Keyed on the frame, not on
+/// any one flag: `:horizon` crossing no row, `:ascii off` when already off and
+/// `:flavor mocha` on the default all repaint identically.
+fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Command> {
+    let (_, arg) = split_command(query.trim());
+    let Some(arg) = arg else {
+        return Vec::new();
+    };
+
+    match command {
+        OmniCommand::Horizon => {
+            let Ok(days) = arg.parse::<u16>() else {
+                return Vec::new();
+            };
+            // An exact proxy, not an approximation: a horizon change is
+            // monotonic — widening only reveals, narrowing only hides — so the
+            // count moves if and only if the visible set does. With
+            // `hide_distant` off it never moves, which is how that case falls out
+            // of the general rule instead of being special-cased.
+            let before = model.visible_tasks().len();
+            model.horizon_days = days;
+            // `within_horizon` reads `horizon_days`, so a smaller horizon can
+            // strand the cursor on a row it just hid — the same reason
+            // `Action::ToggleHideDistant` re-anchors.
+            reselect_visible(model);
+            if model.visible_tasks().len() == before {
+                // Two texts, on the same condition the row-level advisory uses.
+                // Naming `w` when the filter is already on would be wrong twice
+                // over: it is on, and pressing it would switch it *off*.
+                model.status_line = Some(if model.hide_distant {
+                    format!("horizon {days} — no entry crosses it")
+                } else {
+                    format!("horizon {days} — filter off, w applies it")
+                });
+            } else {
+                // Cleared, not just left: a no-op report from a previous command
+                // would otherwise outlive the state it described and then
+                // contradict it — `horizon 30 — filter off` still on screen while
+                // the pane visibly re-filters at 60.
+                model.status_line = None;
+            }
+        }
+        OmniCommand::Flavor => {
+            let Some(flavor) = Flavor::from_name(arg) else {
+                return Vec::new();
+            };
+            // Names its subject, like `ascii already off` and `horizon 30 — …`:
+            // on the status line a bare `already mocha` is an orphan, with
+            // nothing to say what is already mocha.
+            model.status_line =
+                (flavor == model.flavor).then(|| format!("flavor already {}", flavor.as_str()));
+            model.flavor = flavor;
+        }
+        OmniCommand::Ascii => {
+            let Some(on) = parse_on_off(arg) else {
+                return Vec::new();
+            };
+            model.status_line =
+                (on == model.ascii).then(|| format!("ascii already {}", on_off(on)));
+            model.ascii = on;
+        }
+    }
+    Vec::new()
+}
+
+/// Open the pane a JUMP row names.
+///
+/// The `ListId` is resolved to an index **here**, not stored as one when the row
+/// was built: a `ListsLoaded` can reorder `lists` between the render and the
+/// press, and a stale index would open a *different* List — silently, and
+/// plausibly enough to go unnoticed. An id that no longer resolves fires
+/// nothing.
+///
+/// Calls [`open_selection`] **unconditionally**, unlike `move_list_selection`,
+/// which guards on having actually moved. That guard is for a clamped cursor at
+/// the sidebar's edge; naming the pane you are already in is a deliberate
+/// choice, and it is how you leave Search for the List you came from.
+fn jump_to(model: &mut Model, target: JumpTarget) -> Vec<Command> {
+    model.selected = match target {
+        JumpTarget::Today => Selection::Today,
+        JumpTarget::List { id, .. } => match model.lists.iter().position(|l| l.id == id) {
+            Some(index) => Selection::List(index),
+            None => return Vec::new(),
+        },
+    };
+    let commands = open_selection(model);
+    // Set here rather than inside `open_selection`: a landing chosen by name
+    // wants the pane focused, a sidebar `j`/`k` does not.
+    model.focus = Focus::Tasks;
+    commands
+}
+
+/// Hand the query off to the **Search** pane.
+///
+/// Routes through [`enter_search`] rather than emitting `Command::LoadSearch`:
+/// `request_selected` documents itself as that Command's single choke point, and
+/// is the only place that arms `search_pending` and normalises a carried-in
+/// `Manual` lens; `enter_search` additionally clears the inherited cursor.
+///
+/// The **trimmed** query, because `matches_filter` does not trim: a raw `work `
+/// would be a literal needle hiding a Task titled exactly `work`. `Overlay::Filter`
+/// is left open — that is precisely the state `S`-then-type produces.
+fn omnibox_search(model: &mut Model, query: String) -> Vec<Command> {
+    if model.search_active() {
+        // Already there: mirror `Action::Search`, which refuses to re-enter, so
+        // the corpus is neither cleared nor re-fetched. But re-anchor, which that
+        // arm has no need to — `open_filter` reopens the input over an unchanged
+        // query, while this *replaces* it with `tasks` deliberately preserved, and
+        // `is_visible` ANDs in `matches_filter`, so the new query can hide the row
+        // the cursor is on.
+        model.filter = Some(query);
+        open_filter(model);
+        reselect_visible(model);
+        return Vec::new();
+    }
+    let commands = enter_search(model);
+    model.filter = Some(query);
+    commands
 }
 
 /// Keys for the due editor (named for the overlay, not the sort key `due_key`
@@ -3669,6 +4389,24 @@ fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     // move is the "open the List instead" gesture, so it leaves Search — here, not
     // inside `request_selected`, which `refresh()` also calls (with
     // `clear_pane == false`) and must keep Search for `r`.
+    open_selection(model)
+}
+
+/// Load whatever `model.selected` now names, leaving Search on the way.
+///
+/// The tail of [`move_list_selection`], shared with the Omnibox's JUMP — and
+/// **only** the tail. Two things stay at each call site:
+///
+/// - the assignment to `model.selected`, which each caller computes differently
+///   (a clamped step there, a named row here);
+/// - `focus`. Setting it here would make every sidebar `j`/`k` steal focus to
+///   the task pane, and `jk_with_the_sidebar_focused_leaves_search_and_loads_the_list`
+///   asserts the commands but not the focus, so nothing would catch it.
+///
+/// The no-movement guard stays behind too: it is `move_list_selection`'s alone,
+/// because an Omnibox jump is an explicit choice of a named row rather than a
+/// cursor that may not have moved.
+fn open_selection(model: &mut Model) -> Vec<Command> {
     leave_search(model);
     request_selected(model, true)
 }

@@ -130,6 +130,24 @@ Two rules that read alike and are not: an entry is in the **Overdue** group when
 The due gutter exists here on exactly the Overdue group's condition, so the two appear and vanish together: with overdue entries the group prints its dates and a today-due row's cell is blank at the same width (titles stay aligned); with none there is no column at all.
 _Avoid_: section, bucket, page, agenda.
 
+**Omnibox**:
+The modal surface `p` opens: one query over a grouped result list, offering the
+Lists to **jump** to, the keyless **commands**, a hand-off to **Search**, and —
+pinned last — **capturing** the query as a Task. `Enter` runs whichever row is
+highlighted, so what it will do is legible before it is pressed, and a write is
+never what happens by default.
+
+Its four bands are **groups**, in the **Journal spread**'s sense — a labelled run
+of rows under a group header, exactly as **Overdue** and **Today** are there.
+Not the sense the **List** entry avoids: a List is never called a group, and the
+JUMP group is a grouping of *rows* that happen to name Lists.
+
+The commands are **session-only** — they change the running app, never
+`config.toml` — which the COMMAND group header says once rather than every row
+repeating it.
+_Avoid_: command bar, palette (that is Catppuccin's), launcher, fuzzy finder,
+section.
+
 **Notes marker**:
 The `≡` a row carries when its Task's **notes** hold anything visible. Trails the title, after the link `⧉` and before the Subtask meter, and degrades to `=` under `ascii_fallback`. A body of only whitespace or invisible formatting draws nothing — the marker promises text `n` will show.
 

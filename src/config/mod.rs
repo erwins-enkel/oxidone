@@ -11,6 +11,66 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 
+/// A Catppuccin flavor, parsed from [`Config::theme`].
+///
+/// Lives here rather than in `ui::theme` because `app::Model` holds one and
+/// `app` depends on nothing in `ui` — the arrow runs `ui → app`, and the reducer
+/// is the terminal-free core (ADR-0005). `config` is where the setting comes
+/// from, imports neither, and so may be depended on by both.
+///
+/// `Config::theme` stays a `String`: making it a `Flavor` would move parsing into
+/// serde, where one bad value fails the whole `toml::from_str` and — per
+/// [`Config::load`]'s tolerant fallback — silently resets *every* setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Flavor {
+    Latte,
+    Frappe,
+    Macchiato,
+    #[default]
+    Mocha,
+}
+
+impl Flavor {
+    /// Every flavor, in the order the `:flavor` row's refusal lists them —
+    /// that message is built from this, so a fifth variant cannot leave it
+    /// naming four.
+    pub const ALL: [Flavor; 4] = [
+        Flavor::Latte,
+        Flavor::Frappe,
+        Flavor::Macchiato,
+        Flavor::Mocha,
+    ];
+
+    /// The canonical name, as `ui::theme::Theme::from_flavor` expects it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Flavor::Latte => "latte",
+            Flavor::Frappe => "frappe",
+            Flavor::Macchiato => "macchiato",
+            Flavor::Mocha => "mocha",
+        }
+    }
+
+    /// Parse a flavor name, or `None` if it names no flavor.
+    ///
+    /// **Fails closed, unlike `Theme::from_flavor`**, whose `_ => mocha` arm
+    /// accepts anything — so an unknown name there silently paints Mocha and
+    /// reports success. The Omnibox's `:flavor` command needs the refusal.
+    ///
+    /// Exactly as tolerant as `from_flavor` otherwise, because `main.rs` now
+    /// seeds the model *through* this: case-insensitive, and `frappé` accepted
+    /// alongside `frappe`. A config value that works today must keep working.
+    pub fn from_name(name: &str) -> Option<Flavor> {
+        match name.to_ascii_lowercase().as_str() {
+            "latte" => Some(Flavor::Latte),
+            "frappe" | "frappé" => Some(Flavor::Frappe),
+            "macchiato" => Some(Flavor::Macchiato),
+            "mocha" => Some(Flavor::Mocha),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -120,4 +180,41 @@ pub fn log_dir() -> Option<PathBuf> {
 /// `<data dir>/oxidone.db` — the local SQLite cache.
 pub fn db_path() -> Option<PathBuf> {
     project_dirs().map(|d| d.data_local_dir().join("oxidone.db"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Flavor;
+
+    /// `main.rs` now seeds `Model::flavor` through `from_name`, so every spelling
+    /// `Theme::from_flavor` accepts today has to survive the new hop — otherwise a
+    /// working `config.toml` silently regresses to Mocha.
+    #[test]
+    fn from_name_is_as_tolerant_as_from_flavor() {
+        for (name, want) in [
+            ("latte", Flavor::Latte),
+            ("Latte", Flavor::Latte),
+            ("MOCHA", Flavor::Mocha),
+            ("frappe", Flavor::Frappe),
+            ("frappé", Flavor::Frappe),
+            ("Macchiato", Flavor::Macchiato),
+        ] {
+            assert_eq!(Flavor::from_name(name), Some(want), "input {name:?}");
+        }
+    }
+
+    /// The half `Theme::from_flavor` cannot do: an unknown name is a refusal, not
+    /// a silent fall back to Mocha.
+    #[test]
+    fn from_name_refuses_an_unknown_flavor() {
+        assert_eq!(Flavor::from_name("purple"), None);
+        assert_eq!(Flavor::from_name(""), None);
+    }
+
+    #[test]
+    fn every_flavor_round_trips_through_its_own_name() {
+        for f in Flavor::ALL {
+            assert_eq!(Flavor::from_name(f.as_str()), Some(f), "flavor {f:?}");
+        }
+    }
 }

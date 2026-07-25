@@ -26,11 +26,11 @@ use oxidone::api::{RestClient, TasksApi};
 use oxidone::app::{classify_event, update, Command, Message, Model, OFFLINE};
 use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
 use oxidone::cache::Cache;
-use oxidone::config::{self, Config};
+use oxidone::config::{self, Config, Flavor};
 use oxidone::domain::{List, ListId, Task, TaskId};
 use oxidone::links::OpenableUrl;
 use oxidone::sync;
-use oxidone::ui::{self, theme::Theme};
+use oxidone::ui;
 
 /// The live Google client, shared across background workers. `None` when no BYO
 /// credentials are configured (offline, cache-only).
@@ -84,7 +84,6 @@ fn main() -> Result<()> {
 async fn main_inner() -> Result<()> {
     init_tracing();
     let config = Config::load();
-    let theme = Theme::from_flavor(&config.theme);
 
     // Build the live client (and run first-run auth) BEFORE entering the TUI, so
     // the consent browser flow isn't hidden behind the alternate screen.
@@ -110,7 +109,6 @@ async fn main_inner() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run(
         &mut terminal,
-        &theme,
         &config,
         api,
         cache,
@@ -124,7 +122,6 @@ async fn main_inner() -> Result<()> {
 
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    theme: &Theme,
     config: &Config,
     api: Api,
     cache: SharedCache,
@@ -185,6 +182,12 @@ async fn run(
     // Seed the distant-due view filter from config; `w` toggles it thereafter.
     model.hide_distant = config.hide_distant;
     model.horizon_days = config.horizon_days;
+    // The palette and the braille/ASCII switch live on the Model so the Omnibox's
+    // `:flavor`/`:ascii` can change them; `ui::draw` composes both into the frame.
+    // Tolerant like `Config::load` itself — an unrecognised name falls back to the
+    // default here, and only the Omnibox refuses one.
+    model.flavor = Flavor::from_name(&config.theme).unwrap_or_default();
+    model.ascii = config.ascii_fallback;
     // Stamp the real clock before the seed: the startup selection is Today, whose
     // `LoadToday` carries `model.now.date_naive()` as its membership date. Without
     // this the seed would resolve "today" against the epoch placeholder and paint
@@ -233,7 +236,7 @@ async fn run(
         // an idle session shows a stale "today" until something wakes it, which
         // would need a periodic tick to fix and is beyond this change.
         model.now = chrono::Local::now();
-        terminal.draw(|frame| ui::view(&model, theme, config.ascii_fallback, frame))?;
+        terminal.draw(|frame| ui::draw(&model, frame))?;
         match rx.recv().await {
             Some(msg) => {
                 // Re-stamp at the impure edge so the reducer stays pure yet can

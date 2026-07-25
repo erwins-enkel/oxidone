@@ -20,7 +20,10 @@ use ratatui::Frame;
 
 use std::collections::HashMap;
 
-use crate::app::{renders_as_subtask, Focus, Model, Overlay};
+use crate::app::{
+    omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow, CommandState, Focus,
+    JumpTarget, Model, OmniCommand, OmniRow, Overlay,
+};
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
     due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task, TaskId,
@@ -47,8 +50,26 @@ const SIDEBAR_METER_WIDTH: u16 = 6;
 /// are small, so a short bar reads them well enough — the ratio does the rest.
 const SUBTASK_METER_WIDTH: u16 = 4;
 
+/// Compose the palette from the Model and render one frame.
+///
+/// The one place `Model::flavor`/`Model::ascii` become a `Theme` and a flag, so a
+/// render test can drive the same composition `main.rs` does — `main.rs` itself
+/// is unreachable from the suite (see `tests/cli_args.rs`), which would otherwise
+/// leave "`:flavor latte` repaints" verifiable only by inspection.
+///
+/// Deliberately four lines: [`view`] stays the frame renderer, and every existing
+/// render test still calls it with a `Theme` of its own.
+pub fn draw(model: &Model, frame: &mut Frame) {
+    view(
+        model,
+        &Theme::from_flavor(model.flavor.as_str()),
+        model.ascii,
+        frame,
+    );
+}
+
 /// Render the whole frame. Never mutates state. `ascii` reflects
-/// `config.ascii_fallback`: braille data widgets degrade to ASCII when set.
+/// [`Model::ascii`]: braille data widgets degrade to ASCII when set.
 pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::new().bg(theme.base)), area);
@@ -130,6 +151,10 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
         // The filter input draws no popup — the pane header carries its query and
         // caret (see `header_title`), so the narrowed pane stays fully visible.
         Overlay::Filter => return,
+        Overlay::Omnibox { query, selected } => {
+            render_omnibox(frame, area, model, query, *selected, theme);
+            return;
+        }
     };
     let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
     let popup = centered(area, OVERLAY_WIDTH, height + OVERLAY_BORDERS);
@@ -261,6 +286,271 @@ fn capture_lines(buffer: &str, now: DateTime<Local>, theme: &Theme) -> Vec<Line<
         lines.push(Line::styled(preview, Style::new().fg(theme.subtext)));
     }
     lines
+}
+
+/// The Omnibox is wider than the pickers.
+///
+/// Its rows carry a label *and* a trailing reason or effect, where a picker's
+/// carry only a name. At `OVERLAY_WIDTH` a row has
+/// `50 - OVERLAY_BORDERS - LIST_CURSOR.width()` = 46 cells, and `truncate` drops
+/// the *tail* — which is exactly where every reason lives, so the row would
+/// clip away the thing it exists to say. Clamped to the frame, so a narrow
+/// terminal still fits.
+const OMNIBOX_WIDTH: u16 = 72;
+
+/// Cells between a row's label and its trailing reason.
+const OMNIBOX_GAP: usize = 2;
+
+/// The narrowest a CAPTURE row's destination may be squeezed to before its
+/// peeled title starts giving way instead. `Create task in "…"` and a few cells
+/// of the List name.
+const CAPTURE_LEAD_FLOOR: usize = 24;
+
+/// Below this the `→ title` part is dropped whole rather than shown as `→ …`.
+const CAPTURE_TITLE_FLOOR: usize = 8;
+
+/// The Omnibox: a query in the panel title over a grouped result list.
+fn render_omnibox(
+    frame: &mut Frame,
+    area: Rect,
+    model: &Model,
+    query: &str,
+    selected: usize,
+    theme: &Theme,
+) {
+    // Clear of the status line and the legend, as both pickers are, and for the
+    // same reason: that legend is what advertises this overlay's own keys.
+    let body = Rect {
+        height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
+        ..area
+    };
+    let rows = omnibox_rows(model, query);
+
+    // Items first, headers included — `picker_height` must size off *these*, not
+    // off `rows`, or the popup is up to four rows short. That failure is
+    // invisible to a reversed-line assertion, because `ListState` scrolls the
+    // selected row into view either way.
+    let width = OMNIBOX_WIDTH.min(body.width);
+    let text_width =
+        (width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
+    let mut items = Vec::new();
+    let mut drawn_selected = None;
+    let mut group = None;
+    for (i, row) in rows.iter().enumerate() {
+        if group != Some(row.group()) {
+            group = Some(row.group());
+            items.push(ListItem::new(Line::styled(
+                row.group().header(),
+                Style::new().fg(theme.muted).add_modifier(Modifier::BOLD),
+            )));
+        }
+        // The row vector is headerless while `items` is not, so the highlight
+        // has to be remapped or it lands N lines high.
+        if i == selected.min(rows.len().saturating_sub(1)) {
+            drawn_selected = Some(items.len());
+        }
+        items.push(ListItem::new(omnibox_line(
+            model, row, query, text_width, theme,
+        )));
+    }
+
+    let popup = centered(body, width, picker_height(items.len(), body.height));
+    frame.render_widget(Clear, popup);
+    render_selectable(
+        frame,
+        popup,
+        &omnibox_title(query, text_width),
+        items,
+        drawn_selected,
+        true,
+        theme,
+    );
+}
+
+/// The panel title: a constant base, the query, and a caret.
+///
+/// The base is always drawn, so the box is never nameless on an empty query, and
+/// the caret is unconditional — unlike `header_title`'s, which distinguishes a
+/// live filter from a committed one; the Omnibox has no committed state.
+///
+/// **Clipped from the left**, keeping the query's tail. `truncate` drops the
+/// tail, which here would hide the characters just typed *and* the caret with
+/// them; a leading `…` is what an input field does, and says text is hidden
+/// rather than clipping in silence.
+fn omnibox_title(query: &str, text_width: usize) -> String {
+    const BASE: &str = "Omnibox";
+    const CARET: &str = "▏";
+    if query.is_empty() {
+        return BASE.to_string();
+    }
+    let budget = text_width.saturating_sub(BASE.width() + OMNIBOX_GAP + CARET.width());
+    if query.width() <= budget {
+        return format!("{BASE}  {query}{CARET}");
+    }
+    // Walk backwards in cells, reserving the ellipsis's own width.
+    let budget = budget.saturating_sub("…".width());
+    let mut used = 0;
+    let mut start = query.len();
+    for (i, c) in query.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    format!("{BASE}  …{}{CARET}", &query[start..])
+}
+
+/// One row: `{lead}{gap}{trail}`, with **`trail` reserved before `lead` is
+/// truncated**.
+///
+/// The same shape `legend_spans` uses for its pinned help cell: reserve the part
+/// that must survive, spend the rest. What shortens is the echo of what the user
+/// typed — never the reason they need to read.
+fn omnibox_line(
+    model: &Model,
+    row: &OmniRow,
+    query: &str,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let (lead, trail) = match row {
+        OmniRow::Jump(JumpTarget::Today) => ("Today".to_string(), String::new()),
+        OmniRow::Jump(JumpTarget::List { id, title }) => (
+            title.clone(),
+            match model.list_meter(id) {
+                Some((done, total)) => format!("{done}/{total}"),
+                None => String::new(),
+            },
+        ),
+        OmniRow::Command(command) => {
+            let mut trail = match &command.state {
+                CommandState::NeedsArgument { .. } => match command.command {
+                    OmniCommand::Horizon => format!("now {}", model.horizon_days),
+                    OmniCommand::Flavor => format!("now {}", model.flavor.as_str()),
+                    OmniCommand::Ascii => format!("now {}", on_off(model.ascii)),
+                },
+                CommandState::Invalid { reason } => reason.clone(),
+                CommandState::RefusedHere { reason } => (*reason).to_string(),
+                CommandState::Valid { effect } => effect.clone(),
+            };
+            // Appended to *whichever* state is showing, matching the row-level
+            // field: drawing it on `Valid` alone would leave a value asserted on
+            // three rows visible on one.
+            if let Some(advisory) = command.advisory {
+                trail.push(' ');
+                trail.push_str(advisory);
+            }
+            let arg = split_command(query.trim()).1;
+            (
+                format!(
+                    ":{}{}",
+                    command.command.verb(),
+                    command_arg_suffix(&command.state, arg)
+                ),
+                trail,
+            )
+        }
+        OmniRow::Search { query } => (format!("Search all Lists for \"{query}\""), String::new()),
+        OmniRow::Capture(CaptureRow::Refused { reason }) => {
+            ("Create task".to_string(), (*reason).to_string())
+        }
+        OmniRow::Capture(CaptureRow::Ready {
+            list_title,
+            title,
+            due,
+        }) => return capture_line(list_title, title, *due, model.now, width, theme),
+    };
+
+    let trail_cells = if trail.is_empty() {
+        0
+    } else {
+        trail.width() + OMNIBOX_GAP
+    };
+    let lead = truncate(&lead, width.saturating_sub(trail_cells), "…");
+    let pad = width.saturating_sub(lead.width() + trail.width());
+    if trail.is_empty() {
+        return Line::raw(lead);
+    }
+    Line::from(vec![
+        Span::raw(lead),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(trail, Style::new().fg(theme.subtext)),
+    ])
+}
+
+/// The typed argument, echoed after the verb, or the placeholder when there is
+/// none — so the row shows what it will act on rather than the bare verb.
+///
+/// `arg` is the one the row was built from, re-split from the query here rather
+/// than carried on `CommandState`: only the renderer wants it, and the states
+/// that have one already carry what it *means* (a reason, or an effect).
+fn command_arg_suffix(state: &CommandState, arg: Option<&str>) -> String {
+    match state {
+        CommandState::NeedsArgument { .. } => " ‹arg›".to_string(),
+        CommandState::Invalid { .. }
+        | CommandState::RefusedHere { .. }
+        | CommandState::Valid { .. } => arg.map(|a| format!(" {a}")).unwrap_or_default(),
+    }
+}
+
+/// The CAPTURE row, which reserves **per part** rather than whole-trail.
+///
+/// Every other row's trail is a constant this file chose; this one's holds the
+/// peeled title — user text of unbounded length. Reserving the whole trail would
+/// let a long title eat `lead` to nothing and lose the destination List, which
+/// is the one thing the row exists to name.
+fn capture_line(
+    list_title: &str,
+    title: &str,
+    due: Option<NaiveDate>,
+    now: DateTime<Local>,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let due_part = due
+        .map(|d| format!(" · {}", format_due_relative(d, now.date_naive())))
+        .unwrap_or_default();
+
+    // 1. the date, reserved first and bounded. 2. the destination, which yields
+    // to the title *down to its floor* but no further — that floor is what makes
+    // "the row always names where the Task goes" true. 3. the title, whatever
+    // remains.
+    let remaining = width.saturating_sub(due_part.width());
+    let lead_full = format!("Create task in \"{list_title}\"");
+    let title_full = "→ ".width() + title.width();
+    let lead_budget = lead_full
+        .width()
+        .min(remaining.saturating_sub(OMNIBOX_GAP + title_full))
+        // Never squeezed below the floor, and never wider than it needs to be:
+        // a short List title keeps its whole name even beside a long query.
+        .max(CAPTURE_LEAD_FLOOR.min(lead_full.width()))
+        .min(remaining);
+    let lead = truncate(&lead_full, lead_budget, "…");
+
+    let title_budget = remaining.saturating_sub(lead.width() + OMNIBOX_GAP + "→ ".width());
+    // The floor guards against a useless `→ …`, so it applies only when the title
+    // must be *truncated*. A flat `title_budget < FLOOR` discarded titles that fit
+    // whole: `lead_budget` above already reserved this room for them, so once the
+    // destination takes its reservation `title_budget == title.width()` exactly,
+    // and every title under the floor was dropped into blank padding it fitted in.
+    let title_part = if title_budget < CAPTURE_TITLE_FLOOR.min(title.width()) {
+        // Dropped whole rather than shown as `→ …`: the row still says where the
+        // Task goes and when it is due, and the title is already on screen in the
+        // panel-title query the user just typed.
+        String::new()
+    } else {
+        format!("→ {}", truncate(title, title_budget, "…"))
+    };
+
+    let trail = format!("{title_part}{due_part}");
+    let pad = width.saturating_sub(lead.width() + trail.width());
+    Line::from(vec![
+        Span::raw(lead),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(trail, Style::new().fg(theme.subtext)),
+    ])
 }
 
 /// Height of the link picker: one row per link plus its borders, never taller
@@ -1278,6 +1568,10 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
+        // Its own legend: `j`/`k` type, movement is `Up`/`Down`, and `Enter`
+        // runs a row rather than saving a buffer — none of which `TextInput`
+        // would have said.
+        Some(Overlay::Omnibox { .. }) => keymap::LegendContext::Omnibox,
         // The same overlay in Search advertises `Esc leave search` rather than
         // `Esc drop filter`: the pane behind it is the corpus, not a List, so
         // `Esc` leaves Search outright (matching `filter_key`'s Search-aware
@@ -2290,6 +2584,15 @@ mod tests {
             selected: 0,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::ListPicker);
+
+        // The Omnibox *does* have a buffer, and still declares its own: `j`/`k`
+        // type but movement is `Up`/`Down`, and `Enter` runs a row rather than
+        // saving — none of which `TextInput`'s two cells would have said.
+        model.overlay = Some(Overlay::Omnibox {
+            query: String::new(),
+            selected: 0,
+        });
+        assert_eq!(legend_context(&model), keymap::LegendContext::Omnibox);
     }
 
     #[test]

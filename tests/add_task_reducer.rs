@@ -189,3 +189,87 @@ async fn temp_ids_are_unique_across_adds() {
         }]
     );
 }
+
+// The three-way capture resolution `finish_add_task` and `open_add_task` each
+// did is now one `capture_target`. Both had a branch that refuses **silently**,
+// and neither was covered anywhere — so this is the whole proof that folding
+// them changed no behaviour.
+//
+// The trap the fold has to avoid is `model.status_line = refusal.message().map(..)`:
+// it reads tidier than an `if let` and writes `None` on the silent arm, clearing
+// a status line these functions have always left alone.
+
+/// A List pane whose selection resolves to no List — `Model::new()` has an empty
+/// `lists`, so `Selection::List(0)` is out of range. Degenerate, not ordinary.
+fn model_with_an_unresolvable_selection() -> Model {
+    let mut m = Model::new();
+    m.selected = Selection::List(0);
+    m.status_line = Some("seeded".to_string());
+    m
+}
+
+#[test]
+fn open_add_task_leaves_a_status_line_alone_when_it_refuses_silently() {
+    let mut m = model_with_an_unresolvable_selection();
+
+    update(&mut m, ch('a'));
+
+    assert!(m.overlay.is_none(), "no capture overlay to type into");
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("seeded"),
+        "the silent refusal cleared a status line it never set"
+    );
+}
+
+#[test]
+fn finish_add_task_leaves_a_status_line_alone_when_it_refuses_silently() {
+    let mut m = model_with_an_unresolvable_selection();
+    // `a` refuses, so drive the capture overlay directly to reach the submit.
+    m.overlay = Some(Overlay::AddTask {
+        buffer: String::new(),
+    });
+    typed(&mut m, "something");
+
+    let commands = update(&mut m, key(KeyCode::Enter));
+
+    assert!(commands.is_empty(), "nothing was created");
+    assert!(m.tasks.is_empty());
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("seeded"),
+        "the silent refusal cleared a status line it never set"
+    );
+}
+
+/// The loud arm still speaks, byte for byte.
+#[test]
+fn a_today_capture_without_a_default_list_still_names_the_reason() {
+    let mut m = Model::new();
+    assert_eq!(m.selected, Selection::Today);
+    assert!(m.default_list.is_none());
+
+    update(&mut m, ch('a'));
+
+    assert!(m.overlay.is_none());
+    assert_eq!(
+        m.status_line.as_deref(),
+        Some("can't capture: default list not resolved (connect to Google)")
+    );
+}
+
+/// The empty-title check has to stay *ahead* of the target resolution: an empty
+/// submit on Today while offline is silent today, and resolving first would
+/// newly print "can't capture" for a submit that creates nothing either way.
+#[test]
+fn an_empty_submit_is_silent_even_where_the_target_would_refuse() {
+    let mut m = Model::new();
+    m.overlay = Some(Overlay::AddTask {
+        buffer: String::new(),
+    });
+
+    let commands = update(&mut m, key(KeyCode::Enter));
+
+    assert!(commands.is_empty());
+    assert_eq!(m.status_line, None, "an empty submit says nothing");
+}

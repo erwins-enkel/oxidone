@@ -3404,7 +3404,9 @@ fn parse_on_off(arg: &str) -> Option<bool> {
     }
 }
 
-fn on_off(on: bool) -> &'static str {
+/// `on`/`off`, shared with the renderer so the row's `now off` and this
+/// module's `ascii already off` can never drift apart.
+pub fn on_off(on: bool) -> &'static str {
     if on {
         "on"
     } else {

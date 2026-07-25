@@ -21,8 +21,8 @@ use ratatui::Frame;
 use std::collections::HashMap;
 
 use crate::app::{
-    omnibox_rows, renders_as_subtask, split_command, CaptureRow, CommandState, Focus, JumpTarget,
-    Model, OmniCommand, OmniRow, Overlay,
+    omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow, CommandState, Focus,
+    JumpTarget, Model, OmniCommand, OmniRow, Overlay,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
@@ -530,7 +530,12 @@ fn capture_line(
     let lead = truncate(&lead_full, lead_budget, "…");
 
     let title_budget = remaining.saturating_sub(lead.width() + OMNIBOX_GAP + "→ ".width());
-    let title_part = if title_budget < CAPTURE_TITLE_FLOOR {
+    // The floor guards against a useless `→ …`, so it applies only when the title
+    // must be *truncated*. A flat `title_budget < FLOOR` discarded titles that fit
+    // whole: `lead_budget` above already reserved this room for them, so once the
+    // destination takes its reservation `title_budget == title.width()` exactly,
+    // and every title under the floor was dropped into blank padding it fitted in.
+    let title_part = if title_budget < CAPTURE_TITLE_FLOOR.min(title.width()) {
         // Dropped whole rather than shown as `→ …`: the row still says where the
         // Task goes and when it is due, and the title is already on screen in the
         // panel-title query the user just typed.
@@ -546,14 +551,6 @@ fn capture_line(
         Span::raw(" ".repeat(pad)),
         Span::styled(trail, Style::new().fg(theme.subtext)),
     ])
-}
-
-fn on_off(on: bool) -> &'static str {
-    if on {
-        "on"
-    } else {
-        "off"
-    }
 }
 
 /// Height of the link picker: one row per link plus its borders, never taller

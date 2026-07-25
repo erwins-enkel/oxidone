@@ -427,3 +427,41 @@ fn a_command_row_echoes_its_typed_argument() {
     typed(&mut model, "horizon");
     assert!(shows(&model, ":horizon ‹arg›"), "{:#?}", popup_rows(&model));
 }
+
+/// A short title must not be discarded into blank padding. `lead_budget` already
+/// reserved room for it, so once the destination takes that reservation the
+/// title's budget equals its width exactly — a flat floor then dropped every
+/// title under 8 cells despite it fitting.
+///
+/// The critic's repro: at 80 columns the row has 68 cells, the destination takes
+/// 60, and `→ milk` fits in the 8 that remain.
+#[test]
+fn a_short_title_survives_beside_a_long_destination() {
+    let mut model = open_with(&["a list with a really quite long name indeed"]);
+    typed(&mut model, "milk");
+
+    assert!(
+        shows(&model, "→ milk"),
+        "a title that fits was dropped: {:#?}",
+        popup_rows(&model)
+    );
+}
+
+/// The floor still does its job where it was meant to: a title long enough to
+/// need truncating, with too little room to say anything useful, drops whole
+/// rather than rendering as `→ …`.
+#[test]
+fn a_long_title_with_no_room_drops_whole_rather_than_eliding() {
+    let mut model = open_with(&["a list with a really quite long name indeed"]);
+    typed(&mut model, "renew the passport before the trip abroad");
+
+    let rows = popup_rows(&model);
+    let capture = rows
+        .iter()
+        .find(|r| r.contains("Create task in"))
+        .expect("a CAPTURE row");
+    assert!(
+        !capture.contains("→ …"),
+        "elided to nothing useful: {capture:?}"
+    );
+}

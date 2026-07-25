@@ -47,8 +47,26 @@ const SIDEBAR_METER_WIDTH: u16 = 6;
 /// are small, so a short bar reads them well enough — the ratio does the rest.
 const SUBTASK_METER_WIDTH: u16 = 4;
 
+/// Compose the palette from the Model and render one frame.
+///
+/// The one place `Model::flavor`/`Model::ascii` become a `Theme` and a flag, so a
+/// render test can drive the same composition `main.rs` does — `main.rs` itself
+/// is unreachable from the suite (see `tests/cli_args.rs`), which would otherwise
+/// leave "`:flavor latte` repaints" verifiable only by inspection.
+///
+/// Deliberately four lines: [`view`] stays the frame renderer, and every existing
+/// render test still calls it with a `Theme` of its own.
+pub fn draw(model: &Model, frame: &mut Frame) {
+    view(
+        model,
+        &Theme::from_flavor(model.flavor.as_str()),
+        model.ascii,
+        frame,
+    );
+}
+
 /// Render the whole frame. Never mutates state. `ascii` reflects
-/// `config.ascii_fallback`: braille data widgets degrade to ASCII when set.
+/// [`Model::ascii`]: braille data widgets degrade to ASCII when set.
 pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::new().bg(theme.base)), area);

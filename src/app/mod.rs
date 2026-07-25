@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 
+use crate::config::Flavor;
 use crate::dateparse;
 use crate::domain::{
     due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
@@ -71,6 +72,17 @@ pub struct Model {
     /// than this many days out is hidden while the filter is on. Held separately
     /// from the flag so the cutoff survives toggling the filter off and on.
     pub horizon_days: u16,
+    /// The Catppuccin flavor the frame is painted in, seeded from `config.theme`.
+    /// Held here rather than in the runtime so the Omnibox's `:flavor` command can
+    /// change it: `ui::draw` builds the `Theme` from this on every frame.
+    ///
+    /// Session-only, like `ascii` — nothing writes it back to `config.toml`.
+    pub flavor: Flavor,
+    /// Whether braille data widgets degrade to ASCII, seeded from
+    /// `config.ascii_fallback`. Was a runtime parameter to `ui::view`; it moves
+    /// here for the same reason `flavor` does, and reaches the renderer the same
+    /// way.
+    pub ascii: bool,
     /// The active title/notes filter (`/`), or `None` when off. A case-insensitive
     /// substring matched against each row's display title and notes body — a local,
     /// read-only view filter like `show_completed`/`hide_distant`, never mutating
@@ -341,6 +353,8 @@ impl Default for Model {
             sort: SortView::Due,
             hide_distant: false,
             horizon_days: 14,
+            flavor: Flavor::default(),
+            ascii: false,
             filter: None,
             search: false,
             search_pending: false,

@@ -3190,7 +3190,9 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
-/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH.
+/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH,
+/// CAPTURE — the four [`Group::header`] names, and the order `selected == 0`
+/// resolves against, so a write is always the last thing `Enter` can reach.
 ///
 /// A pure function of the `Model` and the query — no `Overlay` in sight — so
 /// every row-level property is assertable without a terminal and without driving

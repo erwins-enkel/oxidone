@@ -321,6 +321,31 @@ pub struct CommandRow {
     pub advisory: Option<&'static str>,
 }
 
+/// The CAPTURE row: what `Enter` would create, or why it cannot.
+///
+/// Validity-or-reason like [`CommandState`], not a flat struct of fields that
+/// only mean anything when the capture can happen — a `Refused` row has no
+/// destination to name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureRow {
+    Ready {
+        list_title: String,
+        /// The **peeled** title, from the same `capture_title_and_due` the write
+        /// calls, so the row and the Task cannot disagree.
+        title: String,
+        /// The peeled date, or the pane's default — what the Task will carry.
+        due: Option<NaiveDate>,
+    },
+    Refused {
+        /// A row constant, deliberately **not** `CaptureRefusal::message()`: that
+        /// wording is what the status line preserves byte-for-byte, and at 55
+        /// cells it leaves a row no room beside its label. Kept true of every
+        /// cause — `default_list` is `None` while online at startup too, so an
+        /// "offline" claim would be wrong in the case it most often names.
+        reason: &'static str,
+    },
+}
+
 /// Where a JUMP row goes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JumpTarget {
@@ -348,6 +373,7 @@ pub enum OmniRow {
     Search {
         query: String,
     },
+    Capture(CaptureRow),
 }
 
 impl OmniRow {
@@ -356,6 +382,7 @@ impl OmniRow {
             OmniRow::Jump(_) => Group::Jump,
             OmniRow::Command(_) => Group::Command,
             OmniRow::Search { .. } => Group::Search,
+            OmniRow::Capture(_) => Group::Capture,
         }
     }
 }
@@ -3217,9 +3244,54 @@ pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
         rows.push(OmniRow::Search {
             query: trimmed.to_string(),
         });
+        if let Some(capture) = capture_row(model, query) {
+            rows.push(OmniRow::Capture(capture));
+        }
     }
 
     rows
+}
+
+/// The CAPTURE row, or `None` where there is nothing honest to draw.
+///
+/// Absent — not a disabled row — in the two **nameless** cases: a
+/// `NoSelectedList` refusal, which has no reason to print either, and a resolved
+/// `default_list` whose `ListId` is not in `model.lists`. The latter is a real
+/// state: `Message::DefaultListResolved` never cross-checks, so a cache-seeded
+/// list set racing resolution leaves an id that names no title. Drawing "Create
+/// task…" with nowhere to put it is the one thing that would be a lie.
+///
+/// That title lookup lives **here, not in `capture_target`**: `finish_add_task`
+/// and `open_add_task` need only the id and capture happily without a title, so
+/// moving it would make them start refusing what they do today. `a` therefore
+/// keeps working while this row is absent, and the next `ListsLoaded` closes the
+/// window.
+fn capture_row(model: &Model, query: &str) -> Option<CaptureRow> {
+    let target = match capture_target(model) {
+        Ok(target) => target,
+        Err(refusal) => {
+            return refusal.message().map(|_| CaptureRow::Refused {
+                reason: "default list unresolved",
+            })
+        }
+    };
+    let list_title = model
+        .lists
+        .iter()
+        .find(|l| l.id == target.list)?
+        .title
+        .clone();
+    // The same helper the write calls, so the row cannot promise a title the
+    // Task will not carry.
+    let (title, due) = capture_title_and_due(model, query, false);
+    if title.is_empty() {
+        return None;
+    }
+    Some(CaptureRow::Ready {
+        list_title,
+        title,
+        due: due.or(target.due_default),
+    })
 }
 
 /// Split a query into `(verb, arg)` at the first space, stripping one optional
@@ -3591,6 +3663,14 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
             match row {
                 OmniRow::Jump(target) => return jump_to(model, target),
                 OmniRow::Search { query } => return omnibox_search(model, query),
+                // Reads the refusal and returns *before* delegating: letting
+                // `finish_add_task` discover it would write `model.status_line`,
+                // which breaks the rule that an unfireable row changes nothing —
+                // and would duplicate a reason already on screen in the row.
+                OmniRow::Capture(CaptureRow::Refused { .. }) => {}
+                OmniRow::Capture(CaptureRow::Ready { .. }) => {
+                    return finish_add_task(model, query, false)
+                }
                 // Dispatch arrives with its own step; until then Enter on a
                 // COMMAND row keeps the overlay, as its unfireable states will.
                 OmniRow::Command(_) => {}

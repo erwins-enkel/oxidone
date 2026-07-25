@@ -8,8 +8,8 @@
 use chrono::{TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{
-    omnibox_rows, update, CommandState, Focus, Group, JumpTarget, Message, Model, OmniCommand,
-    OmniRow, Overlay,
+    omnibox_rows, update, CaptureRow, CommandState, Focus, Group, JumpTarget, Message, Model,
+    OmniCommand, OmniRow, Overlay,
 };
 use oxidone::config::Flavor;
 use oxidone::domain::{List, ListId, Selection};
@@ -142,6 +142,7 @@ fn the_empty_query_lists_today_then_lists_then_commands() {
                 OmniRow::Jump(JumpTarget::List { title, .. }) => title,
                 OmniRow::Command(c) => format!(":{}", c.command.verb()),
                 OmniRow::Search { .. } => "SEARCH".to_string(),
+                OmniRow::Capture(_) => "CAPTURE".to_string(),
             })
             .collect::<Vec<_>>(),
         ["Today", "work", "home", ":horizon", ":flavor", ":ascii"]
@@ -623,4 +624,163 @@ fn enter_after_a_shrink_fires_the_clamped_row() {
         matches!(model.overlay, Some(Overlay::Omnibox { .. })),
         "the clamped row was fired, not a stale one"
     );
+}
+
+// ─── CAPTURE ────────────────────────────────────────────────────────────────
+
+fn capture(model: &Model, q: &str) -> Option<CaptureRow> {
+    omnibox_rows(model, q)
+        .into_iter()
+        .find_map(|row| match row {
+            OmniRow::Capture(c) => Some(c),
+            _ => None,
+        })
+}
+
+/// The row names its destination *and* the peeled title and effective due, so
+/// what `Enter` does is legible before it is pressed.
+#[test]
+fn the_capture_row_states_its_destination_title_and_due() {
+    let mut model = open_with(&["work"]);
+    model.selected = Selection::List(0);
+
+    assert_eq!(
+        capture(&model, "call mum tomorrow"),
+        Some(CaptureRow::Ready {
+            list_title: "work".into(),
+            title: "call mum".into(),
+            due: Some(model.now.date_naive() + chrono::Duration::days(1)),
+        })
+    );
+}
+
+/// `split_title_and_due` never peels word 0, so a lone date-word stays a title.
+/// Its **due** depends on the pane, which is why both are pinned: a List leaves
+/// it undated, Today defaults it to today so the entry stays on its page.
+#[test]
+fn a_lone_date_word_is_a_title_and_its_due_follows_the_pane() {
+    let mut model = open_with(&["work"]);
+
+    model.selected = Selection::List(0);
+    assert_eq!(
+        capture(&model, "tomorrow"),
+        Some(CaptureRow::Ready {
+            list_title: "work".into(),
+            title: "tomorrow".into(),
+            due: None,
+        })
+    );
+
+    model.selected = Selection::Today;
+    model.default_list = Some(ListId("work".into()));
+    assert_eq!(
+        capture(&model, "tomorrow"),
+        Some(CaptureRow::Ready {
+            list_title: "work".into(),
+            title: "tomorrow".into(),
+            due: Some(model.now.date_naive()),
+        })
+    );
+}
+
+/// Neither SEARCH nor CAPTURE on an empty or whitespace-only query: both gate on
+/// the trimmed one, so `matches_filter`'s "empty matches everything" — right for
+/// JUMP — does not leak into an offer.
+#[test]
+fn neither_search_nor_capture_appears_without_a_query() {
+    let mut model = open_with(&["work"]);
+    model.selected = Selection::List(0);
+
+    for q in ["", "   "] {
+        let groups: Vec<_> = omnibox_rows(&model, q).iter().map(OmniRow::group).collect();
+        assert!(!groups.contains(&Group::Search), "{q:?}");
+        assert!(!groups.contains(&Group::Capture), "{q:?}");
+    }
+}
+
+/// Today with `default_list` unresolved: a reason on the row, and `Enter` inert
+/// — it must not delegate, because `finish_add_task` would write that reason to
+/// the status line, which an unfireable row promises not to do.
+#[test]
+fn a_refused_capture_states_its_reason_and_enter_is_inert() {
+    let mut model = open_with(&["work"]);
+    assert_eq!(model.selected, Selection::Today);
+    assert!(model.default_list.is_none());
+    model.status_line = Some("kept".into());
+
+    for c in "buy bread".chars() {
+        update(&mut model, ch(c));
+    }
+    assert!(matches!(
+        capture(&model, "buy bread"),
+        Some(CaptureRow::Refused { .. })
+    ));
+
+    let last = rows(&model).len() - 1;
+    for _ in 0..last {
+        update(&mut model, key(KeyCode::Down));
+    }
+    let commands = update(&mut model, key(KeyCode::Enter));
+
+    assert!(commands.is_empty(), "nothing was created");
+    assert!(
+        matches!(model.overlay, Some(Overlay::Omnibox { .. })),
+        "an unfireable row keeps the overlay"
+    );
+    assert_eq!(model.status_line.as_deref(), Some("kept"));
+}
+
+/// The two **nameless** cases emit no row at all — no destination to name and no
+/// reason to print, and drawing "Create task…" with nowhere to put it would be
+/// the one outright lie.
+#[test]
+fn a_nameless_target_emits_no_capture_row() {
+    // A List selection that resolves to nothing.
+    let mut model = Model::new();
+    model.selected = Selection::List(0);
+    assert_eq!(capture(&model, "buy bread"), None);
+
+    // And a resolved `default_list` naming a List `lists` does not hold —
+    // `DefaultListResolved` never cross-checks, so this is reachable at startup.
+    let mut model = open_with(&["work"]);
+    model.selected = Selection::Today;
+    model.default_list = Some(ListId("ghost".into()));
+    assert_eq!(capture(&model, "buy bread"), None);
+}
+
+/// `a` is unaffected by the row's stricter rule: it needs the id, not a title.
+#[test]
+fn a_still_captures_where_the_omnibox_row_is_absent() {
+    let mut model = open_with(&["work"]);
+    update(&mut model, key(KeyCode::Esc));
+    model.selected = Selection::Today;
+    model.default_list = Some(ListId("ghost".into()));
+
+    update(&mut model, ch('a'));
+
+    assert!(
+        matches!(model.overlay, Some(Overlay::AddTask { .. })),
+        "`a` opened its capture overlay"
+    );
+}
+
+/// Firing it creates through `finish_add_task` and closes the overlay.
+#[test]
+fn firing_the_capture_row_creates_and_closes() {
+    let mut model = open_with(&["work"]);
+    model.selected = Selection::List(0);
+    for c in "buy bread".chars() {
+        update(&mut model, ch(c));
+    }
+    let last = rows(&model).len() - 1;
+    assert!(matches!(rows(&model)[last], OmniRow::Capture(_)));
+    for _ in 0..last {
+        update(&mut model, key(KeyCode::Down));
+    }
+
+    let commands = update(&mut model, key(KeyCode::Enter));
+
+    assert!(model.overlay.is_none());
+    assert!(!commands.is_empty(), "the insert was requested");
+    assert!(model.tasks.iter().any(|t| t.title == "buy bread"));
 }

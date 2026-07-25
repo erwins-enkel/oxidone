@@ -446,6 +446,10 @@ pub enum LegendContext {
     /// the query text. `Esc`'s cell names its scope rather than saying "clear",
     /// which would read as interchangeable with `^U`'s.
     Filter,
+    /// The **Omnibox** (`p`): a grouped result list over a query. Movement is
+    /// `Up`/`Down` only — `j`/`k` type, as they do in every other text overlay —
+    /// and `Enter` runs whichever row is highlighted.
+    Omnibox,
     /// The same input open in **Search**, where `Esc` exits Search rather than
     /// clearing the query — so the `Esc` cell must read "leave search", not
     /// "clear", or the legend promises an affordance the pane does not honour.
@@ -791,6 +795,33 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         KILL_WORD,
     ];
 
+    // The Omnibox: escape hatches first, then movement, then the chords — the
+    // `DUE_INPUT` order, for the reason given there. ASCII throughout: `Up/Down`
+    // is what `key_label` prints for those codes, and `render_legend` takes no
+    // `ascii` flag, so a cell has no way to degrade.
+    //
+    // `Enter` reads "run", not "save": the highlighted row may jump, search or
+    // capture, and only one of those saves anything. No cell for `^N`/`^P` —
+    // they are not bound, deliberately: `resolve` is modifier-blind, so a `^N`
+    // landing just outside the overlay would reach `n` → `EditNotes` and suspend
+    // the TUI into `$EDITOR`.
+    const OMNIBOX: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "run",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "close",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Up/Down"),
+            label: "move",
+        },
+        KILL_LINE,
+        KILL_WORD,
+    ];
+
     match context {
         LegendContext::Tasks => TASKS,
         LegendContext::Sidebar => SIDEBAR,
@@ -800,6 +831,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,
         LegendContext::ListPicker => LIST_PICKER,
+        LegendContext::Omnibox => OMNIBOX,
         LegendContext::Filter => FILTER,
         LegendContext::SearchFilter => SEARCH_FILTER,
     }

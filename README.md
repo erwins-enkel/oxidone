@@ -38,6 +38,9 @@ a Tasks costume.
 - Full list management (create / rename / delete)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
   due → title → "my order" (Google's), the only view a reorder writes to
+- An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a keyless
+  command, search every List, or capture the query as a Task — `Enter` runs the
+  highlighted row
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*
 
@@ -118,14 +121,19 @@ overwrites an existing config. The fields:
 # Must be absolute — `~` is NOT expanded.
 client_secret_path = "/home/you/.config/oxidone/client_secret.json"
 
-# Catppuccin flavor: "latte" | "frappe" | "macchiato" | "mocha"
+# Catppuccin flavor: "latte" | "frappe" | "macchiato" | "mocha".
+# `:flavor` in the Omnibox (`p`) changes it for the session; this is the value it
+# starts from, and the one it returns to on restart.
 theme = "mocha"
 
-# Render ASCII block bars instead of braille (for terminals/fonts without braille glyphs)
+# Render ASCII block bars instead of braille (for terminals/fonts without braille
+# glyphs). `:ascii on|off` changes it for the session.
 ascii_fallback = false
 
 # Hide entries due far out from the task pane (`w` toggles it live). Entries due
 # more than `horizon_days` days out are hidden; undated entries always stay.
+# `:horizon <days>` sets the cutoff for the session — it never flips the filter,
+# so with `hide_distant` off it changes the number and says so.
 hide_distant = false
 horizon_days = 14
 ```

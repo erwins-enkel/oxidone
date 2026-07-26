@@ -263,9 +263,11 @@ fn classify_token(token: &str) -> Option<Token> {
     None
 }
 
-/// A signed-or-bare day-count offset: digits followed by a date-scale unit, as
-/// `interim` reads `3d` / `2 weeks`. `3h` and `3m` are excluded with the rest of
-/// the sub-day units — see [`DateWord::Time`].
+/// A signed-or-bare offset written as **one** token: digits followed by a
+/// date-scale unit, as in `3d`, `+2w`, `3mo`. The spaced spelling (`2 weeks`)
+/// never reaches here — it is two tokens, classified as Number then Unit. `3h`
+/// and `3m` are excluded with the rest of the sub-day units, so this is where
+/// the unit being *date*-scale is enforced — see [`DateWord::Time`].
 fn is_offset(token: &str) -> bool {
     let body = token
         .strip_prefix('+')
@@ -772,8 +774,13 @@ mod tests {
             // and the vocabulary therefore has to list explicitly.
             ("Call tues", "Call", Some(ymd(2026, 7, 21))),
             ("Retro thurs", "Retro", Some(ymd(2026, 7, 23))),
-            // Slash date, day-first (UK dialect).
+            // Slash dates, day-first (UK dialect), with and without a year —
+            // `is_slash_date`'s two arms. The yearless form is the one that keeps
+            // `Sprint 1/2` reading as 1 February: ambiguous against a fraction,
+            // but `1/2` genuinely is a date in this notation and narrowing it is
+            // a separate call from #107.
             ("Pay it 1/8/2026", "Pay it", Some(ymd(2026, 8, 1))),
+            ("Sprint 1/2", "Sprint", Some(ymd(2026, 2, 1))),
             // Month-scale offset, and a backwards one: a past due date is a
             // legitimate capture (the pane renders it as `3d ago`).
             ("Sprint 3mo", "Sprint", Some(ymd(2026, 10, 20))),

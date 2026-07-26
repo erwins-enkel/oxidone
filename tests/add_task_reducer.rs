@@ -73,6 +73,28 @@ async fn enter_parses_a_trailing_date_while_tab_keeps_the_title_literal() {
     }
 }
 
+/// #107 end to end: `interim` reads `milk` as "minutes from now", so a plain
+/// `Enter` used to capture a Task titled `buy` due today — the last word of an
+/// ordinary shopping entry silently becoming a date. Every capture path routes
+/// through this same split, so a List is enough to pin it.
+#[tokio::test]
+async fn enter_keeps_a_non_date_trailing_word_in_the_title() {
+    let (mut m, _l, _t) = model_with_one_task().await;
+    update(&mut m, ch('a'));
+    typed(&mut m, "buy milk");
+    let cmds = update(&mut m, key(KeyCode::Enter));
+    match cmds.as_slice() {
+        [Command::AddTask { title, due, .. }] => {
+            assert_eq!(title, "buy milk", "the trailing word is not a date");
+            assert_eq!(*due, None, "and nothing was dated");
+        }
+        other => panic!("expected one AddTask, got {other:?}"),
+    }
+    // The optimistic placeholder carries the same undated title.
+    assert_eq!(m.tasks[0].title, "buy milk");
+    assert_eq!(m.tasks[0].due, None);
+}
+
 #[tokio::test]
 async fn a_opens_the_capture_overlay() {
     let (mut m, _l, _t) = model_with_one_task().await;

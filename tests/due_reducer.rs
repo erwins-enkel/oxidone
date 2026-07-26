@@ -187,6 +187,23 @@ async fn an_unparseable_date_keeps_the_overlay_open_and_reports() {
     assert!(m.status_line.is_some());
 }
 
+/// The same, for a word `interim` mistakes for a date (#107). `milk` used to
+/// parse as "minutes from now", so submitting it silently dated the Task today —
+/// a typo in this field writing a date through to Google.
+#[tokio::test]
+async fn a_non_date_word_keeps_the_overlay_open_and_reports() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, key(KeyCode::Down)); // "beta", undated
+    update(&mut m, ch('d'));
+    typed(&mut m, "milk");
+    let cmds = update(&mut m, key(KeyCode::Enter));
+
+    assert!(cmds.is_empty(), "nothing is written");
+    assert!(matches!(m.overlay, Some(Overlay::EditDue { .. }))); // still open
+    assert_eq!(m.tasks[1].due, None, "and the Task is not dated today");
+    assert!(m.status_line.is_some());
+}
+
 #[tokio::test]
 async fn a_failed_due_write_rolls_back_to_the_snapshot() {
     let (mut m, _l, tasks) = model_with_tasks().await;
@@ -532,17 +549,22 @@ async fn stepping_from_an_empty_or_unparsable_buffer_lands_on_today() {
         assert_eq!(buffer_of(&m), expected, "then steps from there");
     }
 
-    // Same for a buffer that does not parse.
-    let (mut m, _l, _t) = model_with_tasks().await;
-    m.now = chrono::Local
-        .with_ymd_and_hms(2026, 3, 14, 9, 0, 0)
-        .single()
-        .unwrap();
-    update(&mut m, ch('d'));
-    update(&mut m, chord('u'));
-    typed(&mut m, "not a date");
-    update(&mut m, key(KeyCode::Down));
-    assert_eq!(buffer_of(&m), "2026-03-14");
+    // Same for a buffer that does not parse. `milk` is here alongside the
+    // obvious one because `interim` reads it as a date (#107): before the word
+    // screen it parsed as today, so `↓` stepped to *tomorrow* instead of landing
+    // on today like every other unparsable buffer.
+    for buffer in ["not a date", "milk"] {
+        let (mut m, _l, _t) = model_with_tasks().await;
+        m.now = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 0, 0)
+            .single()
+            .unwrap();
+        update(&mut m, ch('d'));
+        update(&mut m, chord('u'));
+        typed(&mut m, buffer);
+        update(&mut m, key(KeyCode::Down));
+        assert_eq!(buffer_of(&m), "2026-03-14", "buffer {buffer:?}");
+    }
 }
 
 #[tokio::test]

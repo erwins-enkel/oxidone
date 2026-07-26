@@ -1,5 +1,8 @@
-//! The due editor's overlay as actually drawn: the selected prefill and the
-//! preview line beneath it.
+//! The two date-bearing previews as actually drawn: the due editor's overlay —
+//! its selected prefill and the preview line beneath it — and the capture
+//! overlay's `title · due` split row. Both are `ui::mod` reading
+//! `dateparse`, so they share this file's frame harness rather than standing up
+//! a second one.
 //!
 //! Every assertion here that concerns *style* — the reversed prefill, the
 //! unreversed cursor bar, the red on an unparsable buffer — reads
@@ -319,6 +322,49 @@ async fn a_whitespace_only_buffer_previews_the_clear_not_an_error() {
         "{rows:?}"
     );
     assert!(!rows.iter().any(|r| r.contains("→ not a date")), "{rows:?}");
+}
+
+/// #107 at the frame: `interim` reads `milk` as "minutes from now", so this
+/// preview used to reassure the user with `→ Wed 2026-07-22 · today` before
+/// `Enter` wrote that date through. It has to read as the error it is.
+#[tokio::test]
+async fn a_non_date_word_previews_an_error_not_a_date() {
+    let mut m = model_with_due().await;
+    update(&mut m, ch('d'));
+    update(&mut m, chord('u'));
+    typed(&mut m, "milk");
+    let rows = rows(&m);
+    assert!(rows.iter().any(|r| r.contains("→ not a date")), "{rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("· today")),
+        "no resolved date may be previewed for a non-date word: {rows:?}"
+    );
+}
+
+/// The capture overlay's split preview, the other `dateparse` reader in
+/// `ui::mod`. Both halves are asserted: a `capture_lines` that stopped drawing
+/// the row at all would satisfy the first on its own.
+#[tokio::test]
+async fn a_capture_of_a_non_date_word_draws_no_split_preview() {
+    let mut m = model_with_due().await;
+    update(&mut m, ch('a'));
+    typed(&mut m, "buy milk");
+    let undated = rows(&m);
+    assert!(
+        !undated.iter().any(|r| r.contains("→ buy")),
+        "nothing is peeled, so there is no split to preview: {undated:?}"
+    );
+
+    // A real trailing date still previews its split. `now` is Wednesday
+    // 2026-07-22, so the next Friday is two days out.
+    let mut m = model_with_due().await;
+    update(&mut m, ch('a'));
+    typed(&mut m, "ship it friday");
+    let dated = rows(&m);
+    assert!(
+        dated.iter().any(|r| r.contains("→ ship it · in 2d")),
+        "{dated:?}"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
 //! Pure due-date parsing, arithmetic and display. Parsing accepts a bare
 //! day-of-month (`15`), natural language (`today`, `tomorrow`, `mon`, `+3d`) via
-//! `interim`, and ISO `YYYY-MM-DD`; it resolves everything in the caller's
+//! `interim` — screened word by word against an exact date vocabulary, because
+//! `interim` matches its own names by prefix and would otherwise read `milk` as
+//! a date — and ISO `YYYY-MM-DD`; it resolves everything in the caller's
 //! reference timezone and strips any time component down to a
 //! `chrono::NaiveDate` (CONTEXT.md: a due date is a date, never a time). Display
 //! is the inverse: a date rendered relative to a reference day. Between them sits
@@ -30,7 +32,9 @@ pub struct DueParseError(pub String);
 /// Recognises, in order: a bare day-of-month 1–31 (`15` → the next 15th, on or
 /// after today), ISO `YYYY-MM-DD` (unambiguous, date-only fast path), then
 /// `interim`'s natural language (`today`, `tomorrow`, weekday names, `+3d`, month
-/// names, …). Any time component the parser infers is discarded.
+/// names, …) — but only once every word in it is date vocabulary
+/// ([`every_letter_run_is_a_date_word`]), since `interim` alone reads `milk` as a
+/// date. Any time component the parser infers is discarded.
 pub fn parse_due_relative_to<Tz: TimeZone>(
     input: &str,
     now: DateTime<Tz>,
@@ -66,6 +70,14 @@ pub fn parse_due_relative_to<Tz: TimeZone>(
     // shorthand (it treats a leading `+` as a dangling duration with no base
     // date). Strip one leading `+` so both spellings mean "3 days from now".
     let relative = trimmed.strip_prefix('+').map_or(trimmed, str::trim_start);
+    // `interim` matches its weekday, month and unit names on two- and
+    // three-character *prefixes*, so it reads any number of ordinary English
+    // words as dates (`milk` → minutes, `monitor` → Monday). Require every word
+    // to be date vocabulary before handing it over, or a typo in this field
+    // silently becomes today (#107).
+    if !every_letter_run_is_a_date_word(relative) {
+        return Err(DueParseError(input.to_string()));
+    }
     // Natural language, resolved in `now`'s timezone; `date_naive` strips the
     // time in that same zone (never a UTC-shifted date).
     parse_date_string(relative, now, Dialect::Uk)
@@ -127,11 +139,17 @@ pub fn shift_days(base: NaiveDate, delta: i64) -> Option<NaiveDate> {
 ///
 /// It peels the **longest trailing word-suffix** that both looks like a date
 /// ([`looks_like_date_phrase`]) and parses, while leaving at least one word in
-/// the title. `interim` rejects a candidate that opens with a non-date word
-/// (`Bob tomorrow`, `report May`), so scanning longest-first cannot swallow
-/// title words. When nothing peels — including when the whole buffer is a date,
-/// since the first word must stay — the trimmed buffer is the title and there is
-/// no due date.
+/// the title. The gate rejects a candidate containing any word that is not date
+/// vocabulary (`Bob tomorrow`, `report May`), so scanning longest-first cannot
+/// swallow title words — it is the gate that guarantees this and not `interim`,
+/// which happily reads `Bob` as a date. When nothing peels — including when the
+/// whole buffer is a date, since the first word must stay — the trimmed buffer is
+/// the title and there is no due date.
+///
+/// A rejected candidate makes the scan retry a shorter suffix, so the gate
+/// decides the *date* as well as the title: `Ship it 3 days from now` peels
+/// nothing precisely because `now` is a time rather than a day, where a laxer
+/// gate would fall back to it and stamp today.
 pub fn split_title_and_due<Tz: TimeZone>(
     input: &str,
     now: DateTime<Tz>,
@@ -166,32 +184,204 @@ fn word_start_offsets(s: &str) -> Vec<usize> {
 }
 
 /// The false-positive gate for [`split_title_and_due`]: is this trailing
-/// candidate specific enough to *mean* a date? A bare month name and a bare
-/// number both parse — `interim` reads a month name as the first of that month,
-/// and [`parse_due_relative_to`] reads `15` as the next 15th — so without this
-/// gate they would silently eat ordinary title words (`Prep for May`, `Buy milk
-/// 2`, `Sprint 17`). So a **single** token that is a bare month name or all
-/// digits is rejected; every other single token (`3d`, `friday`, `tomorrow`, an
-/// ISO date) and every multi-token candidate is left for the parser to accept or
-/// reject.
+/// candidate specific enough to *mean* a date?
 ///
-/// This is the only thing keeping the bare-day-of-month rule out of title
-/// splitting, which is why it stays even though the reason it was first written
-/// (`interim` reading a bare number as a year) is now the lesser one.
+/// It has to be an allowlist, because `interim` is far looser than it looks.
+/// `types.rs` matches weekday and month names on their first **three**
+/// characters and time units on their first **two** (`se mi ho da we mo ye`,
+/// plus the bare letters `s m h d w y`), and `parser.rs` multiplies a unit with
+/// no `next`/`last` by **zero** — so `milk` is minutes-times-nothing, i.e.
+/// today, `mom` is months, `monitor` is Monday and `marketing` is March. Screen
+/// only the shapes we know (and let the parser judge the rest) and an ordinary
+/// title loses its last word (#107).
+///
+/// So **every** token must classify ([`classify_token`]), and a lone token must
+/// carry a date on its own — which a bare number, month, unit or qualifier does
+/// not (`Buy milk 2`, `Prep for May`, `count the days`, `do this`).
+///
+/// Deliberately stricter than [`parse_due_relative_to`], which the due editor
+/// uses: that is an explicit date field, so its text only has to *be* date
+/// vocabulary. This is a **guess** about ambiguous prose, so it demands
+/// date-specific evidence — a sub-day unit or a time never peels, since a due
+/// date is never a time and such a peel could only ever have meant today.
 fn looks_like_date_phrase(candidate: &str) -> bool {
     let mut tokens = candidate.split_whitespace();
-    let (Some(first), None) = (tokens.next(), tokens.next()) else {
-        // Multi-token (or empty): let the parser be the judge.
-        return true;
+    let Some(first) = tokens.next() else {
+        return false;
     };
-    let bare_number = !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit());
-    !(bare_number || is_month_name(first))
+    let Some(first_class) = classify_token(first) else {
+        return false;
+    };
+    let mut lone = true;
+    for token in tokens {
+        if classify_token(token).is_none() {
+            return false;
+        }
+        lone = false;
+    }
+    !lone || matches!(first_class, Token::SelfSufficient)
 }
 
-/// Whether `token` is an English month name or its common three-letter
-/// abbreviation, case-insensitively — the words `interim` reads as a bare month.
-fn is_month_name(token: &str) -> bool {
-    const MONTHS: [&str; 23] = [
+/// How much one token of a candidate is worth on its own.
+enum Token {
+    /// Carries a date by itself: a weekday, `today`/`tomorrow`/`yesterday`, an
+    /// offset (`3d`), or an ISO or slash date.
+    SelfSufficient,
+    /// Date vocabulary that needs company: a bare number, month name, unit or
+    /// qualifier. `May` alone is an ordinary word; `May 3` is a date.
+    NeedsCompany,
+}
+
+/// Classify one whitespace token of a peel candidate, or `None` if it is not
+/// part of a date at all.
+///
+/// One trailing comma is stripped first: it is the separator `interim` itself
+/// wants between day and year, so `Jul 4, 2017` (and `3d,`) must survive. The
+/// strip is uniform rather than per-shape because a per-shape exception would be
+/// arbitrary, and it costs nothing — `friday,` and `2026-08-01,` now reach the
+/// parser, which rejects them exactly as it did before.
+fn classify_token(token: &str) -> Option<Token> {
+    let token = token.strip_suffix(',').unwrap_or(token);
+    if token.is_empty() {
+        return None;
+    }
+    if token.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(Token::NeedsCompany);
+    }
+    if token.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return match date_word(token)? {
+            DateWord::Anchor => Some(Token::SelfSufficient),
+            DateWord::Month | DateWord::Unit | DateWord::Qualifier => Some(Token::NeedsCompany),
+            // A due date is never a time, so peeling one could only ever have
+            // resolved to today — the false positive itself, not a date.
+            DateWord::Time => None,
+        };
+    }
+    if is_offset(token) || is_iso_date(token) || is_slash_date(token) {
+        return Some(Token::SelfSufficient);
+    }
+    None
+}
+
+/// A signed-or-bare offset written as **one** token: digits followed by a
+/// date-scale unit, as in `3d`, `+2w`, `3mo`. The spaced spelling (`2 weeks`)
+/// never reaches here — it is two tokens, classified as Number then Unit. `3h`
+/// and `3m` are excluded with the rest of the sub-day units, so this is where
+/// the unit being *date*-scale is enforced — see [`DateWord::Time`].
+fn is_offset(token: &str) -> bool {
+    let body = token
+        .strip_prefix('+')
+        .or_else(|| token.strip_prefix('-'))
+        .unwrap_or(token);
+    let split = body
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(body.len());
+    let (digits, unit) = body.split_at(split);
+    !digits.is_empty()
+        && unit.bytes().all(|b| b.is_ascii_alphabetic())
+        && matches!(date_word(unit), Some(DateWord::Unit))
+}
+
+/// `YYYY-M-D` by shape only. Whether the fields name a real day is the parser's
+/// call, so `2026-13-99` passes here and fails there.
+fn is_iso_date(token: &str) -> bool {
+    let mut fields = token.split('-');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(year), Some(month), Some(day), None) => {
+            year.len() == 4 && all_digits(year) && all_digits(month) && all_digits(day)
+        }
+        _ => false,
+    }
+}
+
+/// `D/M` or `D/M/YY(YY)`, again by shape only — `interim` resolves it in the UK
+/// dialect (day first).
+fn is_slash_date(token: &str) -> bool {
+    let mut fields = token.split('/');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(day), Some(month), None, None) => all_digits(day) && all_digits(month),
+        (Some(day), Some(month), Some(year), None) => {
+            all_digits(day) && all_digits(month) && all_digits(year)
+        }
+        _ => false,
+    }
+}
+
+/// A non-empty run of ASCII digits.
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether every maximal run of ASCII letters in `s` is a word the date
+/// vocabulary knows — the pre-check that keeps `interim`'s prefix matching from
+/// reading an ordinary word as a date (see [`looks_like_date_phrase`] for what
+/// it does and why).
+///
+/// Letter *runs*, not whitespace tokens, so the check is blind to the
+/// punctuation it must not care about: `3d` → `d`, `9am` → `am`,
+/// `2026-08-01T18:30:00Z` → `T`, `Z`, and `milk,` → `milk`. Digit-only inputs
+/// have no runs at all, which is why the day-of-month and ISO paths above are
+/// untouched.
+fn every_letter_run_is_a_date_word(s: &str) -> bool {
+    s.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|run| !run.is_empty())
+        .all(|run| date_word(run).is_some())
+}
+
+/// A word the date vocabulary knows, and how much a lone one is worth.
+enum DateWord {
+    /// A weekday, or `today`/`tomorrow`/`yesterday`: a date on its own.
+    Anchor,
+    /// A month name. `Prep for May` is not a dated Task.
+    Month,
+    /// A date-scale unit (`day`, `w`, `months`). `count the days` is not either.
+    Unit,
+    /// `next`/`last`/`this`/`ago`: meaningless without something to qualify.
+    Qualifier,
+    /// A sub-day unit, a time marker, or `now` — an instant, not a day. Google
+    /// stores no time, so these are accepted by [`parse_due_relative_to`] but
+    /// never peeled off a title.
+    Time,
+}
+
+/// Look a word up in the date vocabulary, case-insensitively and **exactly**.
+///
+/// Exactly, because that is the whole fix: `interim` reaches `monitor` from
+/// `mon` and `milk` from `mi`, so anything short of an exact match inherits its
+/// false positives. Every spelling lives in exactly one list, so there is no
+/// precedence to get wrong — and where two families nearly collide, the listing
+/// matches how `interim` itself resolves the word: `mon` is Monday (its
+/// `month_name` has no `mon`, so `week_day` wins) and README documents it, `may`
+/// is a month (it checks month names first), `mo` is months while `m` is
+/// minutes, and `t`/`z` are the ISO separator and zero offset rather than
+/// Tuesday.
+///
+/// The bare prefixes `interim` also accepts — `we`, `da`, `se`, `ho`, `ye`,
+/// `mi` — are deliberately absent: these are the spellings a person types, and
+/// `we` is a pronoun.
+fn date_word(word: &str) -> Option<DateWord> {
+    const WEEKDAYS: &[&str] = &[
+        "mon",
+        "monday",
+        "tue",
+        "tues",
+        "tuesday",
+        "wed",
+        "weds",
+        "wednesday",
+        "thu",
+        "thur",
+        "thurs",
+        "thursday",
+        "fri",
+        "friday",
+        "sat",
+        "saturday",
+        "sun",
+        "sunday",
+    ];
+    const DAY_NAMES: &[&str] = &["today", "tomorrow", "yesterday"];
+    const MONTHS: &[&str] = &[
         "jan",
         "january",
         "feb",
@@ -208,6 +398,7 @@ fn is_month_name(token: &str) -> bool {
         "aug",
         "august",
         "sep",
+        "sept",
         "september",
         "oct",
         "october",
@@ -216,8 +407,29 @@ fn is_month_name(token: &str) -> bool {
         "dec",
         "december",
     ];
-    let lower = token.to_ascii_lowercase();
-    MONTHS.contains(&lower.as_str())
+    const UNITS: &[&str] = &[
+        "d", "day", "days", "w", "week", "weeks", "mo", "month", "months", "y", "year", "years",
+    ];
+    const QUALIFIERS: &[&str] = &["next", "last", "this", "ago"];
+    const TIMES: &[&str] = &[
+        "h", "hour", "hours", "m", "min", "mins", "minute", "minutes", "s", "sec", "secs",
+        "second", "seconds", "am", "pm", "z", "t", "now",
+    ];
+    let lower = word.to_ascii_lowercase();
+    let word = lower.as_str();
+    if WEEKDAYS.contains(&word) || DAY_NAMES.contains(&word) {
+        Some(DateWord::Anchor)
+    } else if MONTHS.contains(&word) {
+        Some(DateWord::Month)
+    } else if UNITS.contains(&word) {
+        Some(DateWord::Unit)
+    } else if QUALIFIERS.contains(&word) {
+        Some(DateWord::Qualifier)
+    } else if TIMES.contains(&word) {
+        Some(DateWord::Time)
+    } else {
+        None
+    }
 }
 
 /// How far either side of `today` a due date still reads as a day count. Beyond
@@ -421,6 +633,54 @@ mod tests {
             parse_due_relative_to("2026-08-01 18:30", now()),
             Ok(ymd(2026, 8, 1))
         );
+        // Including the RFC-3339 spelling, whose `T` and `Z` are the reason the
+        // word screen scans letter *runs* rather than whitespace tokens.
+        assert_eq!(
+            parse_due_relative_to("2026-08-01T18:30:00Z", now()),
+            Ok(ymd(2026, 8, 1))
+        );
+    }
+
+    /// The due editor's half of #107. `interim` reads all of these as dates from
+    /// a two- or three-character prefix, so without the word screen typing `milk`
+    /// into the `d` overlay silently stamped today and `monitor` stamped Monday.
+    #[test]
+    fn an_unknown_word_is_not_a_date() {
+        for input in ["milk", "monitor", "marketing", "mom", "west", "milk,"] {
+            assert!(
+                parse_due_relative_to(input, now()).is_err(),
+                "expected error for {input:?}"
+            );
+        }
+    }
+
+    /// The due editor is an explicit date field, so its screen is looser than the
+    /// capture gate's: the text only has to *be* date vocabulary. `3h` and `now`
+    /// therefore still resolve here while never peeling off a title — asserted on
+    /// both sides so the asymmetry cannot drift into an accident.
+    #[test]
+    fn the_editor_still_accepts_every_vocabulary_spelling() {
+        let cases = [
+            ("9am", ymd(2026, 7, 20)),
+            ("2 days ago", ymd(2026, 7, 18)),
+            ("1/8/2026", ymd(2026, 8, 1)),
+            ("12/8", ymd(2026, 8, 12)),
+            ("sept", ymd(2026, 9, 1)),
+            ("tues", ymd(2026, 7, 21)),
+            // 2026-07-20 *is* a Monday, and interim's UK dialect reads a plain
+            // weekday as the next one — so `mon` is a week out, not today.
+            ("mon", ymd(2026, 7, 27)),
+            ("3 mo", ymd(2026, 10, 20)),
+            ("3h", ymd(2026, 7, 20)),
+            ("now", ymd(2026, 7, 20)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_due_relative_to(input, now()),
+                Ok(expected),
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -502,6 +762,43 @@ mod tests {
             ("Party May 3", "Party", Some(ymd(2026, 5, 3))),
             // `N days` (number + unit) is a date just like the `3d` short form.
             ("Ship it 3 days", "Ship it", Some(ymd(2026, 7, 23))),
+            // A qualifier plus a unit, both directions.
+            ("Plan next week", "Plan", Some(ymd(2026, 7, 27))),
+            ("Review last week", "Review", Some(ymd(2026, 7, 13))),
+            // Day-then-month, and a spelled-out month with a year.
+            ("Party 1 Jul", "Party", Some(ymd(2026, 7, 1))),
+            ("Meet 4 July 2017", "Meet", Some(ymd(2017, 7, 4))),
+            ("Bug from 2 days ago", "Bug from", Some(ymd(2026, 7, 18))),
+            ("Deploy this friday", "Deploy", Some(ymd(2026, 7, 24))),
+            // Four/five-letter abbreviations, which `interim` reaches by prefix
+            // and the vocabulary therefore has to list explicitly.
+            ("Call tues", "Call", Some(ymd(2026, 7, 21))),
+            ("Retro thurs", "Retro", Some(ymd(2026, 7, 23))),
+            // Slash dates, day-first (UK dialect), with and without a year —
+            // `is_slash_date`'s two arms. The yearless form is the one that keeps
+            // `Sprint 1/2` reading as 1 February: ambiguous against a fraction,
+            // but `1/2` genuinely is a date in this notation and narrowing it is
+            // a separate call from #107.
+            ("Pay it 1/8/2026", "Pay it", Some(ymd(2026, 8, 1))),
+            ("Sprint 1/2", "Sprint", Some(ymd(2026, 2, 1))),
+            // Month-scale offset, and a backwards one: a past due date is a
+            // legitimate capture (the pane renders it as `3d ago`).
+            ("Sprint 3mo", "Sprint", Some(ymd(2026, 10, 20))),
+            ("Task -3d", "Task", Some(ymd(2026, 7, 17))),
+            // Connectives are not date words, so the scan falls back past them
+            // and the dangling word stays in the title. Long-standing, pinned
+            // here because the gate now decides these fallbacks.
+            ("Ship it in 3 days", "Ship it in", Some(ymd(2026, 7, 23))),
+            ("Renew on friday", "Renew on", Some(ymd(2026, 7, 24))),
+            ("Ship on 2026-08-01", "Ship on", Some(ymd(2026, 8, 1))),
+            // The Today-capture case from the reducer tests, at this layer.
+            ("call bob tomorrow", "call bob", Some(ymd(2026, 7, 21))),
+            // The comma `interim` wants between day and year. Each of these
+            // loses its date if `classify_token` stops tolerating one.
+            ("Meet Jul 4, 2017", "Meet", Some(ymd(2017, 7, 4))),
+            ("Party Jul 1, 2020", "Party", Some(ymd(2020, 7, 1))),
+            ("Party May 3, 2020", "Party", Some(ymd(2020, 5, 3))),
+            ("Ship it 3d,", "Ship it", Some(ymd(2026, 7, 23))),
         ];
         for (input, title, due) in cases {
             assert_eq!(
@@ -515,8 +812,16 @@ mod tests {
     #[test]
     fn a_bare_month_or_number_stays_in_the_title() {
         // interim would read these as the 1st of a month / a year; the gate keeps
-        // them as ordinary words instead of silently dating the Task.
-        for input in ["Prep for May", "Buy milk 2", "Sprint 17", "Plan june"] {
+        // them as ordinary words instead of silently dating the Task. `sept` is
+        // in the list because interim reaches it from `sep` by prefix, so before
+        // the vocabulary was exact it peeled while `june` did not.
+        for input in [
+            "Prep for May",
+            "Buy milk 2",
+            "Sprint 17",
+            "Plan june",
+            "Ship sept",
+        ] {
             assert_eq!(
                 split_title_and_due(input, now()),
                 (input.to_string(), None),
@@ -537,13 +842,146 @@ mod tests {
         }
     }
 
+    /// The #107 table. `interim` matches weekday and month names on their first
+    /// three characters and units on their first two, then multiplies a
+    /// direction-less unit by zero — so every trailing word here parses, and all
+    /// but one of them used to peel: `milk`/`mom`/`west` as today, `monitor` as
+    /// Monday, `marketing` as 1 March. An exact vocabulary is the only thing that
+    /// keeps them ordinary words.
     #[test]
     fn a_non_date_trailing_word_stays_in_the_title() {
-        // No trailing suffix parses as a date, so nothing is peeled.
-        assert_eq!(
-            split_title_and_due("Build the widget", now()),
-            ("Build the widget".to_string(), None)
-        );
+        for input in [
+            "buy milk",
+            "call mom",
+            "buy new monitor",
+            "Decide marketing",
+            "head west",
+            "launch website",
+            "import data",
+            "call dad",
+            "read more",
+            "call mother",
+            "plan the move",
+            "say yes",
+            "just send",
+            "do not set",
+            // The one that never parsed, kept as the control.
+            "Build the widget",
+        ] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A lone unit is as unspecific as a lone month: `interim` reads it as
+    /// zero-of-that-unit from now, i.e. today.
+    #[test]
+    fn a_bare_unit_or_letter_stays_in_the_title() {
+        for input in ["count the days", "vitamin d", "swap the w", "plan the week"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A lone qualifier is meaningless without something to qualify. These do not
+    /// peel on the parser's own account either, but resting on that would be
+    /// resting on the parser this gate exists to distrust — so the gate rejects
+    /// them itself.
+    #[test]
+    fn a_bare_qualifier_stays_in_the_title() {
+        for input in ["Ship it last", "filed ago", "do this"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A due date is a date, never a time (CONTEXT.md), so peeling a sub-day
+    /// offset or a clock time could only ever have resolved to today — the false
+    /// positive itself. `now` is in here for the same reason: it is an instant.
+    #[test]
+    fn a_sub_day_unit_or_time_never_peels() {
+        for input in [
+            "ship it 3 hours",
+            "sync 3h",
+            "wait 3m",
+            "standup 9am",
+            "room 5:30",
+            "grade 10:00",
+            "task 3.5",
+            "Call it now",
+            // The fallback trap: the parser rejects `3 days from now`, so a laxer
+            // gate walks down to the lone `now` and stamps today.
+            "Ship it 3 days from now",
+            "Renew in 2 weeks from now",
+        ] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Every token has to be date vocabulary, not just the first. Multi-token
+    /// candidates used to be waived entirely ("let the parser be the judge"),
+    /// which is how `2 milk` read as two minutes from now.
+    #[test]
+    fn a_multi_word_candidate_needs_every_word_to_be_a_date() {
+        for input in ["buy 2 milk", "Decide marketing campaign"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A trailing date carrying a *time* stops peeling, deliberately: the time
+    /// tokens are not date shapes, and admitting them only when a date token sits
+    /// beside them would restore the positional waiver this gate replaced. The
+    /// date-only spellings still peel (see `splits_a_trailing_date_off_the_title`)
+    /// and `d` still edits the due date.
+    #[test]
+    fn a_trailing_date_with_a_time_stays_in_the_title() {
+        for input in ["Pay rent 2026-08-01 18:30", "Meeting 2026-08-01T18:30:00Z"] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// The bound on the comma tolerance in `classify_token`. None of these peel
+    /// today — `interim` has no ordinals and rejects a comma after a word — and
+    /// tolerating the day/year comma must not start peeling them.
+    #[test]
+    fn an_ordinal_or_punctuated_word_stays_in_the_title() {
+        for input in [
+            "Party May 3rd",
+            "Fireworks July 4th",
+            "Launch 21st July",
+            "Retro friday,",
+            "Ship it tomorrow,",
+            "Pay rent 2026-08-01,",
+            "Call mon,",
+            "Deadline (friday)",
+        ] {
+            assert_eq!(
+                split_title_and_due(input, now()),
+                (input.to_string(), None),
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]

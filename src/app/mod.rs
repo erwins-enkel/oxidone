@@ -248,17 +248,22 @@ impl Group {
     /// The group header's text. `Command` carries the session-only caveat here
     /// rather than on every row: it would otherwise cost the same dozen cells on
     /// each, competing with the effect and the advisory for one budget.
+    ///
+    /// **"settings are session only"**, not a bare "session only": the group
+    /// also holds `:refresh`, which sets nothing, and an unqualified caveat
+    /// would be a claim about a row it does not describe.
     pub fn header(self) -> &'static str {
         match self {
             Group::Jump => "JUMP",
-            Group::Command => "COMMAND · session only",
+            Group::Command => "COMMAND · settings are session only",
             Group::Search => "SEARCH",
             Group::Capture => "CAPTURE",
         }
     }
 }
 
-/// Which keyless command a COMMAND row names.
+/// Which command a COMMAND row names. Keyless, bar `Refresh`, which is the one
+/// verb here that a key also fires.
 ///
 /// `OmniCommand`, not `Cmd`: [`Command`] is the side-effect enum in this same
 /// module, and a `Cmd`/`Command` pair a scroll apart is the collision this
@@ -268,24 +273,74 @@ pub enum OmniCommand {
     Horizon,
     Flavor,
     Ascii,
+    /// The one verb that *does* something rather than setting something: the
+    /// same manual Refresh `r` fires, reachable by name. Alone in taking no
+    /// argument, which is why `command_state` answers for it before the
+    /// missing-argument guard the other three share.
+    Refresh,
 }
 
 impl OmniCommand {
     /// Table order — which is also the order the rows appear in, and therefore
-    /// which one `selected == 0` names when a prefix matches more than one.
-    pub const ALL: [OmniCommand; 3] = [
+    /// which one heads the COMMAND band when a prefix matches more than one.
+    ///
+    /// `Refresh` is **last** for exactly that reason. It is the only row here
+    /// that reaches the network, and the only prefix matching more than one
+    /// command is the empty verb — which draws the whole band, so last is the
+    /// furthest this table can put the network verb from the row `Enter` starts
+    /// on. It heads the band only when it is the *sole* match, i.e. when the
+    /// user typed `r…` or `s…` and meant it; `:horizon` heads it otherwise, as
+    /// it always has.
+    ///
+    /// Not a claim about `selected == 0`: an empty query matches `Today`, so row
+    /// zero there is a JUMP row and a stray `Enter` reaches no command at all.
+    /// Position within the band is all this order decides.
+    pub const ALL: [OmniCommand; 4] = [
         OmniCommand::Horizon,
         OmniCommand::Flavor,
         OmniCommand::Ascii,
+        OmniCommand::Refresh,
     ];
 
-    /// The canonical verb, without the display-only `:`.
+    /// The canonical verb, without the display-only `:`. Always what the row
+    /// renders, whichever spelling matched it.
     pub fn verb(self) -> &'static str {
         match self {
             OmniCommand::Horizon => "horizon",
             OmniCommand::Flavor => "flavor",
             OmniCommand::Ascii => "ascii",
+            OmniCommand::Refresh => "refresh",
         }
+    }
+
+    /// Spellings that also reach this command, beyond `verb`.
+    ///
+    /// A way *in*, never a second name on screen: the row label is `verb()`
+    /// regardless, so an alias teaches the canonical word instead of competing
+    /// with it. `sync` is the one that exists — it is the word reached for, while
+    /// `CONTEXT.md`'s term is Refresh, and that entry is what keeps the two from
+    /// becoming two features.
+    ///
+    /// An exhaustive match rather than a `Refresh`-only predicate, so a verb
+    /// added later has to answer the question.
+    fn aliases(self) -> &'static [&'static str] {
+        match self {
+            OmniCommand::Refresh => &["sync"],
+            OmniCommand::Horizon | OmniCommand::Flavor | OmniCommand::Ascii => &[],
+        }
+    }
+
+    /// Whether `typed` is a prefix of this command's verb or of any of its
+    /// aliases.
+    ///
+    /// Prefix, not substring, and the reason lives at the call site in
+    /// [`omnibox_rows`]: substring would fire `:horizon` for `zon` and match two
+    /// commands for `a`. The empty verb prefixes everything, which is what makes
+    /// an empty query list the whole table.
+    fn matches_verb(self, typed: &str) -> bool {
+        std::iter::once(self.verb())
+            .chain(self.aliases().iter().copied())
+            .any(|spelling| spelling.starts_with(typed))
     }
 }
 
@@ -300,8 +355,9 @@ pub enum CommandState {
     NeedsArgument { completion: Option<String> },
     /// Argument present and unparseable. Carries the range or the valid set.
     Invalid { reason: String },
-    /// Argument valid, but the command cannot act in this pane (`:horizon` in
-    /// Search). Distinct from `Invalid`: fix the pane, not the text.
+    /// Nothing wrong with the argument; the command cannot act in the state the
+    /// app is in — `:horizon` in Search, `:refresh` with no connection.
+    /// Distinct from `Invalid`: fix the state, not the text.
     RefusedHere { reason: &'static str },
     /// Parsed and ready. `effect` is the row's `14 → 30`.
     Valid { effect: String },
@@ -3203,7 +3259,7 @@ fn open_delete_list_confirm(model: &mut Model) {
 /// [`OmniRow::group`] changes.
 ///
 /// Matching runs on the **trimmed** query throughout — the leading trim is what
-/// keeps `" hor"` from splitting to an empty verb that prefix-matches all three
+/// keeps `" hor"` from splitting to an empty verb that prefix-matches all four
 /// commands and puts an `Invalid` row at `selected == 0`.
 pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
     let trimmed = query.trim();
@@ -3230,10 +3286,11 @@ pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
 
     // COMMAND — split at the first space, strip one display-only `:`, match the
     // verb by *prefix*. Substring would fire `:horizon` for `zon` and match two
-    // commands for `a`, landing an invalid row at `selected == 0`.
+    // commands for `a`, landing an invalid row at `selected == 0`. Aliases match
+    // the same way, so `sy` reaches `:refresh` (see `matches_verb`).
     let (verb, arg) = split_command(trimmed);
     for command in OmniCommand::ALL {
-        if !command.verb().starts_with(&verb.to_lowercase()) {
+        if !command.matches_verb(&verb.to_lowercase()) {
             continue;
         }
         rows.push(OmniRow::Command(command_row(model, command, query, arg)));
@@ -3336,6 +3393,14 @@ fn command_state(
     query: &str,
     arg: Option<&str>,
 ) -> CommandState {
+    // Answered before the missing-argument guard below, which is written for the
+    // three *setting* verbs: a bare `:refresh` is already complete, so routing it
+    // through `NeedsArgument` would offer a completion to an argument that does
+    // not exist and leave the row unfireable forever.
+    if command == OmniCommand::Refresh {
+        return refresh_state(model, arg);
+    }
+
     let Some(arg) = arg else {
         // The target is built rather than appended to, so a typed `:` survives
         // and leading whitespace is normalised away.
@@ -3393,6 +3458,37 @@ fn command_state(
                 reason: "on|off".to_string(),
             },
         },
+        // Already answered at the top, before the guard that made `arg` a
+        // `&str`; this arm exists because the match is exhaustive. It delegates
+        // rather than panicking, so the row stays right if the early return ever
+        // moves — `arg` is `Some` here, which is the case that refuses.
+        OmniCommand::Refresh => refresh_state(model, Some(arg)),
+    }
+}
+
+/// The `:refresh` row's state.
+///
+/// Three answers, and the argument is the *first* question: `:refresh now` is a
+/// typo, not a request, and reading it as a bare `:refresh` would silently act on
+/// something the user did not write.
+///
+/// Offline is [`CommandState::RefusedHere`] rather than `Invalid` for the reason
+/// that variant draws: there is nothing to fix in the text. It also makes the row
+/// unfireable, so the refusal is read *before* it is pressed — `refresh` itself
+/// keeps its own offline guard, which is what `r` still needs.
+fn refresh_state(model: &Model, arg: Option<&str>) -> CommandState {
+    if arg.is_some() {
+        return CommandState::Invalid {
+            reason: "takes no argument".to_string(),
+        };
+    }
+    if !model.api_available {
+        return CommandState::RefusedHere { reason: OFFLINE };
+    }
+    CommandState::Valid {
+        // Not an `old → new`: a Refresh has no before and after to name, and the
+        // row's job here is to say what `Enter` will do.
+        effect: "pull from Google".to_string(),
     }
 }
 
@@ -3718,16 +3814,26 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
 ///
 /// Re-parses the argument rather than carrying it on the row: `Valid` proved it
 /// parses, and threading the value through the row would put the parse in two
-/// places for three commands. A `None` here is unreachable by construction and
-/// simply does nothing, rather than an `unwrap` that would panic the TUI.
+/// places for the three commands that take one. A `None` here is unreachable by
+/// construction and simply does nothing, rather than an `unwrap` that would
+/// panic the TUI.
 ///
 /// Every command reports **when it changed nothing observable**. The overlay is
 /// gone by now, so a command that also leaves the frame untouched is
 /// indistinguishable from a dropped keystroke — which is what the house rules'
 /// "no zero count masquerading as success" forbids. Keyed on the frame, not on
 /// any one flag: `:horizon` crossing no row, `:ascii off` when already off and
-/// `:flavor mocha` on the default all repaint identically.
+/// `:flavor mocha` on the default all repaint identically. `:refresh` needs no
+/// such report: `refresh` prints its own transient status, and the pane repaints
+/// when the pull lands.
 fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Command> {
+    // Before the argument is split, because there is none to split: `:refresh`
+    // is the same verb `r` fires, down to the `pending_refresh` flag and the
+    // offline guard — one Refresh, reachable two ways.
+    if command == OmniCommand::Refresh {
+        return refresh(model);
+    }
+
     let (_, arg) = split_command(query.trim());
     let Some(arg) = arg else {
         return Vec::new();
@@ -3785,6 +3891,10 @@ fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Comm
                 (on == model.ascii).then(|| format!("ascii already {}", on_off(on)));
             model.ascii = on;
         }
+        // Handled above, before the argument split; this arm exists because the
+        // match is exhaustive. It delegates rather than panicking, so the verb
+        // still fires if that early return ever moves.
+        OmniCommand::Refresh => return refresh(model),
     }
     Vec::new()
 }

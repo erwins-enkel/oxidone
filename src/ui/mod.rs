@@ -430,6 +430,11 @@ fn omnibox_line(
                     OmniCommand::Horizon => format!("now {}", model.horizon_days),
                     OmniCommand::Flavor => format!("now {}", model.flavor.as_str()),
                     OmniCommand::Ascii => format!("now {}", on_off(model.ascii)),
+                    // `:refresh` takes no argument, so `command_state` never
+                    // hands it this state, and it sets no value there would be a
+                    // `now …` for. Empty rather than `unreachable!` — a missing
+                    // trail is not worth panicking the TUI over.
+                    OmniCommand::Refresh => String::new(),
                 },
                 CommandState::Invalid { reason } => reason.clone(),
                 CommandState::RefusedHere { reason } => (*reason).to_string(),

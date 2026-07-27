@@ -8,8 +8,8 @@
 use chrono::{TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{
-    omnibox_rows, update, CaptureRow, CommandState, Focus, Group, JumpTarget, Message, Model,
-    OmniCommand, OmniRow, Overlay,
+    omnibox_rows, update, CaptureRow, Command, CommandState, Focus, Group, JumpTarget, Message,
+    Model, OmniCommand, OmniRow, Overlay, OFFLINE,
 };
 use oxidone::config::Flavor;
 use oxidone::domain::{List, ListId, Selection};
@@ -127,7 +127,7 @@ fn esc_closes_and_mutates_nothing() {
 
 // ─── rows and order ─────────────────────────────────────────────────────────
 
-/// The empty query lists Today, then the Lists in order, then the three
+/// The empty query lists Today, then the Lists in order, then the four
 /// commands — and **no** SEARCH row. So `selected == 0` names Today, and
 /// `p`+`Enter` on an untouched Omnibox goes there.
 #[test]
@@ -145,7 +145,7 @@ fn the_empty_query_lists_today_then_lists_then_commands() {
                 OmniRow::Capture(_) => "CAPTURE".to_string(),
             })
             .collect::<Vec<_>>(),
-        ["Today", "work", "home", ":horizon", ":flavor", ":ascii"]
+        ["Today", "work", "home", ":horizon", ":flavor", ":ascii", ":refresh"]
     );
     assert_eq!(selected(&model), 0);
 }
@@ -216,10 +216,10 @@ fn the_verb_matches_by_prefix_not_substring() {
 }
 
 /// The leading trim: on the raw query `" hor"` splits to an empty verb, which
-/// prefix-matches all three commands and lands three `Invalid` rows at
+/// prefix-matches all four commands and lands four `Invalid` rows at
 /// `selected == 0`.
 #[test]
-fn a_leading_space_leaves_one_command_row_not_three() {
+fn a_leading_space_leaves_one_command_row_not_four() {
     let model = open_with(&[]);
     let rows = commands(&model, " hor");
 
@@ -362,10 +362,11 @@ fn the_advisory_is_horizons_alone_and_absent_in_search() {
     }
 }
 
-/// The effect reads `old → new` for all three, so a row says what changes
-/// without a per-command sentence.
+/// The effect reads `old → new` for all three *settings*, so a row says what
+/// changes without a per-command sentence. `:refresh` is not among them: it has
+/// no before and after to name, and states what `Enter` will do instead.
 #[test]
-fn every_valid_effect_reads_old_to_new() {
+fn every_setting_effect_reads_old_to_new() {
     let mut model = open_with(&[]);
     model.horizon_days = 14;
     model.flavor = Flavor::Mocha;
@@ -465,8 +466,8 @@ fn a_no_op_edit_leaves_the_selection_alone() {
 
 /// A `ListsLoaded` can shrink the rows under an open Omnibox — `update` routes
 /// only `Message::Key` to `omnibox_key`. Parked on the **last row overall** (the
-/// `:ascii` row), dropping one List is enough to strand the index; parked on the
-/// last JUMP row it would take four.
+/// `:refresh` row), dropping one List is enough to strand the index; parked on
+/// the last JUMP row it would take four.
 ///
 /// The first keystroke is a swallowed `Left`: it must reach the write-back
 /// without resetting `selected` to 0, and must not be the `Up` itself — or the
@@ -616,7 +617,8 @@ fn enter_after_a_shrink_fires_the_clamped_row() {
     }
 
     update(&mut model, Message::ListsLoaded(vec![list("a"), list("b")]));
-    // The last row is `:ascii`, a COMMAND row: it keeps the overlay rather than
+    // The last row is `:refresh`, and `open_with` leaves `api_available` false,
+    // so it is `RefusedHere`: a COMMAND row that keeps the overlay rather than
     // firing, which is exactly what the clamped index should reach.
     update(&mut model, key(KeyCode::Enter));
 
@@ -789,7 +791,8 @@ fn firing_the_capture_row_creates_and_closes() {
 
 /// Type `q` into a freshly opened Omnibox and press Enter on its first COMMAND
 /// row.
-fn fire(model: &mut Model, q: &str) {
+/// Returns what the `Enter` emitted, for the one command that emits anything.
+fn fire(model: &mut Model, q: &str) -> Vec<Command> {
     for c in q.chars() {
         update(model, ch(c));
     }
@@ -800,7 +803,7 @@ fn fire(model: &mut Model, q: &str) {
     for _ in 0..at {
         update(model, key(KeyCode::Down));
     }
-    update(model, key(KeyCode::Enter));
+    update(model, key(KeyCode::Enter))
 }
 
 /// Completion is one-shot: `hor` grows into `horizon `, and a second Enter has
@@ -985,6 +988,90 @@ fn an_observable_command_clears_a_stale_no_op_report() {
         model.status_line, None,
         "the row became visible, so the stale sentence had to go"
     );
+}
+
+// ─── :refresh ───────────────────────────────────────────────────────────────
+
+/// The only verb here that reaches the network, so its row states whether it
+/// *can*: `Valid` with an API, `RefusedHere` without. `open_with` leaves
+/// `api_available` false, which is why the refusal is the no-setup case.
+#[test]
+fn refresh_is_valid_online_and_refused_offline() {
+    let mut model = open_with(&[]);
+
+    assert_eq!(
+        commands(&model, "refresh")[0].1,
+        CommandState::RefusedHere { reason: OFFLINE }
+    );
+
+    model.api_available = true;
+    assert_eq!(
+        commands(&model, "refresh")[0].1,
+        CommandState::Valid {
+            effect: "pull from Google".to_string()
+        }
+    );
+}
+
+/// It takes none, so one given is a typo — and reading `:refresh now` as a bare
+/// `:refresh` would act on something the user did not write. Refused rather than
+/// ignored, with the query kept so the typo is one `Backspace` from fixed.
+#[test]
+fn refresh_takes_no_argument() {
+    let mut model = open_with(&[]);
+    model.api_available = true;
+
+    assert_eq!(
+        commands(&model, "refresh now")[0].1,
+        CommandState::Invalid {
+            reason: "takes no argument".to_string()
+        }
+    );
+
+    let before = model.status_line.clone();
+    assert_eq!(fire(&mut model, "refresh now"), vec![]);
+    assert_eq!(
+        model.status_line, before,
+        "the row already says why; the status line must not say it twice"
+    );
+    assert_eq!(query(&model), "refresh now", "the query was discarded");
+    assert!(matches!(model.overlay, Some(Overlay::Omnibox { .. })));
+}
+
+/// `sync` is the word reached for; Refresh is the word `CONTEXT.md` defines. The
+/// alias resolves to the same row under the same label, so it is a way *in*
+/// rather than a second name on screen.
+#[test]
+fn sync_finds_the_refresh_row_under_its_canonical_name() {
+    let model = open_with(&[]);
+
+    for q in ["sync", "sy", "s"] {
+        let rows = commands(&model, q);
+        assert_eq!(
+            rows.iter().map(|(c, ..)| *c).collect::<Vec<_>>(),
+            [OmniCommand::Refresh],
+            "{q:?} matched the wrong commands"
+        );
+        assert_eq!(rows[0].0.verb(), "refresh", "{q:?} renamed the row");
+    }
+
+    // An alias is a prefix like any other, so a word that merely *contains* one
+    // matches nothing — the same rule `zon` proves for the canonical verbs.
+    assert!(commands(&model, "ync").is_empty());
+}
+
+/// Fires the same Refresh `r` does — the shared `refresh` helper, so the
+/// transient status comes with it — and closes, because the pull is underway and
+/// there is nothing left to type. What that `Command` then does is
+/// `tests/refresh_reducer.rs`'s subject, not this file's.
+#[test]
+fn firing_refresh_emits_the_refresh_command_and_closes() {
+    let mut model = open_with(&[]);
+    model.api_available = true;
+
+    assert_eq!(fire(&mut model, "refresh"), vec![Command::RefreshLists]);
+    assert!(model.status_line.is_some(), "the pull went unannounced");
+    assert!(model.overlay.is_none(), "the Omnibox outlived its command");
 }
 
 /// The refusal names every flavor the enum holds, derived rather than spelled

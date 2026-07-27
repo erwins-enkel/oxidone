@@ -217,7 +217,12 @@ fn the_popup_is_tall_enough_for_its_headers() {
     typed(&mut model, "fla");
 
     let drawn = popup_rows(&model);
-    for header in ["JUMP", "COMMAND · session only", "SEARCH", "CAPTURE"] {
+    for header in [
+        "JUMP",
+        "COMMAND · settings are session only",
+        "SEARCH",
+        "CAPTURE",
+    ] {
         assert!(
             drawn.iter().any(|r| r.contains(header)),
             "{header:?} missing: {drawn:#?}"
@@ -229,12 +234,13 @@ fn the_popup_is_tall_enough_for_its_headers() {
     );
 }
 
-/// The header carries the session-only caveat once, rather than a dozen cells of
-/// it on every command row.
+/// The header carries the caveat once, rather than a dozen cells of it on every
+/// command row — and scopes it to the *settings*, because `:refresh` shares the
+/// group and sets nothing.
 #[test]
-fn the_command_header_says_session_only() {
+fn the_command_header_scopes_session_only_to_the_settings() {
     let model = open_with(&["work"]);
-    assert!(shows(&model, "COMMAND · session only"));
+    assert!(shows(&model, "COMMAND · settings are session only"));
 }
 
 /// The row vector is headerless while the drawn item list is not, so the
@@ -426,6 +432,28 @@ fn a_command_row_echoes_its_typed_argument() {
     let mut model = open_with(&["work"]);
     typed(&mut model, "horizon");
     assert!(shows(&model, ":horizon ‹arg›"), "{:#?}", popup_rows(&model));
+}
+
+/// `:refresh` is the one verb that is `Valid` with **no** argument, so it is the
+/// only row that reaches `command_arg_suffix` with nothing to append. The bare
+/// verb is what must come out: a `‹arg›` here would advertise an argument that
+/// makes the row refuse.
+#[test]
+fn the_argumentless_verb_renders_bare() {
+    let mut model = open_with(&["work"]);
+    model.api_available = true;
+    typed(&mut model, "refresh");
+
+    let drawn = popup_rows(&model);
+    let row = drawn
+        .iter()
+        .find(|r| r.contains(":refresh"))
+        .unwrap_or_else(|| panic!("no `:refresh` row: {drawn:#?}"));
+    assert!(
+        !row.contains('‹'),
+        "a placeholder on a complete verb: {row:?}"
+    );
+    assert!(row.contains("pull from Google"), "{row:?}");
 }
 
 /// A short title must not be discarded into blank padding. `lead_budget` already

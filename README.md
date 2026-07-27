@@ -38,9 +38,9 @@ a Tasks costume.
 - Full list management (create / rename / delete)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
   due → title → "my order" (Google's), the only view a reorder writes to
-- An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a keyless
-  command, search every List, or capture the query as a Task — `Enter` runs the
-  highlighted row
+- An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a command
+  (`:refresh`, `:horizon`, `:flavor`, `:ascii`), search every List, or capture
+  the query as a Task — `Enter` runs the highlighted row
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*
 

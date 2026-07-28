@@ -30,8 +30,10 @@ a Tasks costume.
 - The due editor (`d`) opens with the current date selected, so the first
   keystroke replaces it: a bare `15` means the next 15th, `↑`/`↓` step a day and
   `PgUp`/`PgDn` a week, and a live preview names the weekday and how far off it
-  is before you commit. `^U` clears the line and `^W` the last word, in every
-  text input
+  is before you commit. `^U` clears the line and `^W` the word before the caret,
+  in every text input; in a popup the caret moves too — `←`/`→`, `^A`/`^E`,
+  `Home`/`End` and `Delete`, so a title can be edited anywhere, not just at its
+  end
 - Bullet Journal entry types — Task, Event (`○`), Note (`—`) — flipped with
   `t`/`T`, and migration (`m`) to push an entry forward a day
 - Notes edited in your `$EDITOR`

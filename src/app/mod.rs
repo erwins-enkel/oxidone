@@ -3,6 +3,8 @@
 //! (api/sync/auth) only ever emit `Message`s into this reducer, and `update`
 //! emits `Command`s for them to run.
 
+pub mod text_input; // the editable line behind every text overlay
+
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
@@ -15,6 +17,8 @@ use crate::domain::{
 };
 use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
+
+use text_input::{kill_word, TextInput};
 
 /// Shown when an operation needs Google but no API client was configured: a
 /// write (ADR-0001: no offline editing in v1), or a Refresh, which has nothing
@@ -466,36 +470,43 @@ impl OmniRow {
 #[derive(Debug, Clone)]
 pub enum Overlay {
     /// In-place title editor for a Task.
-    EditTitle { task: TaskId, buffer: String },
+    EditTitle { task: TaskId, buffer: TextInput },
     /// Capture a new Task's title.
-    AddTask { buffer: String },
+    AddTask { buffer: TextInput },
     /// Capture a new Subtask's title, to be inserted under `parent`.
-    AddSubtask { parent: TaskId, buffer: String },
+    AddSubtask { parent: TaskId, buffer: TextInput },
     /// Due-date entry for a Task: natural language, a bare day-of-month, or ISO
     /// — or empty to clear.
     ///
     /// `pristine` marks the prefill as untouched, i.e. still *selected*: the
-    /// first printable character replaces the whole buffer rather than appending
-    /// to it, and `Backspace` clears it outright. The view draws it reversed
-    /// while it holds, so the replacement is announced rather than sprung.
+    /// first printable character replaces the whole buffer rather than editing
+    /// it, and `Backspace` or `Delete` clears it outright. The view draws it
+    /// reversed while it holds, so the replacement is announced rather than
+    /// sprung.
     ///
     /// Anything that *changes* the buffer clears the flag — a character, a
-    /// `Backspace`, a chord, a step that moves — and it is never set again for
-    /// the life of the overlay. A step refused at the ends of the calendar is
-    /// the one keystroke that does not: it leaves the buffer byte-identical, so
-    /// the prefill is still untouched and still reads as selected.
+    /// delete, a chord, a step that moves — and it is never set again for the
+    /// life of the overlay. Two kinds of keystroke sit either side of that rule:
+    ///
+    /// - A **caret key** clears it *without* changing the buffer. It collapses
+    ///   the selection to the edge it names, which keeps the text and dismisses
+    ///   the selection — so the reversed span must go, or it would promise a
+    ///   replacement that will no longer happen.
+    /// - A **step refused** at the ends of the calendar does not clear it: it
+    ///   leaves the buffer byte-identical, so the prefill is still untouched and
+    ///   still reads as selected.
     EditDue {
         task: TaskId,
-        buffer: String,
+        buffer: TextInput,
         pristine: bool,
     },
     /// Inline single-line notes editor — the fallback used when no external
     /// editor is configured. Empty clears the notes.
-    EditNotes { task: TaskId, buffer: String },
+    EditNotes { task: TaskId, buffer: TextInput },
     /// Capture a new List's title.
-    AddList { buffer: String },
+    AddList { buffer: TextInput },
     /// In-place title editor for a List.
-    RenameList { list: ListId, buffer: String },
+    RenameList { list: ListId, buffer: TextInput },
     /// The title/notes filter input (`/`). A marker with no buffer of its own:
     /// the query lives on [`Model::filter`] (the single source of truth the view
     /// filter reads), edited in place by [`filter_key`] so the pane narrows live
@@ -532,7 +543,7 @@ pub enum Overlay {
 
 impl Overlay {
     /// The editable text buffer of a text-input overlay, if this is one.
-    fn input_buffer(&mut self) -> Option<&mut String> {
+    fn input_buffer(&mut self) -> Option<&mut TextInput> {
         match self {
             Overlay::EditTitle { buffer, .. }
             | Overlay::AddTask { buffer }
@@ -2326,7 +2337,7 @@ fn open_edit_title(model: &mut Model) {
     if let Some(task) = focused_task(model) {
         model.overlay = Some(Overlay::EditTitle {
             task: task.id.clone(),
-            buffer: task.display_title().to_string(),
+            buffer: TextInput::new(task.display_title().to_string()),
         });
     }
 }
@@ -2436,7 +2447,7 @@ fn open_add_task(model: &mut Model) {
         return;
     }
     model.overlay = Some(Overlay::AddTask {
-        buffer: String::new(),
+        buffer: TextInput::default(),
     });
 }
 
@@ -2570,7 +2581,7 @@ fn open_add_subtask(model: &mut Model) {
     };
     model.overlay = Some(Overlay::AddSubtask {
         parent,
-        buffer: String::new(),
+        buffer: TextInput::default(),
     });
 }
 
@@ -3008,10 +3019,11 @@ fn restore_list_move(model: &mut Model, snapshot: PendingListMove) {
 /// Open the due-date editor, prefilled with the current due (ISO) or empty.
 fn open_edit_due(model: &mut Model) {
     if let Some(task) = focused_task(model) {
-        let buffer = task
-            .due
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
+        let buffer = TextInput::new(
+            task.due
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+        );
         model.overlay = Some(Overlay::EditDue {
             task: task.id.clone(),
             buffer,
@@ -3041,7 +3053,7 @@ fn edit_notes(model: &mut Model) -> Vec<Command> {
     } else {
         model.overlay = Some(Overlay::EditNotes {
             task: id,
-            buffer: notes.unwrap_or_default(),
+            buffer: TextInput::new(notes.unwrap_or_default()),
         });
         Vec::new()
     }
@@ -3244,7 +3256,7 @@ fn focused_list(model: &Model) -> Option<&List> {
 fn open_add_list(model: &mut Model) {
     if model.focus == Focus::Sidebar {
         model.overlay = Some(Overlay::AddList {
-            buffer: String::new(),
+            buffer: TextInput::default(),
         });
     }
 }
@@ -3284,7 +3296,7 @@ fn open_rename_list(model: &mut Model) {
     if let Some(list) = focused_list(model) {
         model.overlay = Some(Overlay::RenameList {
             list: list.id.clone(),
-            buffer: list.title.clone(),
+            buffer: TextInput::new(list.title.clone()),
         });
     }
 }
@@ -3751,11 +3763,21 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // See `filter_key` for why the chord arms precede `Char(c)` and why that
         // arm carries the exact negation rather than matching bare.
         KeyCode::Char('u') if chord => buffer.clear(),
-        KeyCode::Char('w') if chord => kill_word(buffer),
-        KeyCode::Char(c) if !chord => buffer.push(c),
-        KeyCode::Backspace => {
-            buffer.pop();
-        }
+        KeyCode::Char('w') if chord => buffer.kill_word(),
+        // The caret keys. `^A`/`^E` are the readline names for the two ends;
+        // `Home`/`End` the terminal ones, and both spellings reach the same
+        // place. `Delete` takes the character *under* the caret, where
+        // `Backspace` takes the one behind it — everything here is relative to
+        // the caret, which is why typing `insert`s rather than appends.
+        KeyCode::Char('a') if chord => buffer.home(),
+        KeyCode::Char('e') if chord => buffer.end(),
+        KeyCode::Left => buffer.left(),
+        KeyCode::Right => buffer.right(),
+        KeyCode::Home => buffer.home(),
+        KeyCode::End => buffer.end(),
+        KeyCode::Delete => buffer.delete(),
+        KeyCode::Char(c) if !chord => buffer.insert(c),
+        KeyCode::Backspace => buffer.backspace(),
         KeyCode::Enter => return submit_input(model, false),
         KeyCode::Esc => model.overlay = None,
         _ => {}
@@ -4028,16 +4050,27 @@ fn omnibox_search(model: &mut Model, query: String) -> Vec<Command> {
     commands
 }
 
+/// A caret key as the due editor needs it: what it does to an ordinary buffer,
+/// paired with the edge it collapses the *selected* prefill to.
+type CaretKey = (fn(&mut TextInput), fn(&mut TextInput));
+
 /// Keys for the due editor (named for the overlay, not the sort key `due_key`
 /// above). Text editing as the shared arm does it, plus two
 /// things only this overlay has: a *selected* prefill, and stepping.
 ///
 /// **The prefill.** While `pristine`, the buffer is the Task's current due date
 /// shown as selected (the view draws it reversed). A printable character
-/// replaces it and `Backspace` clears it, so retyping a date costs one keystroke
-/// instead of ten — the friction this overlay exists to remove. Any keystroke
-/// that changes the buffer clears the flag, after which both keys behave as they
-/// do everywhere else; see [`Overlay::EditDue`] for the one that does not.
+/// replaces it and `Backspace`/`Delete` clears it, so retyping a date costs one
+/// keystroke instead of ten — the friction this overlay exists to remove. Any
+/// keystroke that changes the buffer clears the flag, after which every key
+/// behaves as it does everywhere else; see [`Overlay::EditDue`] for the two
+/// keystrokes either side of that rule.
+///
+/// **The caret.** The same keys the other text overlays bind, with one addition
+/// the selection forces: while `pristine`, a caret key collapses the selection
+/// to the edge it names — `←`/`^A`/`Home` to the start, `→`/`^E`/`End` to the
+/// end — keeping the date and clearing the flag. The terminal's own idiom for a
+/// selection, and it makes the prefill editable rather than retype-only.
 ///
 /// **Stepping.** `↑`/`↓` move a day, `PgUp`/`PgDn` a week, resolving whatever is
 /// in the buffer rather than the Task's stored date — so steps compose with
@@ -4080,12 +4113,36 @@ fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Com
             Err(_) => Some(today),
         };
         if let Some(date) = stepped {
-            *buffer = date.format("%Y-%m-%d").to_string();
+            *buffer = TextInput::new(date.format("%Y-%m-%d").to_string());
             *pristine = false;
         }
         // On `None` the buffer is left exactly as it was: clamping would report a
         // date the key did not ask for, where a visible no-op is the honest
         // reading of "there is no next day".
+        return Vec::new();
+    }
+    // The caret keys, taken before the edit arms below because the selection
+    // answers them differently: while `pristine` they collapse it rather than
+    // step inside it. `←` and `^A` both go left, but only `^A` jumps — hence the
+    // pair.
+    let caret: Option<CaretKey> = match key.code {
+        KeyCode::Left => Some((TextInput::left, TextInput::home)),
+        KeyCode::Right => Some((TextInput::right, TextInput::end)),
+        KeyCode::Home => Some((TextInput::home, TextInput::home)),
+        KeyCode::End => Some((TextInput::end, TextInput::end)),
+        KeyCode::Char('a') if chord => Some((TextInput::home, TextInput::home)),
+        KeyCode::Char('e') if chord => Some((TextInput::end, TextInput::end)),
+        _ => None,
+    };
+    if let Some((motion, collapse)) = caret {
+        if *pristine {
+            // The one keystroke that clears the flag without touching the text:
+            // the selection is dismissed, so the reversed span must go with it.
+            *pristine = false;
+            collapse(buffer);
+        } else {
+            motion(buffer);
+        }
         return Vec::new();
     }
     match key.code {
@@ -4096,7 +4153,7 @@ fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Com
             *pristine = false;
         }
         KeyCode::Char('w') if chord => {
-            kill_word(buffer);
+            buffer.kill_word();
             *pristine = false;
         }
         KeyCode::Char(c) if !chord => {
@@ -4104,34 +4161,22 @@ fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Com
                 buffer.clear();
                 *pristine = false;
             }
-            buffer.push(c);
+            buffer.insert(c);
         }
-        KeyCode::Backspace => {
-            // Deleting a selection deletes all of it, which is what the reversed
-            // prefill invokes; once edited, it pops one character as usual.
-            if *pristine {
-                buffer.clear();
-                *pristine = false;
-            } else {
-                buffer.pop();
-            }
+        // Deleting a selection deletes all of it, which is what the reversed
+        // prefill invokes; once edited, each takes its own side of the caret as
+        // it does everywhere else.
+        KeyCode::Backspace | KeyCode::Delete if *pristine => {
+            buffer.clear();
+            *pristine = false;
         }
+        KeyCode::Backspace => buffer.backspace(),
+        KeyCode::Delete => buffer.delete(),
         KeyCode::Enter => return submit_input(model, false),
         KeyCode::Esc => model.overlay = None,
         _ => {}
     }
     Vec::new()
-}
-
-/// Delete the word before the cursor, readline's `unix-word-rubout`: drop any
-/// trailing whitespace, then the run of non-whitespace behind it.
-/// `"call Bob re: the invoice"` → `"call Bob re: the "`.
-fn kill_word(buffer: &mut String) {
-    buffer.truncate(buffer.trim_end().len());
-    let keep = buffer.rfind(char::is_whitespace).map_or(0, |i| {
-        i + buffer[i..].chars().next().map_or(1, char::len_utf8)
-    });
-    buffer.truncate(keep);
 }
 
 /// Keys shared by both pickers: `j`/`k` move the cursor, `Esc` cancels, and
@@ -4194,15 +4239,21 @@ fn submit_picker(model: &mut Model) -> Vec<Command> {
 /// as the title instead of peeling a trailing date off it.
 fn submit_input(model: &mut Model, literal: bool) -> Vec<Command> {
     match model.overlay.take() {
-        Some(Overlay::EditTitle { task, buffer }) => finish_edit_title(model, task, buffer),
-        Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer, literal),
+        Some(Overlay::EditTitle { task, buffer }) => {
+            finish_edit_title(model, task, buffer.into_text())
+        }
+        Some(Overlay::AddTask { buffer }) => finish_add_task(model, buffer.into_text(), literal),
         Some(Overlay::AddSubtask { parent, buffer }) => {
-            finish_add_subtask(model, parent, buffer, literal)
+            finish_add_subtask(model, parent, buffer.into_text(), literal)
         }
         Some(Overlay::EditDue { task, buffer, .. }) => finish_edit_due(model, task, buffer),
-        Some(Overlay::EditNotes { task, buffer }) => finish_edit_notes(model, task, Some(buffer)),
-        Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer),
-        Some(Overlay::RenameList { list, buffer }) => finish_rename_list(model, list, buffer),
+        Some(Overlay::EditNotes { task, buffer }) => {
+            finish_edit_notes(model, task, Some(buffer.into_text()))
+        }
+        Some(Overlay::AddList { buffer }) => finish_add_list(model, buffer.into_text()),
+        Some(Overlay::RenameList { list, buffer }) => {
+            finish_rename_list(model, list, buffer.into_text())
+        }
         other => {
             model.overlay = other;
             Vec::new()
@@ -4252,7 +4303,7 @@ fn finish_edit_title(model: &mut Model, task: TaskId, buffer: String) -> Vec<Com
 /// parse error, keep the overlay open with a status-line hint (don't drop the
 /// edit). On success, optimistically set `due`, snapshot for rollback, and emit
 /// the write-through — mirroring [`submit_edit_title`].
-fn finish_edit_due(model: &mut Model, task: TaskId, buffer: String) -> Vec<Command> {
+fn finish_edit_due(model: &mut Model, task: TaskId, buffer: TextInput) -> Vec<Command> {
     let trimmed = buffer.trim();
     let due = if trimmed.is_empty() {
         None // clear the due date
@@ -4261,9 +4312,11 @@ fn finish_edit_due(model: &mut Model, task: TaskId, buffer: String) -> Vec<Comma
             Ok(date) => Some(date),
             Err(_) => {
                 model.status_line = Some(format!("could not parse due date: {trimmed:?}"));
-                // Keep the overlay open so the user can fix the input.
-                // Not pristine: this is the user's own text, being corrected,
-                // so the next character must append rather than wipe it.
+                // Keep the overlay open so the user can fix the input, caret
+                // included — it is handed back untouched, so the correction
+                // resumes where it left off. Not pristine: this is the user's
+                // own text, being corrected, so the next character must edit it
+                // rather than wipe it.
                 model.overlay = Some(Overlay::EditDue {
                     task,
                     buffer,

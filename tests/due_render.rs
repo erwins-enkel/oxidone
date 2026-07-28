@@ -232,6 +232,29 @@ async fn the_cursor_bar_is_not_part_of_the_selection() {
     );
 }
 
+/// A caret key collapses the selection: the date stays, the reversed span goes,
+/// and the bar lands at the edge the key named. Drawn, not just modelled — the
+/// reverse-video is the only thing announcing that the next character replaces
+/// the line, so it must vanish the moment that stops being true.
+#[tokio::test]
+async fn collapsing_the_selection_unreverses_it_and_moves_the_bar_to_that_edge() {
+    let mut m = model_with_due().await;
+    update(&mut m, ch('d'));
+    update(&mut m, key(KeyCode::Left));
+    let input = overlay_title_row(&m) + 1;
+
+    assert_eq!(
+        modifier_over(&m, input, "2026-08-14", Modifier::REVERSED),
+        Some(false),
+        "the date survives, but no longer as a selection"
+    );
+    assert!(
+        rows(&m)[input as usize].contains("▏2026-08-14"),
+        "the bar collapsed to the start: {:?}",
+        rows(&m)[input as usize]
+    );
+}
+
 #[tokio::test]
 async fn the_selection_is_gone_once_the_buffer_is_edited() {
     let mut m = model_with_due().await;

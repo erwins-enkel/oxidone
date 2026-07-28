@@ -42,6 +42,15 @@ fn buffer_of(m: &Model) -> &str {
     }
 }
 
+/// Whether the prefill still reads as selected — the flag the view draws
+/// reversed.
+fn pristine_of(m: &Model) -> bool {
+    match &m.overlay {
+        Some(Overlay::EditDue { pristine, .. }) => *pristine,
+        other => panic!("expected an EditDue overlay, got {other:?}"),
+    }
+}
+
 fn typed(m: &mut Model, s: &str) {
     for c in s.chars() {
         update(m, ch(c));
@@ -393,7 +402,7 @@ async fn a_failed_migration_rolls_back_to_the_prior_due_date() {
 
 // ---- Modifier policy ----
 //
-// `^U`/`^W` are the first modifier-bearing keys in the app, so these pin the
+// `^A`/`^E`/`^U`/`^W` are the modifier-bearing keys in the app, so these pin the
 // predicate from both sides. Three ways of typing an ordinary character carry a
 // modifier — SHIFT on capitals, CONTROL|ALT on AltGr, and ALT alone — and all
 // three must still reach the buffer.
@@ -403,8 +412,8 @@ async fn a_control_chord_that_is_not_bound_types_nothing() {
     let (mut m, _l, _t) = model_with_tasks().await;
     update(&mut m, ch('d'));
     update(&mut m, chord('u')); // clear the prefill
-    update(&mut m, chord('a'));
-    assert_eq!(buffer_of(&m), "", "^A must not insert a literal 'a'");
+    update(&mut m, chord('k'));
+    assert_eq!(buffer_of(&m), "", "^K must not insert a literal 'k'");
 }
 
 /// AltGr arrives as CONTROL|ALT, and on several European layouts it is the only
@@ -494,6 +503,75 @@ async fn backspace_after_an_edit_pops_one_character() {
     typed(&mut m, "abc"); // no longer pristine
     update(&mut m, key(KeyCode::Backspace));
     assert_eq!(buffer_of(&m), "ab");
+}
+
+/// A caret key on the selected prefill collapses the selection to the edge it
+/// names instead of replacing the date — the terminal's own idiom, and what
+/// makes the prefill editable rather than retype-only.
+#[tokio::test]
+async fn a_caret_key_collapses_the_selected_prefill_and_keeps_the_date() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, ch('d')); // prefilled "2026-08-01", selected
+    update(&mut m, key(KeyCode::Left));
+    assert_eq!(
+        buffer_of(&m),
+        "2026-08-01",
+        "the date survives the collapse"
+    );
+    assert!(
+        !pristine_of(&m),
+        "the selection is gone, so the reversed span is"
+    );
+
+    // Collapsed to the *start*, so the next character inserts in front of the
+    // date rather than replacing it.
+    update(&mut m, ch('!'));
+    assert_eq!(buffer_of(&m), "!2026-08-01");
+}
+
+/// The other edge, by the other spelling: `^E` collapses to the end, and `^A`
+/// back to the start.
+#[tokio::test]
+async fn the_caret_chords_collapse_the_prefill_to_either_end() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, ch('d'));
+    update(&mut m, chord('e'));
+    assert!(!pristine_of(&m));
+    update(&mut m, ch('!'));
+    assert_eq!(buffer_of(&m), "2026-08-01!");
+
+    update(&mut m, chord('a'));
+    update(&mut m, ch('?'));
+    assert_eq!(buffer_of(&m), "?2026-08-01!");
+}
+
+/// `Delete` takes the whole selection, as `Backspace` does; once edited it takes
+/// the character under the caret and `Backspace` the one behind it.
+#[tokio::test]
+async fn delete_clears_the_selection_then_takes_the_character_under_the_caret() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, ch('d'));
+    update(&mut m, key(KeyCode::Delete));
+    assert_eq!(buffer_of(&m), "", "the selection went whole");
+
+    typed(&mut m, "friday");
+    update(&mut m, key(KeyCode::Home));
+    update(&mut m, key(KeyCode::Delete));
+    assert_eq!(buffer_of(&m), "riday");
+}
+
+/// Stepping still works after the caret has moved, and lands the caret back at
+/// the end of the date it wrote — the buffer is replaced wholesale.
+#[tokio::test]
+async fn stepping_after_a_caret_move_replaces_the_whole_buffer() {
+    let (mut m, _l, _t) = model_with_tasks().await;
+    update(&mut m, ch('d'));
+    update(&mut m, key(KeyCode::Home));
+    update(&mut m, key(KeyCode::Down)); // a day later than the prefill
+    assert_eq!(buffer_of(&m), "2026-08-02");
+
+    update(&mut m, ch('!'));
+    assert_eq!(buffer_of(&m), "2026-08-02!", "the caret followed the date");
 }
 
 #[tokio::test]

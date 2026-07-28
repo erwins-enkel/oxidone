@@ -340,26 +340,27 @@ pub fn bindings() -> &'static [Binding] {
 
 /// Resolve a key press to its bound `Action`, if any.
 ///
-/// The verbs are plain keys, so modifiers are ignored — with one exception:
-/// `^U` and `^W` resolve to nothing, because they are text-editing keys this app
-/// advertises, and `u`/`w` are bound to verbs one of which opens a browser. Every
+/// The verbs are plain keys, so modifiers are ignored — with one exception: the
+/// four text-editing chords this app advertises resolve to nothing, because
+/// `a`/`e`/`u`/`w` are all bound to verbs, one of which opens a browser. Every
 /// other Ctrl chord still resolves as if unmodified (see the body).
 pub fn resolve(key: KeyEvent) -> Option<Action> {
-    // `^U` and `^W` are advertised in four overlay legends, so they become
+    // `^A`/`^E`/`^U`/`^W` are advertised in the overlay legends, so they become
     // muscle memory — and a press landing just outside an overlay (a beat before
     // `d` opens it, a beat after `Enter` closes it) arrives here instead. Without
     // this, `^U` would resolve to `u` → `OpenLink`, which spawns a browser for a
-    // single-link Task, and `^W` to `w` → `ToggleHideDistant`, silently emptying
-    // the pane.
+    // single-link Task, `^W` to `w` → `ToggleHideDistant`, silently emptying the
+    // pane, `^A` to `a` → `AddTask` and `^E` to `e` → `EditTitle`, each springing
+    // the very overlay the user just left.
     //
-    // Scoped to those two keys rather than to every Ctrl chord, deliberately.
+    // Scoped to those four keys rather than to every Ctrl chord, deliberately.
     // This table is modifier-blind throughout — `Ctrl-Q` quits, `Ctrl-C` toggles
     // Completed — and that is left exactly as it was: gating the lot would
     // silently change two more keys in a change that neither introduced nor
     // advertised them. Making the whole table modifier-aware is a decision of its
     // own, with its own tests, tracked in #105. What is gated here is only what
     // this app now *teaches* the user to press.
-    if is_control_chord(key.modifiers) && matches!(key.code, KeyCode::Char('u' | 'w')) {
+    if is_control_chord(key.modifiers) && matches!(key.code, KeyCode::Char('a' | 'e' | 'u' | 'w')) {
         return None;
     }
     bindings()
@@ -444,8 +445,9 @@ pub fn key_label(code: KeyCode) -> String {
 pub enum LegendContext {
     Tasks,
     Sidebar,
-    /// A text-capture overlay: chars go to the buffer, Enter saves, Esc cancels,
-    /// and the readline chords `^U`/`^W` clear the line and the last word.
+    /// A text-capture overlay: chars go in at the caret, Enter saves, Esc
+    /// cancels, and the readline chords `^U`/`^W`/`^A`/`^E` clear the line, kill
+    /// the word before the caret, and jump to either end.
     TextInput,
     /// The due-date editor: like `TextInput`, plus arrows and page keys that step
     /// the date a day or a week at a time, so the legend advertises them.
@@ -648,9 +650,10 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
 
     // Overlay keys live in the reducer, not `bindings()`, so they are literal.
     //
-    // The two chords go last in every slice they join: the row drops from the
-    // right, and not knowing `^U` costs you a few Backspaces, where not knowing
-    // `Esc` strands you in the overlay.
+    // The three chords go last in every slice they join, in this order: the row
+    // drops from the right, and not knowing `Esc` strands you in the overlay,
+    // where not knowing `^U` costs you a few Backspaces and not knowing `^A`/`^E`
+    // costs you a few arrow presses — the cheapest of the three to miss.
     const KILL_LINE: LegendEntry = LegendEntry {
         keys: LegendKeys::Literal("^U"),
         label: "clear",
@@ -658,6 +661,13 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     const KILL_WORD: LegendEntry = LegendEntry {
         keys: LegendKeys::Literal("^W"),
         label: "word",
+    };
+    // Caret motion, by its readline names only: `←`/`→` and `Home`/`End` do the
+    // same work and need no advertising, where a cell costs columns on every row
+    // it joins.
+    const CARET: LegendEntry = LegendEntry {
+        keys: LegendKeys::Literal("^A/^E"),
+        label: "ends",
     };
 
     const TEXT_INPUT: &[LegendEntry] = &[
@@ -671,10 +681,13 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
         KILL_LINE,
         KILL_WORD,
+        CARET,
     ];
 
     // The due editor: `Enter`/`Esc` first (the escape hatches outrank
-    // everything), then the stepping keys, then the chords.
+    // everything), then the stepping keys, then the chords. This is the one
+    // slice already full at 80 columns, so `CARET` shows only from 88 on — the
+    // drop rule working as designed, pinned by `the_due_editor_legend_*` tests.
     //
     // The signs read `-/+` in *key* order: `Up` and `PageUp` step backwards, so
     // `+/-day` would pair the first key with the wrong sign. ASCII throughout —
@@ -701,6 +714,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
         KILL_LINE,
         KILL_WORD,
+        CARET,
     ];
 
     // `Tab` submits the title verbatim (no date parsing) — a key the plain
@@ -720,6 +734,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
         KILL_LINE,
         KILL_WORD,
+        CARET,
     ];
 
     const CONFIRM: &[LegendEntry] = &[

@@ -20,6 +20,7 @@ use ratatui::Frame;
 
 use std::collections::HashMap;
 
+use crate::app::text_input::TextInput;
 use crate::app::{
     omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow, CommandState, Focus,
     JumpTarget, Model, OmniCommand, OmniRow, Overlay,
@@ -115,15 +116,24 @@ const BOTTOM_CHROME_ROWS: u16 = 2;
 
 fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Model, theme: &Theme) {
     let now = model.now;
+    // The popup's inner text width, which every input line windows itself to.
+    // Derived from the frame the way the pickers derive their row width, not
+    // assumed to be `OVERLAY_WIDTH`: `centered` clamps the popup to the frame,
+    // so a terminal narrower than the popup gets a narrower line.
+    let text_width = OVERLAY_WIDTH
+        .min(area.width)
+        .saturating_sub(OVERLAY_BORDERS) as usize;
     // Every overlay but the picker is one or two lines of text in a popup, in
     // two shapes: the add-entry captures grow a second line only when a trailing
     // date is recognised (see `capture_lines`), while the due editor always has
     // one (see `due_lines`) because its whole job is to say what `Enter` will do.
     // The rest are a single line.
     let (title, lines): (&str, Vec<Line>) = match overlay {
-        Overlay::EditTitle { buffer, .. } => ("Edit title", vec![input_line(buffer)]),
-        Overlay::AddTask { buffer } => ("Add task", capture_lines(buffer, now, theme)),
-        Overlay::AddSubtask { buffer, .. } => ("Add subtask", capture_lines(buffer, now, theme)),
+        Overlay::EditTitle { buffer, .. } => ("Edit title", vec![input_line(buffer, text_width)]),
+        Overlay::AddTask { buffer } => ("Add task", capture_lines(buffer, now, text_width, theme)),
+        Overlay::AddSubtask { buffer, .. } => {
+            ("Add subtask", capture_lines(buffer, now, text_width, theme))
+        }
         // No "(blank clears)" here, unlike the notes editor below: `due_lines`
         // says it live, on the line beneath, exactly when the buffer is empty.
         Overlay::EditDue {
@@ -132,13 +142,21 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
             pristine,
         } => (
             "Edit due date",
-            due_lines(buffer, *pristine, stored_due(model, task), now, theme),
+            due_lines(
+                buffer,
+                *pristine,
+                stored_due(model, task),
+                now,
+                text_width,
+                theme,
+            ),
         ),
-        Overlay::EditNotes { buffer, .. } => {
-            ("Edit notes (blank clears)", vec![input_line(buffer)])
-        }
-        Overlay::AddList { buffer } => ("Add list", vec![input_line(buffer)]),
-        Overlay::RenameList { buffer, .. } => ("Rename list", vec![input_line(buffer)]),
+        Overlay::EditNotes { buffer, .. } => (
+            "Edit notes (blank clears)",
+            vec![input_line(buffer, text_width)],
+        ),
+        Overlay::AddList { buffer } => ("Add list", vec![input_line(buffer, text_width)]),
+        Overlay::RenameList { buffer, .. } => ("Rename list", vec![input_line(buffer, text_width)]),
         Overlay::Confirm(confirm) => ("Confirm", vec![Line::from(confirm.prompt.clone())]),
         // The one overlay that is a list, not a line — and the only one whose
         // height is not fixed.
@@ -165,9 +183,42 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
     );
 }
 
-/// The editable line of a text overlay: the buffer trailed by a cursor bar.
-fn input_line(buffer: &str) -> Line<'static> {
-    Line::from(format!("{buffer}▏"))
+/// The editable line of a text overlay: the buffer with the caret bar drawn
+/// *at* the caret, windowed to the `width` cells the popup has for it.
+fn input_line(buffer: &TextInput, width: usize) -> Line<'static> {
+    Line::from(input_window(buffer, buffer.caret(), width))
+}
+
+/// The visible slice of an input line: `text` with the caret bar inserted at
+/// byte offset `caret`, windowed to `width` cells so the bar is always on
+/// screen.
+///
+/// Stateless — the window is a function of the caret, so there is no scroll
+/// offset to keep in step with the buffer. Two positions, one rule: while the
+/// caret still fits, the window is anchored at the head, and past that it is
+/// anchored on the caret, which is then the rightmost cell. No ellipsis marks
+/// the hidden text; the line scrolls, as a terminal's own single-line inputs do.
+///
+/// Measured in display cells with `unicode_width`, as [`truncate`] measures, and
+/// a character that would straddle either edge is dropped rather than split —
+/// half of a wide character is not a character.
+fn input_window(text: &str, caret: usize, width: usize) -> String {
+    const CARET: &str = "▏";
+    let caret_col = text[..caret].width();
+    let line = format!("{}{CARET}{}", &text[..caret], &text[caret..]);
+    // The bar occupies `[caret_col, caret_col + 1)`. It fits at the head while
+    // that end column is within `width`; past that, the window ends on it.
+    let start = (caret_col + CARET.width()).saturating_sub(width);
+    let mut out = String::new();
+    let mut col = 0;
+    for c in line.chars() {
+        let cell = c.width().unwrap_or(0);
+        if col >= start && col + cell <= start + width {
+            out.push(c);
+        }
+        col += cell;
+    }
+    out
 }
 
 /// The due date the model currently holds for `task`, or `None` if it has none —
@@ -213,10 +264,11 @@ fn stored_due(model: &Model, task: &TaskId) -> Option<NaiveDate> {
 /// The line is present either way: it is what fixes the popup's height, so
 /// dropping it would make the frame jump as you type.
 fn due_lines(
-    buffer: &str,
+    buffer: &TextInput,
     pristine: bool,
     stored_due: Option<NaiveDate>,
     now: DateTime<Local>,
+    width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let input = if pristine {
@@ -228,7 +280,7 @@ fn due_lines(
             Span::raw("▏"),
         ])
     } else {
-        input_line(buffer)
+        input_line(buffer, width)
     };
     let trimmed = buffer.trim();
     let (preview, fg) = if trimmed.is_empty() {
@@ -279,8 +331,13 @@ fn format_due_preview(due: NaiveDate, today: NaiveDate) -> String {
 /// date is recognised — a dim preview of the `title · due` split that submitting
 /// (with `Enter`) will produce. `Tab` submits the buffer verbatim, so what the
 /// preview shows is exactly what a plain `Enter` commits.
-fn capture_lines(buffer: &str, now: DateTime<Local>, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = vec![input_line(buffer)];
+fn capture_lines(
+    buffer: &TextInput,
+    now: DateTime<Local>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![input_line(buffer, width)];
     if let (title, Some(due)) = split_title_and_due(buffer, now) {
         let preview = format!("→ {title} · {}", format_due_relative(due, now.date_naive()));
         lines.push(Line::styled(preview, Style::new().fg(theme.subtext)));
@@ -2545,21 +2602,21 @@ mod tests {
         // The add-entry captures carry the date-parsing/`Tab`-literal legend, not
         // the plain text-input one.
         model.overlay = Some(Overlay::AddTask {
-            buffer: String::new(),
+            buffer: TextInput::default(),
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::TaskCapture);
 
         model.overlay = Some(Overlay::AddSubtask {
             parent: TaskId("p".into()),
-            buffer: String::new(),
+            buffer: TextInput::default(),
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::TaskCapture);
 
-        // The due editor declares its own legend: it binds stepping keys and
-        // `^U`/`^W`, none of which `TextInput`'s two cells would have said.
+        // The due editor declares its own legend: it binds the stepping keys,
+        // which `TextInput`'s cells would not have said.
         model.overlay = Some(Overlay::EditDue {
             task: TaskId("t".into()),
-            buffer: String::new(),
+            buffer: TextInput::default(),
             pristine: false,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::DueInput);
@@ -2912,6 +2969,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- The input line's caret window ------------------------------------
+
+    /// The caret bar is drawn where the caret is, not after the text.
+    #[test]
+    fn the_caret_bar_sits_at_the_caret() {
+        assert_eq!(input_window("abcd", 4, 20), "abcd▏");
+        assert_eq!(input_window("abcd", 2, 20), "ab▏cd");
+        assert_eq!(input_window("abcd", 0, 20), "▏abcd");
+        assert_eq!(input_window("", 0, 20), "▏", "an empty line is all caret");
+    }
+
+    /// Past the fold the window follows the caret, and every window is exactly
+    /// the cells it was given — the point being that the bar is never off-screen.
+    #[test]
+    fn a_line_longer_than_the_popup_windows_onto_the_caret() {
+        let long = "abcdefghij";
+
+        // Caret at the head: anchored left, the tail hidden.
+        assert_eq!(input_window(long, 0, 8), "▏abcdefg");
+        // Still at the head while the bar fits within the width.
+        assert_eq!(input_window(long, 4, 8), "abcd▏efg");
+        // Past it: anchored on the bar, which is now the rightmost cell.
+        assert_eq!(input_window(long, 9, 8), "cdefghi▏");
+        assert_eq!(input_window(long, 10, 8), "defghij▏");
+
+        for caret in 0..=long.len() {
+            assert!(
+                input_window(long, caret, 8).width() <= 8,
+                "caret {caret} overflowed the window"
+            );
+        }
+    }
+
+    /// A wide character that would straddle an edge is dropped, not split: the
+    /// window then runs a cell short rather than printing half a glyph.
+    #[test]
+    fn a_wide_character_at_the_window_edge_is_dropped_whole() {
+        // 日本語abc is 2+2+2+1+1+1 = 9 cells; the bar makes 10.
+        assert_eq!(input_window("日本語abc", 12, 8), "本語abc▏");
+        let clipped = input_window("日本語abc", 12, 7);
+        assert_eq!(clipped, "語abc▏", "`本` would have straddled the left edge");
+        assert_eq!(clipped.width(), 6, "a cell left blank rather than split");
     }
 
     // --- The inline notes preview ----------------------------------------

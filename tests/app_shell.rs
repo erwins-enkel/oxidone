@@ -341,12 +341,22 @@ fn overlay_legends_advertise_only_keys_the_overlay_handles() {
         .iter()
         .map(|c| c.text())
         .collect();
-    assert_eq!(text, ["Enter save", "Esc cancel", "^U clear", "^W word"]);
+    assert_eq!(
+        text,
+        [
+            "Enter save",
+            "Esc cancel",
+            "^U clear",
+            "^W word",
+            "^A/^E ends"
+        ]
+    );
 
     // The due editor declares its own, naming every key it binds that the plain
-    // text legend would not have: the stepping keys and both chords. `Backspace`
-    // is deliberately absent — the reversed prefill is its affordance, and the
-    // row is already 76 of 80 columns.
+    // text legend would not have: the stepping keys. `Backspace` is deliberately
+    // absent — the reversed prefill is its affordance — and the cells that fit at
+    // 80 columns already spend 76 of them, which is why `^A/^E ends` waits for a
+    // wider terminal (`tests/legend_render.rs` pins that from both sides).
     let due: Vec<String> = keymap::legend(LegendContext::DueInput)
         .iter()
         .map(|c| c.text())
@@ -360,6 +370,7 @@ fn overlay_legends_advertise_only_keys_the_overlay_handles() {
             "PgUp/PgDn -/+week",
             "^U clear",
             "^W word",
+            "^A/^E ends",
         ]
     );
 

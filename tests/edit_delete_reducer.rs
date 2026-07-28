@@ -20,6 +20,19 @@ fn typed(m: &mut Model, s: &str) {
     }
 }
 
+/// A `Ctrl`-chord: CONTROL alone.
+fn chord(c: char) -> Message {
+    Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+}
+
+/// What the open title editor currently holds.
+fn assert_buffer(m: &Model, expected: &str) {
+    match &m.overlay {
+        Some(Overlay::EditTitle { buffer, .. }) => assert_eq!(buffer, expected),
+        other => panic!("expected EditTitle overlay, got {other:?}"),
+    }
+}
+
 async fn model_with_tasks() -> (Model, List, Vec<Task>) {
     model_with_titles(&["alpha", "beta"]).await
 }
@@ -99,6 +112,67 @@ async fn editing_and_enter_writes_through_optimistically() {
             title: "alptra".to_string(),
         }]
     );
+}
+
+/// The caret's reason to exist: prepending a word without retyping the title.
+#[tokio::test]
+async fn caret_home_then_typing_prepends_instead_of_appending() {
+    let (mut m, l, tasks) = model_with_tasks().await;
+    update(&mut m, ch('e'));
+    update(&mut m, chord('a')); // ^A — to the start
+    typed(&mut m, "Draft ");
+    let cmds = update(&mut m, key(KeyCode::Enter));
+
+    assert_eq!(m.tasks[0].title, "Draft alpha");
+    assert_eq!(
+        cmds,
+        vec![Command::SetTitle {
+            list: l.id,
+            task: tasks[0].id.clone(),
+            title: "Draft alpha".to_string(),
+        }]
+    );
+}
+
+/// Every caret key, on one buffer: the two ends by both spellings, one step in
+/// each direction, and the two deletes, which take opposite sides of the caret.
+#[tokio::test]
+async fn the_caret_keys_move_and_delete_around_the_caret() {
+    let (mut m, _l, _t) = model_with_titles(&["abcd"]).await;
+    update(&mut m, ch('e'));
+
+    update(&mut m, key(KeyCode::Home));
+    update(&mut m, key(KeyCode::Right));
+    update(&mut m, key(KeyCode::Delete)); // takes `b`, under the caret
+    assert_buffer(&m, "acd");
+
+    update(&mut m, key(KeyCode::Backspace)); // takes `a`, behind it
+    assert_buffer(&m, "cd");
+
+    update(&mut m, key(KeyCode::End));
+    update(&mut m, key(KeyCode::Left));
+    typed(&mut m, "-");
+    assert_buffer(&m, "c-d");
+
+    update(&mut m, chord('e')); // ^E — to the end
+    typed(&mut m, "!");
+    assert_buffer(&m, "c-d!");
+
+    update(&mut m, chord('w')); // ^W kills back from the caret
+    assert_buffer(&m, "");
+}
+
+/// `^W` spares what follows the caret — the whole point of making it
+/// caret-relative rather than "drop the last word of the line".
+#[tokio::test]
+async fn kill_word_spares_the_text_after_the_caret() {
+    let (mut m, _l, _t) = model_with_titles(&["call Bob re: the invoice"]).await;
+    update(&mut m, ch('e'));
+    for _ in 0.."invoice".len() {
+        update(&mut m, key(KeyCode::Left));
+    }
+    update(&mut m, chord('w'));
+    assert_buffer(&m, "call Bob re: invoice");
 }
 
 #[tokio::test]

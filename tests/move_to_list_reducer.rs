@@ -602,6 +602,46 @@ fn moving_a_parent_out_and_back_does_not_lose_its_subtasks() {
     );
 }
 
+#[test]
+fn a_parent_coming_home_from_a_flat_pane_still_frees_its_subtasks() {
+    // The same round trip, with the return hop made from Today — whose `due <=
+    // today` aggregate has no row for an undated child. Reading the ids to evict
+    // off the pane would leave `c1` tombstoned under `a` with nothing able to
+    // clear it: `reconcile_tombstones` evicts on a fetch that *omits* the id, and
+    // every fetch of `a` now lists it.
+    let mut undated = child("c1", "a", "p1");
+    undated.due = None;
+    let mut m = list_model(&["a", "b"], vec![task("p1", "a"), undated.clone()]);
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "b")));
+    assert!(m.tasks.is_empty(), "parent and child both left the pane");
+
+    // Today shows the parent, which is due today, and not the child.
+    m.selected = Selection::Today;
+    update(
+        &mut m,
+        Message::TodayLoaded {
+            tasks: vec![task("p1", "b")],
+            failed: Vec::new(),
+        },
+    );
+    m.focus = Focus::Tasks;
+    m.selected_task = Some(0);
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "a")));
+
+    m.selected = Selection::List(0);
+    update(
+        &mut m,
+        Message::TasksLoaded(ListId("a".into()), vec![task("p1", "a"), undated]),
+    );
+    assert_eq!(
+        ids(&m),
+        ["p1", "c1"],
+        "the subtask is back in its own List, tombstone spent"
+    );
+}
+
 // ---- Failure ----
 
 #[test]

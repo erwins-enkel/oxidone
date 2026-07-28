@@ -145,6 +145,21 @@ pub struct Model {
     /// a field on the Task cache: it augments nothing Google stores and
     /// round-trips nothing, so the pure-mirror rule (ADR-0003) holds.
     tombstones: HashMap<ListId, HashSet<TaskId>>,
+    /// The Subtask ids tombstoned alongside each relocated parent, so a later hop
+    /// can evict them again without depending on what the pane happens to hold.
+    ///
+    /// A child is tombstoned only when its row is on screen — that is the only
+    /// place the reply's ids come from, since Google names just the parent. The
+    /// *eviction* must not inherit that limit: a return hop made from a pane
+    /// missing the child (Today's aggregate drops an undated one) would leave the
+    /// outbound tombstone standing, and `reconcile_tombstones` cannot clear it —
+    /// it evicts on a fetch that *omits* the id, and the child is back, so every
+    /// fetch lists it. That is a Task hidden from its own List until restart, the
+    /// failure the parent's own unconditional eviction exists to prevent.
+    ///
+    /// Superseded on each hop and dropped once the parent carries nothing, so it
+    /// holds at most the children of the Tasks relocated this session.
+    carried_subtasks: HashMap<TaskId, HashSet<TaskId>>,
     /// A Move (indent/outdent/reorder) in flight, with the List and the pre-Move
     /// `tasks` snapshot for rollback. A Move renumbers many positions, so it is
     /// single-flight (one at a time) and reconciled by a whole-pane refetch on
@@ -601,6 +616,7 @@ impl Default for Model {
             pending_list_deletes: HashMap::new(),
             pending_clears: HashMap::new(),
             tombstones: HashMap::new(),
+            carried_subtasks: HashMap::new(),
             pending_move: None,
             pending_list_moves: HashMap::new(),
             next_temp: 0,
@@ -1758,20 +1774,23 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 .entry(source.clone())
                 .or_default()
                 .insert(task.id.clone());
-            if let Some(set) = model.tombstones.get_mut(&task.list) {
-                set.remove(&task.id);
-                if set.is_empty() {
-                    model.tombstones.remove(&task.list);
-                }
+            evict_tombstone(model, &task.list, &task.id);
+
+            // The Subtasks Google carried along (#86) take the same hand-off, and
+            // its two halves have different reach.
+            //
+            // **Evicting** covers every child this Task has ever carried, read
+            // from `carried_subtasks` rather than the pane: the return hop may be
+            // made from a pane the child is missing from, and a tombstone left
+            // standing there hides it from its own List until restart.
+            for child in model.carried_subtasks.remove(&task.id).unwrap_or_default() {
+                evict_tombstone(model, &task.list, &child);
             }
 
-            // The Subtasks Google carried along (#86). Their rows still name the
-            // source List, so they leave the pane with their parent and take the
-            // same hand-off it just did — including the eviction under the
-            // destination, without which an A→B→A hop leaves a child tombstoned
-            // in its own List for the rest of the session. Scoped to the source,
-            // because a destination pane opened mid-flight is showing children
-            // that legitimately arrived.
+            // **Tombstoning** reaches only the rows on screen — the reply names
+            // just the parent, so they are the only children whose ids are known.
+            // Scoped to the source List, because a destination pane opened
+            // mid-flight is showing children that legitimately arrived.
             let carried: Vec<TaskId> = model
                 .tasks
                 .iter()
@@ -1795,13 +1814,11 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                         .entry(source.clone())
                         .or_default()
                         .insert(child.clone());
-                    if let Some(set) = model.tombstones.get_mut(&task.list) {
-                        set.remove(child);
-                        if set.is_empty() {
-                            model.tombstones.remove(&task.list);
-                        }
-                    }
+                    evict_tombstone(model, &task.list, child);
                 }
+                model
+                    .carried_subtasks
+                    .insert(task.id.clone(), carried.iter().cloned().collect());
                 model.selected_task =
                     anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                 reselect_visible(model);
@@ -2029,6 +2046,21 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
             model.tasks.clear();
             model.selected_task = None;
             Vec::new()
+        }
+    }
+}
+
+/// Retire one tombstone: `id` is genuinely back in `list`, so a stale entry
+/// there must not outlive its trip home. Empty sets are dropped so a List with
+/// nothing outstanding leaves `reconcile_tombstones` at its early return.
+///
+/// Only a Move knows this. `reconcile_tombstones` cannot: it evicts on a fetch
+/// that *omits* the id, and a returned row is listed by every fetch.
+fn evict_tombstone(model: &mut Model, list: &ListId, id: &TaskId) {
+    if let Some(set) = model.tombstones.get_mut(list) {
+        set.remove(id);
+        if set.is_empty() {
+            model.tombstones.remove(list);
         }
     }
 }

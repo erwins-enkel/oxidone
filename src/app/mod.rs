@@ -157,8 +157,12 @@ pub struct Model {
     /// fetch lists it. That is a Task hidden from its own List until restart, the
     /// failure the parent's own unconditional eviction exists to prevent.
     ///
-    /// Superseded on each hop and dropped once the parent carries nothing, so it
-    /// holds at most the children of the Tasks relocated this session.
+    /// Accumulates rather than being replaced per hop, and is never dropped while
+    /// the parent is known to have children: a child the pane missed on one hop
+    /// may still be tombstoned under a List two hops back, and only the trip that
+    /// brings it home can retire that entry. So it holds the distinct Subtasks of
+    /// the Tasks relocated this session — bounded by real subtask counts, not by
+    /// the number of hops.
     carried_subtasks: HashMap<TaskId, HashSet<TaskId>>,
     /// A Move (indent/outdent/reorder) in flight, with the List and the pre-Move
     /// `tasks` snapshot for rollback. A Move renumbers many positions, so it is
@@ -1782,9 +1786,13 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             // **Evicting** covers every child this Task has ever carried, read
             // from `carried_subtasks` rather than the pane: the return hop may be
             // made from a pane the child is missing from, and a tombstone left
-            // standing there hides it from its own List until restart.
-            for child in model.carried_subtasks.remove(&task.id).unwrap_or_default() {
-                evict_tombstone(model, &task.list, &child);
+            // standing there hides it from its own List until restart. Taken
+            // whole and put back below with this hop's children folded in — a
+            // child unseen on one hop may still be tombstoned under a List two
+            // hops back, waiting for the trip that brings it home.
+            let mut remembered = model.carried_subtasks.remove(&task.id).unwrap_or_default();
+            for child in &remembered {
+                evict_tombstone(model, &task.list, child);
             }
 
             // **Tombstoning** reaches only the rows on screen — the reply names
@@ -1816,12 +1824,13 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                         .insert(child.clone());
                     evict_tombstone(model, &task.list, child);
                 }
-                model
-                    .carried_subtasks
-                    .insert(task.id.clone(), carried.iter().cloned().collect());
                 model.selected_task =
                     anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
                 reselect_visible(model);
+            }
+            remembered.extend(carried);
+            if !remembered.is_empty() {
+                model.carried_subtasks.insert(task.id.clone(), remembered);
             }
 
             // Only a flat cross-List pane needs repair, and only the one the Move

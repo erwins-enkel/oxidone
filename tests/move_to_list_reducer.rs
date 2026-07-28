@@ -602,31 +602,56 @@ fn moving_a_parent_out_and_back_does_not_lose_its_subtasks() {
     );
 }
 
-#[test]
-fn a_parent_coming_home_from_a_flat_pane_still_frees_its_subtasks() {
-    // The same round trip, with the return hop made from Today — whose `due <=
-    // today` aggregate has no row for an undated child. Reading the ids to evict
-    // off the pane would leave `c1` tombstoned under `a` with nothing able to
-    // clear it: `reconcile_tombstones` evicts on a fetch that *omits* the id, and
-    // every fetch of `a` now lists it.
-    let mut undated = child("c1", "a", "p1");
-    undated.due = None;
-    let mut m = list_model(&["a", "b"], vec![task("p1", "a"), undated.clone()]);
-    move_selected(&mut m);
-    update(&mut m, Message::MovedToList(task("p1", "b")));
-    assert!(m.tasks.is_empty(), "parent and child both left the pane");
-
-    // Today shows the parent, which is due today, and not the child.
+/// Park the Today aggregate on a single row and put the cursor on it. The
+/// aggregate is `due <= today`, so an undated child is simply not in it.
+fn today_showing(m: &mut Model, row: Task) {
     m.selected = Selection::Today;
     update(
-        &mut m,
+        m,
         Message::TodayLoaded {
-            tasks: vec![task("p1", "b")],
+            tasks: vec![row],
             failed: Vec::new(),
         },
     );
     m.focus = Focus::Tasks;
     m.selected_task = Some(0);
+}
+
+#[test]
+fn a_parent_coming_home_from_a_flat_pane_still_frees_its_subtasks() {
+    // A→B→C→A, with every hop after the first made from Today, where the undated
+    // child has no row. Two ways to get this wrong, one per hop:
+    //
+    // B→C must not forget `c1` just because this pane holds none of it — the
+    // `a` tombstone from the first hop is still outstanding and only the trip
+    // home can spend it.
+    //
+    // C→A must then evict it. Otherwise `reconcile_tombstones` never can: it
+    // evicts on a fetch that *omits* the id, and every fetch of `a` now lists it,
+    // so the child stays filtered out of its own List until restart.
+    let mut undated = child("c1", "a", "p1");
+    undated.due = None;
+    let mut m = list_model(&["a", "b", "c"], vec![task("p1", "a"), undated.clone()]);
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "b")));
+    assert!(m.tasks.is_empty(), "parent and child both left the pane");
+
+    // B→C. The picker offers `a` then `c`, so step past `a`.
+    today_showing(&mut m, task("p1", "b"));
+    update(&mut m, press('M'));
+    update(&mut m, press('j'));
+    assert_eq!(
+        update(&mut m, key(KeyCode::Enter)),
+        vec![Command::MoveToList {
+            source: ListId("b".into()),
+            task: TaskId("p1".into()),
+            destination: ListId("c".into()),
+        }]
+    );
+    update(&mut m, Message::MovedToList(task("p1", "c")));
+
+    // C→A, where `a` is the picker's first candidate again.
+    today_showing(&mut m, task("p1", "c"));
     move_selected(&mut m);
     update(&mut m, Message::MovedToList(task("p1", "a")));
 

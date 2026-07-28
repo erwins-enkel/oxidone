@@ -47,6 +47,14 @@ fn task(id: &str, list: &str) -> Task {
     }
 }
 
+/// A Subtask of `parent`, in `list`.
+fn child(id: &str, list: &str, parent: &str) -> Task {
+    Task {
+        parent: Some(TaskId(parent.into())),
+        ..task(id, list)
+    }
+}
+
 fn base(lists: &[&str]) -> Model {
     let mut m = Model::new();
     m.now = Local
@@ -187,20 +195,19 @@ fn esc_cancels_without_writing() {
     assert_eq!(ids(&m), ["t1"]);
 }
 
-// ---- Refusals ----
-
 #[test]
-fn a_task_with_subtasks_is_refused() {
+fn a_task_with_subtasks_opens_the_picker() {
+    // Google carries the subtree (#86), so a parent is an ordinary candidate:
+    // no refusal, and no live query before the picker (#93).
     let mut child = task("c1", "a");
     child.parent = Some(TaskId("t1".into()));
     let mut m = list_model(&["a", "b"], vec![task("t1", "a"), child]);
     update(&mut m, press('M'));
-    assert!(m.overlay.is_none());
-    assert_eq!(
-        m.status_line.as_deref(),
-        Some("can't move a task with subtasks to another list")
-    );
+    assert_eq!(targets(&m), ["b"]);
+    assert_eq!(m.status_line, None);
 }
+
+// ---- Refusals ----
 
 #[test]
 fn a_task_still_being_added_cannot_be_moved() {
@@ -485,6 +492,116 @@ fn moving_a_task_out_and_back_does_not_lose_it() {
     assert_eq!(ids(&m), ["t1"], "the round trip must not swallow the row");
 }
 
+#[test]
+fn the_carried_subtasks_leave_the_source_pane_with_their_parent() {
+    // Google carries the subtree (#86), so the children are in the destination
+    // the moment the parent's move confirms. Leaving their rows here would show
+    // them under a List that no longer holds them.
+    let mut m = list_model(
+        &["a", "b"],
+        vec![
+            task("p1", "a"),
+            child("c1", "a", "p1"),
+            child("c2", "a", "p1"),
+            task("p2", "a"),
+            child("c3", "a", "p2"),
+        ],
+    );
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "b")));
+    assert_eq!(ids(&m), ["p2", "c3"], "another parent's child stays");
+
+    // Tombstoned like the parent: a fetch of the source issued before the move
+    // cannot bring them back.
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("a".into()),
+            vec![
+                task("p1", "a"),
+                child("c1", "a", "p1"),
+                child("c2", "a", "p1"),
+                task("p2", "a"),
+                child("c3", "a", "p2"),
+            ],
+        ),
+    );
+    assert_eq!(ids(&m), ["p2", "c3"]);
+}
+
+#[test]
+fn the_cursor_steps_past_the_departing_subtasks() {
+    // Removing the parent at `Enter` parks the cursor on its first child, which
+    // is exactly the row about to leave. It must step to the next row that
+    // stays, not to the top of the pane.
+    // `t0` ahead of the parent is what makes the assertion discriminating: the
+    // pane's first row and the cursor's rightful destination are different rows.
+    let mut m = list_model(
+        &["a", "b"],
+        vec![
+            task("t0", "a"),
+            task("p1", "a"),
+            child("c1", "a", "p1"),
+            child("c2", "a", "p1"),
+            task("p2", "a"),
+        ],
+    );
+    m.selected_task = Some(1);
+    move_selected(&mut m);
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.0.clone()),
+        Some("c1".to_string()),
+        "the cursor sits on a doomed child"
+    );
+
+    update(&mut m, Message::MovedToList(task("p1", "b")));
+    assert_eq!(ids(&m), ["t0", "p2"]);
+    assert_eq!(
+        m.selected_task.map(|i| m.tasks[i].id.0.clone()),
+        Some("p2".to_string())
+    );
+}
+
+#[test]
+fn moving_a_parent_out_and_back_does_not_lose_its_subtasks() {
+    // The children's half of `moving_a_task_out_and_back_does_not_lose_it`: the
+    // A→B tombstone must be evicted when they come home, or `set_tasks` drops
+    // them from their own List for the rest of the session. Nothing re-fetches A
+    // while they are away, so the eviction is the only thing that clears it.
+    let mut m = list_model(&["a", "b"], vec![task("p1", "a"), child("c1", "a", "p1")]);
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "b")));
+    assert!(m.tasks.is_empty());
+
+    // Now in B, where both arrived, and moved home.
+    m.selected = Selection::List(1);
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("b".into()),
+            vec![task("p1", "b"), child("c1", "b", "p1")],
+        ),
+    );
+    m.focus = Focus::Tasks;
+    m.selected_task = Some(0);
+    move_selected(&mut m);
+    update(&mut m, Message::MovedToList(task("p1", "a")));
+
+    m.selected = Selection::List(0);
+    update(
+        &mut m,
+        Message::TasksLoaded(
+            ListId("a".into()),
+            vec![task("p1", "a"), child("c1", "a", "p1")],
+        ),
+    );
+    assert_eq!(
+        ids(&m),
+        ["p1", "c1"],
+        "the round trip must not swallow the subtask"
+    );
+}
+
 // ---- Failure ----
 
 #[test]
@@ -501,13 +618,13 @@ fn a_failed_move_restores_the_row_at_its_index_with_the_reason() {
         &mut m,
         Message::MoveToListFailed {
             task: TaskId("t2".into()),
-            reason: "can't move a task with subtasks to another list".into(),
+            reason: "failed to move task: network unreachable".into(),
         },
     );
     assert_eq!(ids(&m), ["t1", "t2", "t3"]);
     assert_eq!(
         m.status_line.as_deref(),
-        Some("can't move a task with subtasks to another list")
+        Some("failed to move task: network unreachable")
     );
 }
 

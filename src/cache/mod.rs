@@ -276,6 +276,29 @@ impl Cache {
         Ok(())
     }
 
+    /// Follow a relocated parent's Subtasks into `destination`: only their
+    /// `list_id` moves.
+    ///
+    /// Google carries the subtree on a cross-List Move — the children follow,
+    /// still naming their parent, and every `id` survives (verified 2026-07-21,
+    /// see #86) — so their rows need relocating, not rewriting: `parent` still
+    /// names the same Task, and the ids the rows are keyed by are the ones
+    /// Google kept.
+    ///
+    /// Two limits, both deliberate. A **Cleared** child has no row here at all
+    /// (`fetch_active_tasks` asks with `show_hidden=false`), so there is nothing
+    /// of it to leave stale. And the children's `position` keeps its source-List
+    /// value: Google renumbers the destination, but reading that back would cost
+    /// the very round trip #93 removed, so the stale index stands until the next
+    /// Refresh replaces the List wholesale.
+    pub fn relocate_subtasks(&self, parent: &TaskId, destination: &ListId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET list_id = ?1, local_updated = ?2 WHERE parent = ?3",
+            params![destination.0, Utc::now().to_rfc3339(), parent.0],
+        )?;
+        Ok(())
+    }
+
     /// Append an observed completion to the append-only `completion_log`
     /// (ADR-0007). A no-op unless the Task is Completed with a `completed_at`;
     /// idempotent on `(task_id, completed_at)`. Deliberately separate from the
@@ -647,5 +670,61 @@ mod tests {
         }
         assert!(all.iter().any(|t| t.id.0 == "a1" && t.list.0 == "a"));
         assert!(all.iter().any(|t| t.id.0 == "b2" && t.list.0 == "b"));
+    }
+
+    /// `parent`, and everything else about the child, is left as Google keeps it
+    /// — only the `list_id` follows.
+    #[test]
+    fn relocate_subtasks_carries_the_children_and_nothing_else() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache.replace_lists(&[list("a"), list("b")]).unwrap();
+        let parent = task("p", "a", "1");
+        let mut child = task("c", "a", "2");
+        child.parent = Some(parent.id.clone());
+        let bystander = task("x", "a", "3");
+        cache
+            .replace_tasks(
+                &ListId("a".into()),
+                &[parent.clone(), child.clone(), bystander],
+            )
+            .unwrap();
+
+        cache
+            .relocate_subtasks(&parent.id, &ListId("b".into()))
+            .unwrap();
+
+        let moved = cache.tasks(&ListId("b".into())).unwrap();
+        assert_eq!(moved.len(), 1, "only the child follows");
+        assert_eq!(moved[0].id, child.id);
+        assert_eq!(
+            moved[0].parent.as_ref(),
+            Some(&parent.id),
+            "the child still names its parent"
+        );
+        assert_eq!(moved[0].position, child.position);
+
+        // The parent is this call's *subject*, not its object: relocating it is
+        // `upsert_task`'s job, and a bystander is nobody's child.
+        let left = cache.tasks(&ListId("a".into())).unwrap();
+        assert_eq!(
+            left.iter().map(|t| t.id.0.as_str()).collect::<Vec<_>>(),
+            ["p", "x"]
+        );
+    }
+
+    #[test]
+    fn relocating_a_childless_parent_touches_nothing() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache.replace_lists(&[list("a"), list("b")]).unwrap();
+        cache
+            .replace_tasks(&ListId("a".into()), &[task("p", "a", "1")])
+            .unwrap();
+
+        cache
+            .relocate_subtasks(&TaskId("p".into()), &ListId("b".into()))
+            .unwrap();
+
+        assert_eq!(cache.tasks(&ListId("a".into())).unwrap().len(), 1);
+        assert!(cache.tasks(&ListId("b".into())).unwrap().is_empty());
     }
 }

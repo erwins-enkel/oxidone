@@ -1259,9 +1259,8 @@ pub enum Message {
     /// A cross-List Move succeeded; carries the server Task, whose `list` is now
     /// the destination.
     MovedToList(Task),
-    /// A cross-List Move failed or was refused; roll the optimistic removal back.
-    /// `reason` is shown verbatim — for the Subtask refusal it is oxidone's own
-    /// sentence, for a transport failure it is the worker's formatted chain.
+    /// A cross-List Move failed; roll the optimistic removal back. `reason` is
+    /// the worker's formatted error chain, shown verbatim.
     MoveToListFailed {
         task: TaskId,
         reason: String,
@@ -1756,7 +1755,7 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             let source = snapshot.task.list.clone();
             model
                 .tombstones
-                .entry(source)
+                .entry(source.clone())
                 .or_default()
                 .insert(task.id.clone());
             if let Some(set) = model.tombstones.get_mut(&task.list) {
@@ -1764,6 +1763,48 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
                 if set.is_empty() {
                     model.tombstones.remove(&task.list);
                 }
+            }
+
+            // The Subtasks Google carried along (#86). Their rows still name the
+            // source List, so they leave the pane with their parent and take the
+            // same hand-off it just did — including the eviction under the
+            // destination, without which an A→B→A hop leaves a child tombstoned
+            // in its own List for the rest of the session. Scoped to the source,
+            // because a destination pane opened mid-flight is showing children
+            // that legitimately arrived.
+            let carried: Vec<TaskId> = model
+                .tasks
+                .iter()
+                .filter(|t| t.parent.as_ref() == Some(&task.id) && t.list == source)
+                .map(|t| t.id.clone())
+                .collect();
+            if !carried.is_empty() {
+                // A cursor on a departing child steps to the nearest row that
+                // stays, rather than to the top of the pane — the parent's own
+                // removal at `Enter` most likely parked it on the first child.
+                let anchor = match selected_id(model) {
+                    Some(id) if carried.contains(&id) => display_neighbour(model, &id, |t| {
+                        model.is_visible(t) && !carried.contains(&t.id)
+                    }),
+                    other => other,
+                };
+                model.tasks.retain(|t| !carried.contains(&t.id));
+                for child in &carried {
+                    model
+                        .tombstones
+                        .entry(source.clone())
+                        .or_default()
+                        .insert(child.clone());
+                    if let Some(set) = model.tombstones.get_mut(&task.list) {
+                        set.remove(child);
+                        if set.is_empty() {
+                            model.tombstones.remove(&task.list);
+                        }
+                    }
+                }
+                model.selected_task =
+                    anchor.and_then(|id| model.tasks.iter().position(|t| t.id == id));
+                reselect_visible(model);
             }
 
             // Only a flat cross-List pane needs repair, and only the one the Move
@@ -2809,14 +2850,6 @@ fn open_move_to_list(model: &mut Model) {
     // placeholder too and never reaches the destination checks below.
     if is_placeholder(&id.0) {
         model.status_line = Some("still saving — try again in a moment".to_string());
-        return;
-    }
-    // Fast path only. The deciding check runs live in `sync::move_task_to_list`,
-    // because a Cleared child is in neither this Vec nor the cache — and in Today
-    // this Vec is the `due <= today` aggregate, which hides undated and distant
-    // children too.
-    if model.tasks.iter().any(|t| t.parent.as_ref() == Some(&id)) {
-        model.status_line = Some("can't move a task with subtasks to another list".to_string());
         return;
     }
     // An in-list Move must not be in flight. `MoveFailed` restores `model.tasks`

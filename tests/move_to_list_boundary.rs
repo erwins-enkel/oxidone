@@ -76,7 +76,7 @@ async fn a_subtask_arrives_top_level() {
 }
 
 #[tokio::test]
-async fn a_parent_with_a_visible_child_is_refused_before_any_write() {
+async fn a_parent_carries_its_visible_child_into_the_destination() {
     let (api, cache, source, destination, parent) = seed().await;
     let child = api
         .insert_task(&source.id, new_task("child"))
@@ -85,33 +85,49 @@ async fn a_parent_with_a_visible_child_is_refused_before_any_write() {
     api.move_task(&source.id, &child.id, Some(&parent.id), None)
         .await
         .unwrap();
+    // Mirror the child too, the way a refresh would: it is the row that would be
+    // left naming the source if the reconcile stopped at the parent (#94).
+    let active = sync::fetch_active_tasks(&api, &source.id).await.unwrap();
+    sync::mirror_tasks(&cache, &source.id, &active).unwrap();
 
-    let err = sync::write_move_to_list(&api, &cache, &source.id, &parent.id, &destination.id)
+    sync::write_move_to_list(&api, &cache, &source.id, &parent.id, &destination.id)
         .await
-        .unwrap_err();
-    // The *message* is the assertion that matters: the fake implements no
-    // children-rejection, so this sentence can only come from the pre-check.
-    // Deleting that check fails here, where state alone would not notice.
-    assert_eq!(
-        err.to_string(),
-        "can't move a task with subtasks to another list"
-    );
+        .unwrap();
 
-    // Corroboration: nothing moved.
-    let still = api.list_tasks(&source.id, true, true, None).await.unwrap();
-    assert!(still.iter().any(|t| t.id == parent.id));
-    assert!(api
+    // Google's side: both are in the destination, the child still naming its
+    // parent — the behaviour #86 verified and `FakeTasksApi` models.
+    let arrived = api
         .list_tasks(&destination.id, true, true, None)
+        .await
+        .unwrap();
+    assert_eq!(arrived.len(), 2);
+    let moved_child = arrived.iter().find(|t| t.id == child.id).unwrap();
+    assert_eq!(moved_child.parent.as_ref(), Some(&parent.id));
+    assert!(api
+        .list_tasks(&source.id, true, true, None)
         .await
         .unwrap()
         .is_empty());
+
+    // The mirror agrees (ADR-0003). Without `relocate_subtasks` the child's row
+    // still reads `list = source` here while Google has it in the destination.
+    assert!(cache.tasks(&source.id).unwrap().is_empty());
+    let cached: Vec<_> = cache
+        .tasks(&destination.id)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(cached.contains(&parent.id));
+    assert!(cached.contains(&child.id));
 }
 
 #[tokio::test]
-async fn a_cleared_child_still_refuses_the_move() {
+async fn a_cleared_child_follows_and_leaves_no_stale_cache_row() {
     // The case neither the pane nor the cache can see: `fetch_active_tasks` asks
     // with `show_hidden=false`, so a Cleared child is absent from the cache
-    // entirely. Only the live `show_hidden=true` query catches it.
+    // entirely — which is also why it needs no reconcile. It has no row to leave
+    // behind, and the local `UPDATE … WHERE parent` never has to reach it.
     let (api, cache, source, destination, parent) = seed().await;
     let child = api
         .insert_task(&source.id, new_task("child"))
@@ -145,25 +161,26 @@ async fn a_cleared_child_still_refuses_the_move() {
         "a Cleared child is not in the cache at all"
     );
 
-    let err = sync::write_move_to_list(&api, &cache, &source.id, &parent.id, &destination.id)
+    sync::write_move_to_list(&api, &cache, &source.id, &parent.id, &destination.id)
         .await
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "can't move a task with subtasks to another list"
-    );
-    assert!(api
+        .unwrap();
+
+    // It followed on Google — visible only under `show_hidden=true`.
+    let arrived = api
         .list_tasks(&destination.id, true, true, None)
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap();
+    assert!(arrived.iter().any(|t| t.id == child.id));
+    // And left nothing stale behind: the cache holds no row for it at all, under
+    // either List.
+    assert!(!cache.all_tasks().unwrap().iter().any(|t| t.id == child.id));
+    assert!(cache.tasks(&source.id).unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn a_failing_move_post_leaves_the_cache_untouched() {
-    // Reaching the POST's failure path without `fail_next`, which is a single
-    // slot consumed by the pre-check's `list_tasks`: an unknown destination
-    // passes the check and is rejected by the move itself.
+    // An unknown destination, so the failure comes from the move's own
+    // validation rather than injection — `fail_next` has its own test below.
     let (api, cache, source, _destination, task) = seed().await;
 
     let err = sync::write_move_to_list(
@@ -185,15 +202,18 @@ async fn a_failing_move_post_leaves_the_cache_untouched() {
 }
 
 #[tokio::test]
-async fn a_failing_pre_check_never_reaches_the_move() {
+async fn an_injected_failure_lands_on_the_move_itself() {
+    // `fail_next` is one-shot and positional, so this pins the round-trip count:
+    // the move is the *first* call a relocation makes. Re-introducing any
+    // pre-check — the `list_tasks` #93 removed, or another — spends the slot
+    // elsewhere and this reads its context line instead.
     let (api, cache, source, destination, task) = seed().await;
-    // One-shot and positional: `list_tasks` runs first, so this is the check.
     api.fail_next(ApiError::Network("down".into()));
 
     let err = sync::write_move_to_list(&api, &cache, &source.id, &task.id, &destination.id)
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "failed to check for subtasks");
+    assert_eq!(err.to_string(), "failed to move task");
 
     let still = api.list_tasks(&source.id, true, true, None).await.unwrap();
     assert_eq!(still.len(), 1);

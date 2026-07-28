@@ -378,17 +378,13 @@ impl TasksApi for FakeTasksApi {
         if !st.list_exists(destination) {
             return Err(ApiError::NotFound);
         }
-        // Deliberately *not* rejecting a Task that has Subtasks: Google accepts
-        // it (verified 2026-07-21, see #86), and this fake models Google.
-        // Encoding oxidone's refusal would also mask it: `sync::move_task_to_list`
-        // checks first, so no caller reaches this with children.
-        //
-        // Google carries the subtree (#86, #95): the children follow their
-        // parent into the destination, still naming it, ids intact — so the code
-        // below relocates them alongside the parent. What #86 did *not* verify is
-        // the children's `etag`/`updated`, so those are left unbumped here as a
-        // stand-in, not observed behaviour; a reader lifting the `sync` refusal
-        // (#93) must not read the carried timestamps as Google's truth.
+        // A Task that has Subtasks is not rejected: Google accepts it and carries
+        // the subtree (#86, #95, verified 2026-07-21), and this fake models
+        // Google. The children follow their parent into the destination, still
+        // naming it, ids intact — so the code below relocates them alongside it.
+        // What #86 did *not* verify is the children's `etag`/`updated`, so those
+        // are left unbumped here as a stand-in, not observed behaviour; no test
+        // may read the carried timestamps as Google's truth.
 
         // The parent's children in Manual order, captured before any mutation.
         // `live_ids_in_order` excludes only `deleted`, so a Cleared (`hidden`)

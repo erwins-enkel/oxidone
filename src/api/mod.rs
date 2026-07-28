@@ -58,9 +58,10 @@ pub trait TasksApi: Send + Sync {
     /// position Google permits for every Task, including a Completed-and-Cleared
     /// one, so a single rule covers every case.
     ///
-    /// Refusing a Task that has Subtasks is *oxidone's* policy, not Google's, so
-    /// it lives in `sync`, not here — implementations relocate whatever they are
-    /// given.
+    /// A parent's Subtasks come along: Google carries the subtree, children
+    /// following still parented to it, ids intact (#86). The response names only
+    /// the parent, so a caller mirroring this locally reconciles the children
+    /// itself (`sync::mirror_move_to_list`).
     async fn move_task_to_list(
         &self,
         list: &ListId,

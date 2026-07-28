@@ -480,11 +480,10 @@ async fn move_task_to_list_carries_the_subtree_along() {
     assert_eq!(moved.position, format!("{:020}", 0));
 }
 
-// Deliberately no test that the fake refuses a parent with Subtasks: it does not.
-// That rule is oxidone's — Google accepts the move and carries the subtree intact
-// (verified 2026-07-21, see #86) — it lives in `sync::move_task_to_list`, and
-// teaching it to the fake would mask the boundary test that pins it — see
-// `tests/move_to_list_boundary.rs`.
+// Nothing here refuses a parent with Subtasks, because nothing anywhere does:
+// Google accepts the move and carries the subtree intact (verified 2026-07-21,
+// see #86), which is what `move_task_to_list_carries_the_subtree_along` models.
+// oxidone's own refusal was removed in #93 once that probe came back.
 
 // ---- Fault injection ----
 

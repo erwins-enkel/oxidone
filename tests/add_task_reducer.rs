@@ -3,6 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, NewTask, TasksApi};
+use oxidone::app::text_input::TextInput;
 use oxidone::app::{update, Command, Message, Model, Overlay};
 use oxidone::domain::{List, Selection, Status, Task, TaskId};
 
@@ -249,7 +250,7 @@ fn finish_add_task_leaves_a_status_line_alone_when_it_refuses_silently() {
     let mut m = model_with_an_unresolvable_selection();
     // `a` refuses, so drive the capture overlay directly to reach the submit.
     m.overlay = Some(Overlay::AddTask {
-        buffer: String::new(),
+        buffer: TextInput::default(),
     });
     typed(&mut m, "something");
 
@@ -287,7 +288,7 @@ fn a_today_capture_without_a_default_list_still_names_the_reason() {
 fn an_empty_submit_is_silent_even_where_the_target_would_refuse() {
     let mut m = Model::new();
     m.overlay = Some(Overlay::AddTask {
-        buffer: String::new(),
+        buffer: TextInput::default(),
     });
 
     let commands = update(&mut m, key(KeyCode::Enter));

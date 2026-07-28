@@ -183,10 +183,63 @@ fn model_with_due_editor() -> Model {
     let mut model = Model::new();
     model.overlay = Some(oxidone::app::Overlay::EditDue {
         task: oxidone::domain::TaskId("t".into()),
-        buffer: String::new(),
+        buffer: oxidone::app::text_input::TextInput::default(),
         pristine: false,
     });
     model
+}
+
+/// A plain text overlay — the title editor, reached the same way the app does.
+fn model_with_title_editor() -> Model {
+    let mut model = Model::new();
+    model.overlay = Some(oxidone::app::Overlay::EditTitle {
+        task: oxidone::domain::TaskId("t".into()),
+        buffer: oxidone::app::text_input::TextInput::new("alpha".to_string()),
+    });
+    model
+}
+
+/// A capture overlay — `a`, which carries the `Tab literal` cell too.
+fn model_with_capture() -> Model {
+    let mut model = Model::new();
+    model.overlay = Some(oxidone::app::Overlay::AddTask {
+        buffer: oxidone::app::text_input::TextInput::default(),
+    });
+    model
+}
+
+/// The caret cell is advertised where there is room for it — both popup
+/// contexts that are not the due editor. Its `^A/^E` naming is the whole point:
+/// `←`/`→` and `Home`/`End` do the same work unadvertised, and the row pays
+/// columns for every cell it carries.
+#[test]
+fn the_popup_legends_advertise_the_caret_chords() {
+    let text = rows(&model_with_title_editor())
+        .last()
+        .expect("a legend row")
+        .clone();
+    for cell in [
+        "Enter save",
+        "Esc cancel",
+        "^U clear",
+        "^W word",
+        "^A/^E ends",
+    ] {
+        assert!(
+            text.contains(cell),
+            "{cell:?} missing at 80 columns: {text:?}"
+        );
+    }
+
+    let capture = rows(&model_with_capture())
+        .last()
+        .expect("a legend row")
+        .clone();
+    assert!(capture.contains("Tab literal"), "{capture:?}");
+    assert!(
+        capture.contains("^A/^E ends"),
+        "the capture row has room for it too: {capture:?}"
+    );
 }
 
 #[test]
@@ -229,6 +282,27 @@ fn the_due_editor_legend_drops_the_chords_before_the_escape_hatches() {
     assert!(
         narrower.contains("Enter save") && narrower.contains("Esc cancel"),
         "the escape hatches are the last to go: {narrower:?}"
+    );
+}
+
+/// The due editor is the one context already full at 80 columns, so the caret
+/// cell — last in the slice, and so first to drop — waits for a wider terminal.
+/// Pinned from both sides: absent is the drop rule working, not a missing cell.
+#[test]
+fn the_due_editor_reveals_the_caret_cell_only_on_a_wider_terminal() {
+    let model = model_with_due_editor();
+
+    let default = rows(&model).last().expect("a legend row").clone();
+    assert!(
+        !default.contains("^A/^E ends"),
+        "the 80-column row is full without it: {default:?}"
+    );
+
+    let wide = rows_at(&model, 100).last().expect("a legend row").clone();
+    assert!(wide.contains("^A/^E ends"), "{wide:?}");
+    assert!(
+        wide.contains("^W word"),
+        "it evicts nothing above it: {wide:?}"
     );
 }
 

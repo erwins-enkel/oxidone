@@ -758,8 +758,7 @@ fn spawn_write_notes(
 ///
 /// `{e:#}` on purpose: `anyhow`'s plain `Display` prints only the outermost
 /// context, so `{e}` would reduce a transport failure to "failed to move task"
-/// and drop Google's own message. The Subtask refusal carries no context, so it
-/// reads the same either way.
+/// and drop Google's own message.
 fn spawn_move_to_list(
     api: Arc<dyn TasksApi>,
     cache: SharedCache,
@@ -772,8 +771,8 @@ fn spawn_move_to_list(
         let message =
             match sync::move_task_to_list(api.as_ref(), &source, &task, &destination).await {
                 Ok(moved) => {
-                    // One write relocates the row: `tasks` is keyed by id.
-                    if let Err(e) = cache.lock().unwrap().upsert_task(&moved) {
+                    // The moved Task and the Subtasks Google carried with it.
+                    if let Err(e) = sync::mirror_move_to_list(&cache.lock().unwrap(), &moved) {
                         tracing::warn!(error = %e, "failed to cache moved task");
                     }
                     Message::MovedToList(moved)

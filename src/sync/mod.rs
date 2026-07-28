@@ -4,7 +4,7 @@
 //! from Google via `TasksApi`, mirrors the result into the cache, and returns
 //! the cached view. Write-through and the offline queue land in later slices.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 
 use crate::api::{ApiError, TaskPatch, TasksApi};
@@ -288,55 +288,52 @@ pub async fn delete_list(api: &dyn TasksApi, cache: &Cache, list: &ListId) -> Re
     Ok(())
 }
 
-/// Relocate a Task to another List, refusing first if it still has Subtasks.
+/// Relocate a Task to another List, Subtasks and all.
 ///
-/// The refusal is **oxidone's**, not Google's: Google *accepts* the move and
-/// carries the subtree intact — children follow, still naming their parent, and
-/// every `id` survives (verified 2026-07-21 against a live account, two runs of
-/// two fixtures each; see #86). So this stays an `anyhow` error rather than an
-/// [`ApiError`] variant: `Rejected` would render as "google rejected the
-/// request" for a call Google never received. Transport failures keep their
-/// cause under a context line; callers format with `{e:#}` to show the chain.
+/// **One `TasksApi` call.** A Task that still had Subtasks used to be refused
+/// here, behind a live `list_tasks` with `show_hidden=true` — the one query that
+/// could see a Cleared child. Google carries the subtree intact instead:
+/// children follow, still naming their parent, and every `id` survives (verified
+/// 2026-07-21 against a live account, two runs of two fixtures each; see #86).
+/// The rule was adopted because a half-moved subtree could not be undone, and
+/// nothing is half-moved — so it and its round trip are gone (#93).
 ///
-/// The rule outlived its reason — it was adopted because a half-moved subtree
-/// could not be undone, and nothing is half-moved. It is kept here only until
-/// #93 removes it; note that removing it also needs #94, since the cache
-/// mirrors only the parent (see [`write_move_to_list`]).
+/// The children Google carried are the caller's remaining work: the response
+/// names only the parent, so the cache follows them separately (see
+/// [`mirror_move_to_list`]).
 ///
-/// The check must be **live**. A Cleared Subtask is in neither the pane nor the
-/// cache — the cache is filled by [`fetch_active_tasks`] with `show_hidden=false`
-/// and `replace_tasks` drops the List's rows wholesale first — so only a fetch
-/// with `show_hidden=true` can see one. The scan is exhaustive: `list_tasks`
-/// follows `nextPageToken`, so a child cannot hide past a page boundary.
-///
-/// **Two `TasksApi` calls**, and `FakeTasksApi`'s injected error is one-shot and
-/// positional: the first is spent here, on the check. Two *trait* calls is not
-/// two HTTP requests — `RestClient` pages the check, and `show_hidden=true` is
-/// its worst case, since a long Cleared history counts against the page size.
+/// Transport failures keep their cause under a context line; callers format with
+/// `{e:#}` to show the chain.
 pub async fn move_task_to_list(
     api: &dyn TasksApi,
     source: &ListId,
     task: &TaskId,
     destination: &ListId,
 ) -> Result<Task> {
-    let siblings = api
-        .list_tasks(source, true, true, None)
-        .await
-        .context("failed to check for subtasks")?;
-    if siblings.iter().any(|t| t.parent.as_ref() == Some(task)) {
-        bail!("can't move a task with subtasks to another list");
-    }
     api.move_task_to_list(source, task, destination)
         .await
         .context("failed to move task")
 }
 
-/// Relocate a Task to another List and mirror the result into the cache.
+/// Mirror a completed relocation into the cache: the moved Task, then the
+/// Subtasks Google carried with it.
 ///
-/// One `upsert_task` is the whole cache reconcile: `tasks` is keyed by `id`
-/// `PRIMARY KEY` and written `INSERT OR REPLACE`, so writing the moved Task
-/// *relocates* the row rather than duplicating it. A `delete_task` on the source
-/// would be a second, racier definition of the same effect.
+/// The parent needs no `delete_task` on the source — `tasks` is keyed by `id`
+/// `PRIMARY KEY` and written `INSERT OR REPLACE`, so the upsert *relocates* its
+/// row rather than duplicating it, and a delete would be a second, racier
+/// definition of the same effect. The children are the half a single upsert
+/// cannot reach: Google moves them too (#86) but the response names only the
+/// parent, so [`Cache::relocate_subtasks`] follows them by `parent` (#94).
+///
+/// One definition of the reconcile, because there are two callers:
+/// [`write_move_to_list`] and the worker's split form.
+pub fn mirror_move_to_list(cache: &Cache, moved: &Task) -> Result<()> {
+    cache.upsert_task(moved)?;
+    cache.relocate_subtasks(&moved.id, &moved.list)?;
+    Ok(())
+}
+
+/// Relocate a Task to another List and mirror the result into the cache.
 ///
 /// The combined form for tests; the worker splits it so no lock is held across
 /// the await (see [`patch_completed`] for the rationale).
@@ -348,7 +345,7 @@ pub async fn write_move_to_list(
     destination: &ListId,
 ) -> Result<Task> {
     let moved = move_task_to_list(api, source, task, destination).await?;
-    cache.upsert_task(&moved)?;
+    mirror_move_to_list(cache, &moved)?;
     Ok(moved)
 }
 

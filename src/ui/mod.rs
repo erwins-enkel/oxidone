@@ -725,9 +725,10 @@ fn truncate(text: &str, width: usize, ellipsis: &str) -> String {
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Sidebar;
-    // The pinned Today row sits above the real Lists (no meter — its cross-List
-    // completion is only known while it is the active pane). The cursor spans
-    // `[Today, …lists]`, so the highlight index is offset by the one pinned row.
+    // Two pinned rows sit above the real Lists: Today (no meter — its cross-List
+    // completion is only known while it is the active pane) and the Weekly
+    // spread's indicator. The cursor spans `[Today, …lists]` — it never lands on
+    // the Week row — so the highlight index is offset by both.
     let mut items: Vec<ListItem> = Vec::with_capacity(model.lists.len() + 2);
     items.push(ListItem::new("Today"));
     // The Weekly spread's row: an indicator, never a cursor stop. It cannot be

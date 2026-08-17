@@ -2196,9 +2196,10 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     // Consume the flag unconditionally, so a Refresh's `full` never carries into a
     // later lazy cascade.
     let full = std::mem::take(&mut model.pending_refresh);
-    // A flat cross-List pane (Today or Search) already fans out every List (fetch +
-    // mirror) via its `LoadToday`/`LoadSearch`, so a separate per-List meter fan-out
-    // would double-fetch — skip it. Recount fills the meters from the mirrored cache.
+    // A flat cross-List pane (Today, Search or the Weekly spread) already fans out
+    // every List (fetch + mirror) via its `LoadToday`/`LoadSearch`/`LoadWeek`, so a
+    // separate per-List meter fan-out would double-fetch — skip it. Recount fills
+    // the meters from the mirrored cache.
     if model.flat_pane() {
         return commands;
     }
@@ -2375,8 +2376,9 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
     reselect_visible(model);
 }
 
-/// Fill a **flat cross-List** pane (Today's aggregate or Search's corpus) from a
-/// cross-List Task set, keeping the cursor on the same Task by id where possible.
+/// Fill a **flat cross-List** pane — Today's aggregate, Search's corpus, or the
+/// Weekly spread's — from a cross-List Task set, keeping the cursor on the same
+/// Task by id where possible.
 ///
 /// Drops any id confirmed deleted/Cleared under its own List (the #65 stale-fetch
 /// guard) and any row with a cross-List Move in flight. Both are unconditional,
@@ -2516,7 +2518,8 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::ToggleShowCompleted => {
             if model.week_active() {
                 model.status_line = Some(
-                    "completed filter doesn't apply in the week — the ✕ is the record".to_string(),
+                    "completed filter doesn't apply in the week — the cross is the record"
+                        .to_string(),
                 );
             } else {
                 model.show_completed = !model.show_completed;
@@ -3986,13 +3989,16 @@ fn toggle_week(model: &mut Model) -> Vec<Command> {
     commands
 }
 
-/// Step the spread to `offset` whole weeks from the current one (`]` → 1,
+/// Show the week `offset` whole weeks from the one containing today (`]` → 1,
 /// `[` → 0).
+///
+/// A set, not a step — the two keys name the two weeks the spread has rather than
+/// walking a cursor, so `]` twice is still next week.
 ///
 /// Re-windows the corpus already loaded rather than fetching: the worker reads
 /// every List regardless of week, and `within_week` applies the window. The
 /// cursor may be left on a row the new week excludes, so re-anchor it.
-fn step_week(model: &mut Model, offset: u32) {
+fn show_week(model: &mut Model, offset: u32) {
     model.week_offset = offset;
     reselect_visible(model);
 }
@@ -4022,11 +4028,11 @@ fn week_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Option<Vec<Co
     }
     match key.code {
         KeyCode::Char(']') => {
-            step_week(model, 1);
+            show_week(model, 1);
             return Some(Vec::new());
         }
         KeyCode::Char('[') => {
-            step_week(model, 0);
+            show_week(model, 0);
             return Some(Vec::new());
         }
         _ => {}
@@ -4117,9 +4123,10 @@ fn set_week_due(model: &mut Model, due: Option<NaiveDate>) -> Vec<Command> {
         model.status_line = Some("a write is already in progress for this task".to_string());
         return Vec::new();
     }
-    // Unscheduling a Completed row would drop it from the spread entirely: the
-    // pool half admits only `needsAction`, and it has no date left to be in the
-    // week by. Refuse rather than vanish it.
+    // Unscheduling can take the row out of the spread altogether, and there are
+    // two ways in — the two halves of `within_week`. A **Completed** row is
+    // refused: the pool admits only `needsAction`, and re-dating a Completed entry
+    // means nothing anyway, which is the same reason `m` refuses one.
     if due.is_none() && task.status == Status::Completed {
         model.status_line =
             Some("completed tasks stay on their day — un-complete it first".to_string());
@@ -4128,12 +4135,32 @@ fn set_week_due(model: &mut Model, due: Option<NaiveDate>) -> Vec<Command> {
     let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
         return Vec::new();
     };
+    // The other way is a row from a List that is not the pool's — the week half is
+    // cross-List while the pool half is one List, so undating such a row leaves it
+    // in neither. Not refused: taking a task off your week is a legitimate thing to
+    // want, and the write is correct. But it is *reported*, because "back to the
+    // pool" is what `0` advertises and this row went somewhere else — and a pane a
+    // row silently vanishes from reads as a dropped keystroke.
+    let mut after = model.tasks[index].clone();
+    after.due = due;
+    let leaves = !model.within_week(&after);
+    let home = leaves.then(|| {
+        model
+            .lists
+            .iter()
+            .find(|l| l.id == after.list)
+            .map_or_else(|| after.list.0.clone(), |l| l.title.clone())
+    });
     model
         .pending_writes
         .insert(id.clone(), model.tasks[index].clone());
     model.tasks[index].due = due;
-    // The row may have just crossed between the pool and the week — or, with a
-    // filter on, out of view entirely; re-anchor the cursor onto a visible row.
+    if let Some(home) = home {
+        model.status_line = Some(format!("unscheduled — now undated in {home}"));
+    }
+    // The row may have just crossed between the pool and the week — or left the
+    // spread outright, or, with a filter on, gone out of view; re-anchor the cursor
+    // onto a visible row.
     reselect_visible(model);
     vec![Command::SetDue {
         list,

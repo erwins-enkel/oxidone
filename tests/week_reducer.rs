@@ -502,6 +502,46 @@ fn the_digits_assign_a_day_and_zero_unschedules() {
     assert_eq!(due_of(&m, "a"), None);
 }
 
+/// `0` on a row from a List that is **not** the pool's takes it out of the spread
+/// altogether — the week half is cross-List, the pool half is one List, so an
+/// undated foreign row is in neither. The write is legitimate and happens; what it
+/// must not do is happen silently, since `0` advertises "back to the pool" and this
+/// row went somewhere else.
+///
+/// The sibling of the Completed refusal, and the case a single-List fixture cannot
+/// reach: with one List the pool List *is* the row's List, so the row lands in the
+/// pool and nothing vanishes.
+#[test]
+fn unscheduling_a_cross_list_row_reports_that_it_left_the_week() {
+    let mut m = in_week(&["w", "h"], vec![open("foreign", "h", day(1))]);
+    select(&mut m, "foreign");
+    assert_eq!(visible(&m), ["foreign"]);
+
+    let commands = update(&mut m, press('0'));
+
+    assert_eq!(due_of(&m, "foreign"), None, "the write still happens");
+    assert!(matches!(commands.as_slice(), [Command::SetDue { .. }]));
+    assert!(visible(&m).is_empty(), "and the row does leave the spread");
+    let said = m.status_line.clone().unwrap_or_default();
+    assert!(
+        said.contains('H'),
+        "it must name where the row went: {said:?}"
+    );
+}
+
+/// The same key on a row in the pool List does land it back in the pool, which is
+/// what `0` advertises — so the report above is scoped to the case that needs it.
+#[test]
+fn unscheduling_a_pool_list_row_lands_it_in_the_pool() {
+    let mut m = in_week(&["w", "h"], vec![open("mine", "w", day(1))]);
+    select(&mut m, "mine");
+
+    update(&mut m, press('0'));
+
+    assert_eq!(due_of(&m, "mine"), None);
+    assert_eq!(visible(&m), ["mine"], "still on screen, now in the pool");
+}
+
 /// `6`..`9` name no column, so they fall through rather than scheduling a
 /// Saturday the grid cannot draw.
 #[test]

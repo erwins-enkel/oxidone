@@ -648,7 +648,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
-    // The spread's keys are hardcoded in the reducer's `week_grid_key`, not in
+    // The spread's keys are hardcoded in the reducer's `week_key`, not in
     // `bindings()`, so they are literal — a change there must be mirrored here by
     // hand, exactly as the overlay legends are.
     //

@@ -51,8 +51,9 @@ pub enum Action {
     /// query input over the existing query.
     Search,
     /// Open the **Omnibox** (`p`): one grouped list over a query, offering the
-    /// Lists to jump to, the commands (keyless, bar `:refresh`, which `r` also
-    /// fires), a hand-off to Search, and — last — capturing the query as a Task.
+    /// Lists to jump to, the commands (keyless, bar `:refresh` and `:week`, which
+    /// `r` and `W` also fire), a hand-off to Search, and — last — capturing the
+    /// query as a Task.
     Omnibox,
     /// Open a URL found in the selected Task's notes.
     OpenLink,

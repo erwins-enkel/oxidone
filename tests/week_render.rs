@@ -369,6 +369,66 @@ fn the_pending_notice_shows_while_the_corpus_is_incomplete() {
     );
 }
 
+/// The pending notice belongs to the pane it describes. `week` survives an `S`
+/// — deliberately, so `Esc` returns to the spread — and while Search holds the
+/// pane `WeekLoaded` is dropped by its own guard, so nothing would ever clear the
+/// flag. Ungated, the notice would stick in the Search header for the session.
+#[test]
+fn the_pending_notice_does_not_leak_into_the_search_header() {
+    let mut model = Model::new();
+    model.now = Local
+        .with_ymd_and_hms(TODAY.0, TODAY.1, TODAY.2, 12, 0, 0)
+        .unwrap();
+    model.lists = vec![list("w")];
+    model.selected = Selection::List(0);
+    update(&mut model, press('W'));
+    assert!(model.week_pending);
+
+    update(&mut model, press('S'));
+
+    assert!(model.week_pending, "the flag survives; the notice must not");
+    // Wide enough that the panel title is not clipped — at 80 columns the pane
+    // truncates it, and the assertion below would pass without meaning anything.
+    let rows = pane_rows_at(&model, 160, false);
+    assert!(
+        rows.iter().any(|r| r.contains("SEARCH")),
+        "Search holds the pane: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("reading all lists")),
+        "the week's notice leaked into Search: {rows:?}"
+    );
+}
+
+/// Pool rows whose List resolves to no *title* are still headed by their own
+/// block. The "no list selected" notice denies they exist, so it is keyed on
+/// there being no rows either.
+///
+/// The fixture is the only shape that reaches it: `default_list` naming a List
+/// absent from `lists`, with the pool rows in that same List — so
+/// `week_pool_list()` answers `Some`, `within_week` admits them, and the title
+/// lookup still comes back empty.
+#[test]
+fn pool_rows_are_never_headed_by_the_no_pool_notice() {
+    let mut model = week_model(&["w"], vec![open("jot", "ghost", None)]);
+    model.selected = Selection::Today;
+    model.default_list = Some(ListId("ghost".into()));
+
+    let rows = pane_rows(&model);
+    assert!(
+        rows.iter().any(|r| r.contains("jot")),
+        "the pool row is drawn: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("UNSCHEDULED")),
+        "and headed: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("no list selected")),
+        "a notice denying the rows below it: {rows:?}"
+    );
+}
+
 /// The panel names the pane, since the sidebar cursor stays parked on a List and
 /// cannot say it. No Sort label: the spread has one fixed order.
 #[test]

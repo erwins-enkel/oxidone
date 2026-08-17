@@ -394,6 +394,73 @@ fn space_acts_on_the_cell_under_the_cursor() {
     assert_eq!(status_of(&m, "a"), Status::NeedsAction);
 }
 
+/// Completing a **scheduled** row leaves it on screen with its `✕`, so the cursor
+/// must stay on it — `Space` is documented to un-complete the cell under the
+/// cursor, and the row under the cursor has not moved.
+///
+/// Two rows, deliberately: with one, `display_successor` answers `None` and a
+/// cursor that should have moved stays put by accident.
+#[test]
+fn completing_a_scheduled_row_leaves_the_cursor_on_it() {
+    let mut m = in_week(&["w"], vec![open("a", "w", day(2)), open("b", "w", day(2))]);
+    select(&mut m, "a");
+    assert!(!m.show_completed, "the default is what makes this a test");
+
+    update(&mut m, Message::Key(space()));
+    assert_eq!(status_of(&m, "a"), Status::Completed);
+    assert_eq!(visible(&m), ["a", "b"], "the ✕ row is still drawn");
+    assert_eq!(
+        selected_title(&m),
+        Some("a".to_string()),
+        "the cursor must not walk to the neighbour"
+    );
+
+    // And the documented contract holds: the next Space un-completes *this* row.
+    m.pending_writes_cleared();
+    update(&mut m, Message::Key(space()));
+    assert_eq!(status_of(&m, "a"), Status::NeedsAction);
+    assert_eq!(status_of(&m, "b"), Status::NeedsAction);
+}
+
+/// The sharp end of the same bug: had the cursor slipped to a neighbour due on
+/// another day, the next `Space` would have taken the schedule branch and
+/// silently re-dated a row the user never selected.
+#[test]
+fn completing_a_scheduled_row_never_redates_its_neighbour() {
+    let mut m = in_week(
+        &["w"],
+        vec![open("mon", "w", day(0)), open("thu", "w", day(3))],
+    );
+    select(&mut m, "mon");
+    update(&mut m, press('l')); // cursor on Monday, where `mon` sits
+
+    update(&mut m, Message::Key(space()));
+    m.pending_writes_cleared();
+    let commands = update(&mut m, Message::Key(space()));
+
+    assert_eq!(due_of(&m, "thu"), day(3), "the neighbour keeps its day");
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Command::SetDue { task, .. } if task == &TaskId("thu".into()))),
+        "no write against an unselected row: {commands:?}"
+    );
+}
+
+/// The counterpart, and why a blanket "never move in the spread" would be wrong:
+/// an **undated pool** row completed *does* leave, since the pool half admits
+/// only `needsAction`. The cursor follows it out.
+#[test]
+fn completing_a_pool_row_moves_the_cursor_because_the_row_leaves() {
+    let mut m = in_week(&["w"], vec![open("a", "w", None), open("b", "w", None)]);
+    select(&mut m, "a");
+
+    update(&mut m, Message::Key(space()));
+
+    assert_eq!(visible(&m), ["b"], "the completed pool row is gone");
+    assert_eq!(selected_title(&m), Some("b".to_string()));
+}
+
 /// A cell that is not the row's own dot moves the dot there, wherever it was.
 #[test]
 fn space_on_another_day_moves_the_dot() {
@@ -458,6 +525,22 @@ fn a_completed_row_cannot_be_unscheduled_out_of_sight() {
     assert!(commands.is_empty());
     assert_eq!(due_of(&m, "a"), day(1));
     assert!(m.status_line.is_some(), "and it says why");
+}
+
+/// Closing the spread forgets which week was on screen, as it forgets the day
+/// cursor: `W` always opens on the week you are in, and `]` is one keystroke
+/// away. Left set, the spread would reopen on next week with only the panel
+/// title saying so.
+#[test]
+fn reopening_the_spread_lands_on_the_current_week() {
+    let mut m = in_week(&["w"], vec![open("next", "w", day(9))]);
+    update(&mut m, press(']'));
+    assert_eq!(visible(&m), ["next"]);
+
+    update(&mut m, press('W'));
+    update(&mut m, press('W'));
+    assert_eq!(m.week_offset, 0);
+    assert!(visible(&m).is_empty(), "next week's row is not in this one");
 }
 
 /// `]` shows next week, `[` returns — re-windowing the corpus already loaded,
@@ -599,6 +682,12 @@ fn space() -> KeyEvent {
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+}
+
+fn selected_title(m: &Model) -> Option<String> {
+    m.selected_task
+        .and_then(|i| m.tasks.get(i))
+        .map(|t| t.display_title().to_string())
 }
 
 fn status_of(m: &Model, title: &str) -> Status {

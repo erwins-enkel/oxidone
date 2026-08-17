@@ -166,8 +166,9 @@ _Avoid_: selection, caret (that is the text inputs'), cell cursor.
 
 **Omnibox**:
 The modal surface `p` opens: one query over a grouped result list, offering the
-Lists to **jump** to, the **commands** (keyless, bar `:refresh`, which `r` also
-fires), a hand-off to **Search**, and — pinned last — **capturing** the query as
+Lists to **jump** to, the **commands** (keyless, bar `:refresh` and `:week`,
+which `r` and `W` also fire), a hand-off to **Search**, and — pinned last —
+**capturing** the query as
 a Task. `Enter` runs whichever row is highlighted, so what it will do is legible
 before it is pressed, and a write is never what happens by default.
 
@@ -179,8 +180,8 @@ JUMP group is a grouping of *rows* that happen to name Lists.
 The *setting* commands are **session-only** — they change the running app, never
 `config.toml` — which the COMMAND group header says once rather than every row
 repeating it. The header scopes that caveat to the settings because `:refresh`
-shares the group and sets nothing: it acts, and there is no value of it to
-outlive the session.
+and `:week` share the group and set nothing: they act, and there is no value of
+either to outlive the session.
 _Avoid_: command bar, palette (that is Catppuccin's), launcher, fuzzy finder,
 section.
 

@@ -15,7 +15,7 @@ use crate::domain::{
     due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
     TaskId, WEEK_DAYS,
 };
-use crate::keymap::{self, is_control_chord, Action};
+use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
 
 use text_input::{kill_word, TextInput};
@@ -302,8 +302,8 @@ impl Group {
     /// each, competing with the effect and the advisory for one budget.
     ///
     /// **"settings are session only"**, not a bare "session only": the group
-    /// also holds `:refresh`, which sets nothing, and an unqualified caveat
-    /// would be a claim about a row it does not describe.
+    /// also holds `:refresh` and `:week`, which set nothing, and an unqualified
+    /// caveat would be a claim about rows it does not describe.
     pub fn header(self) -> &'static str {
         match self {
             Group::Jump => "JUMP",
@@ -2249,7 +2249,7 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
     // The spread's corpus is the same whole-corpus load Search takes, and for the
     // same reason: the scheduled half spans every List. Precedes the
     // `selected_list_id()` match below, which is `None` here too. Ignores
-    // `clear_pane` for the pane's own rows — `enter_week` owns the clearing — so
+    // `clear_pane` for the pane's own rows — `toggle_week` owns the clearing — so
     // the Move repair's `clear_pane: false` keeps its bridged row.
     //
     // The single choke point for `LoadWeek`, so the pending notice is armed on
@@ -3845,18 +3845,11 @@ fn command_state(
     }
 }
 
-/// The `:refresh` row's state.
+/// The `:week` row's state.
 ///
-/// Three answers, and the argument is the *first* question: `:refresh now` is a
-/// typo, not a request, and reading it as a bare `:refresh` would silently act on
-/// something the user did not write.
-///
-/// Offline is [`CommandState::RefusedHere`] rather than `Invalid` for the reason
-/// that variant draws: there is nothing to fix in the text. It also makes the row
-/// unfireable, so the refusal is read *before* it is pressed — `refresh` itself
-/// keeps its own offline guard, which is what `r` still needs.
-/// The `:week` row's state. Argument-less like `:refresh`, and never refused —
-/// the spread needs no connection, and it toggles from either side.
+/// Argument-less like `:refresh`, and the argument is likewise the first
+/// question. Never refused, though: the spread reads the local corpus, so it
+/// needs no connection, and it toggles from either side.
 fn week_state(model: &Model, arg: Option<&str>) -> CommandState {
     if arg.is_some() {
         return CommandState::Invalid {
@@ -3872,6 +3865,16 @@ fn week_state(model: &Model, arg: Option<&str>) -> CommandState {
     }
 }
 
+/// The `:refresh` row's state.
+///
+/// Three answers, and the argument is the *first* question: `:refresh now` is a
+/// typo, not a request, and reading it as a bare `:refresh` would silently act on
+/// something the user did not write.
+///
+/// Offline is [`CommandState::RefusedHere`] rather than `Invalid` for the reason
+/// that variant draws: there is nothing to fix in the text. It also makes the row
+/// unfireable, so the refusal is read *before* it is pressed — `refresh` itself
+/// keeps its own offline guard, which is what `r` still needs.
 fn refresh_state(model: &Model, arg: Option<&str>) -> CommandState {
     if arg.is_some() {
         return CommandState::Invalid {
@@ -3997,7 +4000,7 @@ fn step_week(model: &mut Model, offset: u32) {
 fn week_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Option<Vec<Command>> {
     use crossterm::event::KeyCode;
     // Leave the readline chords and any other modified key alone.
-    if is_control_chord(key.modifiers) {
+    if keymap::is_control_chord(key.modifiers) {
         return None;
     }
     match key.code {
@@ -4082,7 +4085,13 @@ fn set_week_due(model: &mut Model, due: Option<NaiveDate>) -> Vec<Command> {
     let Some(task) = focused_task(model) else {
         return Vec::new();
     };
+    // Already there. Says so rather than returning silently: every other outcome
+    // in this function reports, so a mute one reads as a dropped keystroke.
     if task.due == due {
+        model.status_line = Some(match due {
+            Some(_) => "already planned for that day".to_string(),
+            None => "already unscheduled".to_string(),
+        });
         return Vec::new();
     }
     let (id, list) = (task.id.clone(), task.list.clone());
@@ -4123,6 +4132,11 @@ fn leave_week(model: &mut Model) {
     model.week = false;
     model.week_pending = false;
     model.week_day = None;
+    // Back to the current week, like the day cursor going back to home: `W`
+    // always opens on the week you are in, and `]` is one keystroke away. Left
+    // set, the spread would reopen on next week with only the panel title saying
+    // so.
+    model.week_offset = 0;
 }
 
 /// Shared teardown for the three sites that drop Search (`exit_search`,
@@ -5008,13 +5022,24 @@ fn toggle_complete(model: &mut Model) -> Vec<Command> {
     let snapshot = model.tasks[index].clone();
     // Completing iff open.
     let completed = model.tasks[index].status == Status::NeedsAction;
-    // Completing a Task while completed are hidden drops it from view, so the
+    // Completing a Task that the pane then hides drops it from view, so the
     // cursor moves onto the next visible Task (the Google-app behaviour). Take
     // that successor *before* the status changes: completing empties the Task's
     // group key, which sinks it to the undated tail, and scanning from there
     // would anchor on the row before its new position instead of the next one
     // by due date.
-    let hides_it = completed && !model.show_completed;
+    //
+    // Asked of `is_visible` on the row as it *will* be, rather than read off
+    // `show_completed` — that flag is only one of the filters, and the Weekly
+    // spread is exempt from it (`completed_visible`). There the answer differs
+    // per row and no single flag can stand in for it: a **scheduled** row keeps
+    // its cell and its `✕`, so the cursor must stay on it or the next `Space`
+    // would act on a neighbour — re-dating it, if that neighbour sits on another
+    // day. An **undated pool** row genuinely does leave, because `within_week`'s
+    // pool half admits only `needsAction`. One predicate, one answer.
+    let mut after = model.tasks[index].clone();
+    set_completed(&mut after, completed);
+    let hides_it = !model.is_visible(&after);
     let successor = hides_it.then(|| display_successor(model, &id)).flatten();
 
     set_completed(&mut model.tasks[index], completed);

@@ -1565,6 +1565,9 @@ fn week_spread<'a>(
     theme: &Theme,
 ) -> (Vec<ListItem<'a>>, Option<usize>) {
     let scheduled_rows = rows.len() - pool_rows;
+    // Drawn when the pool has rows, *or* when there is no pool List to draw from
+    // — an absent block would otherwise read as "nothing undated" when it means
+    // "nowhere to look".
     let pool_header = pool_rows > 0 || pool_title.is_none();
 
     let mut header = vec![Span::raw(week_grid_pad(0, grid.inner_width))];
@@ -1574,14 +1577,17 @@ fn week_spread<'a>(
 
     let mut rows = rows.into_iter();
     if pool_header {
-        out.push(match pool_title {
-            Some(title) => week_header(format!("UNSCHEDULED ({title})"), theme),
+        out.push(match (pool_title, pool_rows) {
+            (Some(title), _) => week_header(format!("UNSCHEDULED ({title})"), theme),
             // Fail closed: say why the block is empty rather than letting an
-            // absent pool read as an empty one.
-            None => week_header(
+            // absent pool read as an empty one. Keyed on there being no rows as
+            // well as no title, so rows whose List is momentarily unresolvable are
+            // headed by their own block rather than by a notice that denies them.
+            (None, 0) => week_header(
                 "UNSCHEDULED — no list selected, and no default list".to_string(),
                 theme,
             ),
+            (None, _) => week_header("UNSCHEDULED".to_string(), theme),
         });
         out.extend(rows.by_ref().take(pool_rows));
     }
@@ -1832,7 +1838,15 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     // The same notice for the Weekly spread, which reads the same whole corpus:
     // until the fan-out lands a never-mirrored List contributes nothing, and an
     // empty week must read as "not yet", never as "nothing planned".
-    if model.week_pending {
+    //
+    // Gated on the pane being active, unlike Search's above. `search_pending` is
+    // cleared by `leave_search`, which every exit from Search calls, so it cannot
+    // outlive its pane. `week` survives an `S` — deliberately, so `Esc` returns to
+    // the spread — and while Search holds the pane `Message::WeekLoaded` is
+    // dropped by its own guard, so the flag stays set with nothing to clear it.
+    // Ungated, the notice would leak into the Search header and stick there for
+    // the session, describing a pane it is not about.
+    if model.week_pending && model.week_active() {
         title.push_str("  · reading all lists…");
     }
 

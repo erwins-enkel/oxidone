@@ -474,7 +474,10 @@ fn omnibox_line(
     theme: &Theme,
 ) -> Line<'static> {
     let (lead, trail) = match row {
+        // Both pinned rows are bare: neither is a List, so neither has a meter to
+        // trail. Named exactly as the sidebar names them — a JUMP row is that row.
         OmniRow::Jump(JumpTarget::Today) => ("Today".to_string(), String::new()),
+        OmniRow::Jump(JumpTarget::Week) => ("Week".to_string(), String::new()),
         OmniRow::Jump(JumpTarget::List { id, title }) => (
             title.clone(),
             match model.list_meter(id) {
@@ -725,18 +728,12 @@ fn truncate(text: &str, width: usize, ellipsis: &str) -> String {
 
 fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, theme: &Theme) {
     let focused = model.focus == Focus::Sidebar;
-    // Two pinned rows sit above the real Lists: Today (no meter — its cross-List
-    // completion is only known while it is the active pane) and the Weekly
-    // spread's indicator. The cursor spans `[Today, …lists]` — it never lands on
-    // the Week row — so the highlight index is offset by both.
+    // Two pinned rows sit above the real Lists — Today and Week — neither with a
+    // meter: a cross-List pane's completion is only known while it is the active
+    // pane. The cursor spans `[Today, Week, …lists]`, so a List's highlight index
+    // is offset by both.
     let mut items: Vec<ListItem> = Vec::with_capacity(model.lists.len() + 2);
     items.push(ListItem::new("Today"));
-    // The Weekly spread's row: an indicator, never a cursor stop. It cannot be
-    // selectable, because the cursor is what names the pool List the spread draws
-    // UNSCHEDULED from — landing the cursor here would leave the spread with no
-    // pool. So it shows the lens's state and the key that toggles it, and the
-    // cursor steps straight over it (a non-selectable row among selectable ones,
-    // exactly as the journal spread's headers are in the task pane).
     items.push(week_sidebar_row(model.week_active(), theme));
     for l in &model.lists {
         items.push(ListItem::new(sidebar_row(
@@ -746,19 +743,24 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, the
             ascii,
         )));
     }
-    // Offset by the two pinned rows above the Lists, not one.
+    // Offset by the two pinned rows above the Lists, not one. The same slot
+    // arithmetic `move_list_selection` walks — the two must agree, or the highlight
+    // drifts a row from the cursor.
     let selected = match model.selected {
         Selection::Today => Some(0),
+        Selection::Week => Some(1),
         Selection::List(i) => Some(i + 2),
     };
     render_selectable(frame, area, "Lists", items, selected, focused, theme);
 }
 
-/// The sidebar's Weekly spread row: the label, and the key that toggles it.
+/// The sidebar's Weekly spread row: the label, and the key that opens it.
 ///
-/// Lit in the accent while the lens is on, dim otherwise — it is the one place
-/// the sidebar says which pane the task pane is showing, since the cursor stays
-/// parked on a List either way.
+/// A cursor stop like Today, and the row that means the week across **every**
+/// List — a List's own week is that List's row with the lens on. Lit in the accent
+/// while the lens is up anywhere, dim otherwise, so a List-scoped week still says
+/// so here while the cursor sits on the List it is scoped to. That accent is
+/// independent of the cursor highlight, which `render_selectable` draws.
 ///
 /// Carries no glyph, deliberately. A `●`/`○` pair would read as an **Entry
 /// type** signifier — `○ ` is the Event glyph, two rows from Tasks that wear it
@@ -1394,15 +1396,27 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
         (items, selected)
     };
 
-    // Search and the Weekly spread name themselves in the header — neither has a
-    // sidebar row of its own and the parked cursor still highlights the List it
-    // was opened from, so the title is where the user reads which pane this is.
+    // Search names itself in the header: it has no sidebar row of its own and the
+    // parked cursor still highlights the List it was opened from, so the title is
+    // where the user reads which pane this is. The spread does too, and adds the
+    // List it is scoped to.
     let base = if model.search_active() {
         format!("SEARCH — {}", model.sort.label())
     } else if week {
         // No Sort label: the spread has one fixed order, which is why `s` is
-        // refused in it. The week it shows takes that slot instead.
-        format!("WEEKLY SPREAD — week {}", week_start.iso_week().week())
+        // refused in it. The week it shows takes that slot instead, then its scope
+        // — a filter that can empty the pane has to be legible in it, the reason
+        // `header_title` also names an active `/` query. Read from `week_scope`,
+        // the same accessor `within_week` filters by, so the title cannot name a
+        // narrower set than the one drawn beneath it.
+        let scope = model
+            .week_scope()
+            .and_then(|id| model.lists.iter().find(|l| &l.id == id))
+            .map_or_else(|| "all lists".to_string(), |l| l.title.clone());
+        format!(
+            "WEEKLY SPREAD — week {} — {scope}",
+            week_start.iso_week().week()
+        )
     } else {
         format!("Tasks — {}", model.sort.label())
     };

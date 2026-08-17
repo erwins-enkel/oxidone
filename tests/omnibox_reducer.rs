@@ -127,11 +127,11 @@ fn esc_closes_and_mutates_nothing() {
 
 // ─── rows and order ─────────────────────────────────────────────────────────
 
-/// The empty query lists Today, then the Lists in order, then every command —
-/// and **no** SEARCH row. So `selected == 0` names Today, and `p`+`Enter` on an
-/// untouched Omnibox goes there.
+/// The empty query lists the two pinned rows, then the Lists in order, then every
+/// command — and **no** SEARCH row. So `selected == 0` names Today, and `p`+`Enter`
+/// on an untouched Omnibox goes there.
 #[test]
-fn the_empty_query_lists_today_then_lists_then_commands() {
+fn the_empty_query_lists_the_pinned_rows_then_lists_then_commands() {
     let model = open_with(&["work", "home"]);
 
     assert_eq!(
@@ -139,13 +139,14 @@ fn the_empty_query_lists_today_then_lists_then_commands() {
             .into_iter()
             .map(|row| match row {
                 OmniRow::Jump(JumpTarget::Today) => "Today".to_string(),
+                OmniRow::Jump(JumpTarget::Week) => "Week".to_string(),
                 OmniRow::Jump(JumpTarget::List { title, .. }) => title,
                 OmniRow::Command(c) => format!(":{}", c.command.verb()),
                 OmniRow::Search { .. } => "SEARCH".to_string(),
                 OmniRow::Capture(_) => "CAPTURE".to_string(),
             })
             .collect::<Vec<_>>(),
-        ["Today", "work", "home", ":horizon", ":flavor", ":ascii", ":week", ":refresh"]
+        ["Today", "Week", "work", "home", ":horizon", ":flavor", ":ascii", ":week", ":refresh"]
     );
     assert_eq!(selected(&model), 0);
 }
@@ -500,7 +501,7 @@ fn a_shrinking_lists_loaded_is_repaired_on_the_next_keystroke() {
 
 /// A JUMP lands with the task pane focused — asserted from `Focus::Sidebar`,
 /// because from `Focus::Tasks` it would pass even with the line deleted. That
-/// line sits at the call site, deliberately outside `open_selection`, so this is
+/// line sits at the call site, deliberately outside `land`, so this is
 /// the only thing standing between it and every sidebar `j`/`k` stealing focus.
 #[test]
 fn a_jump_focuses_the_task_pane() {

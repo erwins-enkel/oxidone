@@ -257,16 +257,21 @@ impl EntryType {
     }
 }
 
-/// What the sidebar cursor points at: the pinned **Today** view (a cross-List
-/// aggregate of what is due), or a real List by index into `Model::lists`.
+/// What the sidebar cursor points at: one of the two pinned rows — the **Today**
+/// view (a cross-List aggregate of what is due) or the **Weekly spread** across
+/// every List — or a real List by index into `Model::lists`.
 ///
-/// Replaces a bare `Option<usize>`: Today is always selectable (it is pinned and
-/// needs no List), so there is no "nothing selected" state to model. `List(i)`
+/// Replaces a bare `Option<usize>`: both pinned rows are always selectable (they
+/// need no List), so there is no "nothing selected" state to model. `List(i)`
 /// with `i` out of range is transient (a List just removed) and clamped back to a
 /// valid selection — falling to `Today`, which is always valid — by the reducer.
+///
+/// Neither pinned row is a List, so both answer `None` to
+/// `Model::selected_list_id` and every List verb keyed on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
     Today,
+    Week,
     List(usize),
 }
 

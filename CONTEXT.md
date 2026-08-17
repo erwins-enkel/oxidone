@@ -50,6 +50,8 @@ _Avoid_: deadline, due time, due-at.
 
 **Today**:
 The pinned, cross-List view of what is due — the sidebar's first row, always selectable, never a real List. Membership is `due <= today` (`domain::due_on_or_before`, the one definition, shared by the cache aggregate and the view filter); an **undated** entry is therefore never in it. A Completed row shows only if it was completed today, so the pane answers "among what was due, what got done". Flat and read-only in ordering terms: no Subtask nesting, no Manual lens (`position` is per-List, so a cross-List hand order is undefined), and a Manual lens carried in from a List is normalised to Due on entry. Renders as a **Journal spread**.
+
+Answers *what am I doing now*; the **Weekly spread** answers *what am I doing this week, and on which day*. The two never coexist — the spread's lens gates Today's rules off — and both read the same due date.
 _Avoid_: today list, agenda, inbox, dashboard.
 
 ### Ordering
@@ -119,7 +121,7 @@ A local, append-only record of completion events (`task_id`, `list_id`, `title`,
 ### Visual vocabulary
 
 **Signifier**:
-The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task — except in the **Journal spread**, which reserves the cell always, so a title holds its column as Events and Notes enter and leave the day. That fixed position is what makes it a gutter there rather than a cell.
+The glyph a row carries for its **Entry type** — `○ ` Event, `— ` Note, blank for a Task. Sits between the Subtask indent and the title, and degrades to `o `/`- ` under `ascii_fallback`. Absent entirely when every entry in view is a Task — except in the **Journal spread** and the **Weekly spread**, which reserve the cell always, so a title holds its column as Events and Notes enter and leave the day. That fixed position is what makes it a gutter there rather than a cell.
 _Avoid_: bullet, icon, marker (a marker *trails* the title — the link `⧉` or the **Notes marker** `≡`).
 
 **Journal spread**:
@@ -132,10 +134,41 @@ Two rules that read alike and are not: an entry is in the **Overdue** group when
 The due gutter exists here on exactly the Overdue group's condition, so the two appear and vanish together: with overdue entries the group prints its dates and a today-due row's cell is blank at the same width (titles stay aligned); with none there is no column at all.
 _Avoid_: section, bucket, page, agenda.
 
+**Weekly spread**:
+The planning surface `W` opens: a **Day grid** of Monday–Friday columns beside the rows, in which a **Dot** marks the day an entry is planned for. Toggled with `W` (`w` is the distant filter) or `:week`, and — like **Search** — a lens *orthogonal* to the sidebar cursor rather than a pane the cursor moves to. That is what lets the cursor keep naming the **Unscheduled pool**'s List while the spread is up.
+
+Two blocks, and two scoping rules: **Unscheduled** is the selected List's undated entries that are still `needsAction`, **Week** is every List's entries dated within the five days on display. Nothing else is in it — an entry dated Saturday, Sunday or before Monday is simply absent, since there is no column to draw it in and overdue is **Today**'s work. Flat, like Today, and its order is fixed (pool in Manual order, then by day), so the Sort lens is refused rather than silently ignored.
+
+Reads *every* List, so it takes the same whole-corpus load Search does — and the same pending notice, because an incomplete corpus must never read as a week with nothing planned.
+_Avoid_: week view, planner, calendar, agenda, board.
+
+**Day grid**:
+The five fixed-width cells trailing each row of the **Weekly spread**, one per weekday, under a `Mo Tu We Th Fr` header. Its width is reserved unconditionally — a narrow pane clips the title, never the columns, because the grid *is* the view. Today's column is accented, and only while the week on screen contains today.
+
+A cell is `·` empty, `•` planned, or `✕` planned-and-completed, degrading to `.`/`*`/`x` under `ascii_fallback`. The **Day cursor**'s cell is bracketed (`[•]`) rather than coloured, so it survives the selected row's reverse.
+_Avoid_: table, calendar, matrix, tracker.
+
+**Dot**:
+The `•` in a **Day grid** cell: the day an entry is planned for. It *is* the entry's **Due date** — placing one writes `due`, clearing one clears it — so a plan syncs to every other client and shows up in **Today** on its day. Not a local-only field; ADR-0003 stands.
+
+One per row, which falls out of the model rather than being enforced: a Task has one due date. Completing it crosses it to `✕`, which is Bullet Journal's own gesture and the reason the spread always draws Completed rows in its Week block.
+_Avoid_: mark, bullet (that is the **Signifier**'s family), pin, flag.
+
+**Unscheduled pool**:
+The **Weekly spread**'s first block: the undated, still-`needsAction` entries of the List the sidebar cursor names — the week's brain-dump, and where `a` captures to. The status clause bounds it: unlike the Week block, whose `✕` rows are bounded by five days, the pool has no window to age old completions out of.
+_Avoid_: backlog, inbox, staging, unplanned.
+
+**Day cursor**:
+Where the **Weekly spread** is aimed: **home** (on the title) or one of the day columns. `h`/`l` walk it, and `h` falls through at Monday — home, then the sidebar — so "left, eventually out of the pane" still holds.
+
+Home is what keeps `Space` whole. `Space` acts on the cell under the cursor: empty schedules, the row's own **Dot** completes, a `✕` un-completes — and at home it is the ordinary completion key, which is the only way to finish a row still in the **Unscheduled pool**, since that row has no dot cell anywhere.
+_Avoid_: selection, caret (that is the text inputs'), cell cursor.
+
 **Omnibox**:
 The modal surface `p` opens: one query over a grouped result list, offering the
-Lists to **jump** to, the **commands** (keyless, bar `:refresh`, which `r` also
-fires), a hand-off to **Search**, and — pinned last — **capturing** the query as
+Lists to **jump** to, the **commands** (keyless, bar `:refresh` and `:week`,
+which `r` and `W` also fire), a hand-off to **Search**, and — pinned last —
+**capturing** the query as
 a Task. `Enter` runs whichever row is highlighted, so what it will do is legible
 before it is pressed, and a write is never what happens by default.
 
@@ -147,8 +180,8 @@ JUMP group is a grouping of *rows* that happen to name Lists.
 The *setting* commands are **session-only** — they change the running app, never
 `config.toml` — which the COMMAND group header says once rather than every row
 repeating it. The header scopes that caveat to the settings because `:refresh`
-shares the group and sets nothing: it acts, and there is no value of it to
-outlive the session.
+and `:week` share the group and set nothing: they act, and there is no value of
+either to outlive the session.
 _Avoid_: command bar, palette (that is Catppuccin's), launcher, fuzzy finder,
 section.
 

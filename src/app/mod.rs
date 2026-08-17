@@ -13,7 +13,7 @@ use crate::config::Flavor;
 use crate::dateparse;
 use crate::domain::{
     due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
-    TaskId,
+    TaskId, WEEK_DAYS,
 };
 use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
@@ -109,6 +109,34 @@ pub struct Model {
     /// incomplete corpus renders a pending notice rather than reading "no match".
     /// Held here, not on `status_line`, so no other message can erase it.
     pub search_pending: bool,
+    /// Whether the **Weekly spread** is active. Orthogonal to
+    /// [`selected`](Self::selected), exactly as [`search`](Self::search) is: the
+    /// sidebar cursor stays parked on a List, which is what lets moving it
+    /// re-scope the UNSCHEDULED pool without leaving the spread. When set,
+    /// `tasks` holds the whole cached corpus (as Search's does) and
+    /// [`within_week`](Self::within_week) alone decides what is drawn.
+    ///
+    /// Both [`today_active`](Self::today_active) and
+    /// [`selected_list_id`](Self::selected_list_id) are gated on `!week`, so the
+    /// Today-only rules and the whole per-List-identity family fail closed here.
+    pub week: bool,
+    /// Whether the week corpus is still awaiting its live fan-out — the exact
+    /// analogue of [`search_pending`](Self::search_pending), and load-bearing for
+    /// the same reason: an incomplete corpus must render a pending notice rather
+    /// than read "nothing planned this week".
+    pub week_pending: bool,
+    /// Which week the spread shows, in whole weeks from the one containing
+    /// today: `0` is the current week, `1` the next. Stepped by `]`/`[`.
+    pub week_offset: u32,
+    /// The spread's day cursor: `None` is the **home** position on the title
+    /// itself, `Some(i)` the `i`-th day column (`0` = Monday).
+    ///
+    /// Home is what keeps `Space` whole. A row still in the UNSCHEDULED pool has
+    /// no dot cell, so with the cursor only ever in the grid it could never be
+    /// completed; at home `Space` toggles completion exactly as it does in every
+    /// other pane. The pane opens here, so nothing already learned changes until
+    /// the cursor is deliberately moved right.
+    pub week_day: Option<usize>,
     pub focus: Focus,
     pub show_help: bool,
     pub should_quit: bool,
@@ -239,6 +267,7 @@ pub struct Model {
 enum PaneKey {
     Today,
     Search,
+    Week,
     List(ListId),
 }
 
@@ -273,8 +302,8 @@ impl Group {
     /// each, competing with the effect and the advisory for one budget.
     ///
     /// **"settings are session only"**, not a bare "session only": the group
-    /// also holds `:refresh`, which sets nothing, and an unqualified caveat
-    /// would be a claim about a row it does not describe.
+    /// also holds `:refresh` and `:week`, which set nothing, and an unqualified
+    /// caveat would be a claim about rows it does not describe.
     pub fn header(self) -> &'static str {
         match self {
             Group::Jump => "JUMP",
@@ -301,6 +330,10 @@ pub enum OmniCommand {
     /// argument, which is why `command_state` answers for it before the
     /// missing-argument guard the other three share.
     Refresh,
+    /// Toggle the **Weekly spread**, the same lens `W` fires. Argument-less like
+    /// [`Refresh`](Self::Refresh), and like it it *acts* rather than setting a
+    /// value — so the COMMAND group's session-only caveat does not describe it.
+    Week,
 }
 
 impl OmniCommand {
@@ -318,10 +351,11 @@ impl OmniCommand {
     /// Not a claim about `selected == 0`: an empty query matches `Today`, so row
     /// zero there is a JUMP row and a stray `Enter` reaches no command at all.
     /// Position within the band is all this order decides.
-    pub const ALL: [OmniCommand; 4] = [
+    pub const ALL: [OmniCommand; 5] = [
         OmniCommand::Horizon,
         OmniCommand::Flavor,
         OmniCommand::Ascii,
+        OmniCommand::Week,
         OmniCommand::Refresh,
     ];
 
@@ -333,6 +367,7 @@ impl OmniCommand {
             OmniCommand::Flavor => "flavor",
             OmniCommand::Ascii => "ascii",
             OmniCommand::Refresh => "refresh",
+            OmniCommand::Week => "week",
         }
     }
 
@@ -349,7 +384,9 @@ impl OmniCommand {
     fn aliases(self) -> &'static [&'static str] {
         match self {
             OmniCommand::Refresh => &["sync"],
-            OmniCommand::Horizon | OmniCommand::Flavor | OmniCommand::Ascii => &[],
+            OmniCommand::Horizon | OmniCommand::Flavor | OmniCommand::Ascii | OmniCommand::Week => {
+                &[]
+            }
         }
     }
 
@@ -619,6 +656,10 @@ impl Default for Model {
             filter: None,
             search: false,
             search_pending: false,
+            week: false,
+            week_pending: false,
+            week_offset: 0,
+            week_day: None,
             show_completed: false,
             focus: Focus::Sidebar,
             show_help: false,
@@ -660,32 +701,35 @@ impl Model {
         Self::default()
     }
 
-    /// The `ListId` of the active List, or `None` when Today or **Search** is the
-    /// active pane (neither is a List), or the index is transiently out of range.
-    /// The single choke point every write path and the sidebar identity read, so
-    /// the not-a-List branches live here rather than at each call site.
+    /// The `ListId` of the active List, or `None` when Today, **Search** or the
+    /// **Weekly spread** is the active pane (none of the three is a List), or the
+    /// index is transiently out of range. The single choke point every write path
+    /// and the sidebar identity read, so the not-a-List branches live here rather
+    /// than at each call site.
     ///
-    /// The `!search` gate is load-bearing: `selected` stays parked on the List
-    /// Search was opened from, so without it every gate of the form
+    /// The `!search`/`!week` gates are load-bearing: `selected` stays parked on a
+    /// List in both panes, so without them every gate of the form
     /// `selected_list_id() == Some(list)` — the per-List write path, the Move
-    /// rollback, the Clear repairs, the sidebar meter — would match the *parked*
-    /// List against the *corpus* and fail open. Returning `None` here makes the
-    /// whole family fail closed at the source. Call sites that need the parked
-    /// List by identity (only `set_lists`'s restore) read `self.selected` directly.
+    /// rollback, the Clear repairs, the sidebar meter, `set_tasks` — would match
+    /// the *parked* List against the *corpus* and fail open. Returning `None`
+    /// here makes the whole family fail closed at the source. Call sites that
+    /// need the parked List by identity (`set_lists`'s restore, and
+    /// `week_pool_list`) read `self.selected` directly.
     pub fn selected_list_id(&self) -> Option<&ListId> {
         match self.selected {
-            Selection::List(i) if !self.search => self.lists.get(i).map(|l| &l.id),
+            Selection::List(i) if !self.search && !self.week => self.lists.get(i).map(|l| &l.id),
             _ => None,
         }
     }
 
     /// Whether the pinned Today view is the active pane — **strictly** Today, not
-    /// Search opened from Today. `selected` stays parked on Today while searching
-    /// (the sidebar cursor never moves), so the `!search` gate is what keeps every
-    /// Today-only rule — `due <= today` membership, completion-day hiding, the
-    /// journal spread — from firing inside Search.
+    /// Search or the Weekly spread opened from Today. `selected` stays parked on
+    /// Today in both (the sidebar cursor never moves), so the `!search`/`!week`
+    /// gates are what keep every Today-only rule — `due <= today` membership,
+    /// completion-day hiding, the journal spread, and the `today_active()`
+    /// refusal guards — from firing inside them.
     pub fn today_active(&self) -> bool {
-        matches!(self.selected, Selection::Today) && !self.search
+        matches!(self.selected, Selection::Today) && !self.search && !self.week
     }
 
     /// Whether the cross-List Search pane is active.
@@ -693,13 +737,42 @@ impl Model {
         self.search
     }
 
-    /// Whether the active pane is **flat and cross-List** — Today or Search. The
-    /// ordering and layout axis they share: the flat `cross_list_ordered` order,
-    /// the Due↔Title `s` cycle (Manual is undefined across Lists), and the view's
-    /// `flat` column rules. Distinct from `today_active()`, which names the
-    /// Today-only rules Search does not inherit.
+    /// Whether the **Weekly spread** is the active pane. Search wins when both
+    /// are set — a Search opened from the spread is its own pane, exactly as one
+    /// opened from Today is.
+    pub fn week_active(&self) -> bool {
+        self.week && !self.search
+    }
+
+    /// The Monday the displayed week opens on, from `now` and `week_offset`.
+    pub fn week_start(&self) -> NaiveDate {
+        crate::domain::week_start(self.now.date_naive(), self.week_offset)
+    }
+
+    /// The List the UNSCHEDULED pool is drawn from: the one the sidebar cursor is
+    /// parked on, or `default_list` when it is parked on Today.
+    ///
+    /// Reads `self.selected` directly, which is the escape
+    /// [`selected_list_id`](Self::selected_list_id) sanctions for the call sites
+    /// that need the parked List *by identity* — this one does, and the accessor
+    /// answers `None` in the spread precisely so the identity family cannot.
+    ///
+    /// `None` (Today selected, `default_list` unresolved) leaves the pool block
+    /// absent and refuses `a`: never an empty-looking pool.
+    pub fn week_pool_list(&self) -> Option<&ListId> {
+        match self.selected {
+            Selection::List(i) => self.lists.get(i).map(|l| &l.id),
+            Selection::Today => self.default_list.as_ref(),
+        }
+    }
+
+    /// Whether the active pane is **flat and cross-List** — Today, Search or the
+    /// Weekly spread. The ordering and layout axis they share: bypassing the
+    /// parent/Subtask grouping for one global order, and the view's `flat` column
+    /// rules. Distinct from `today_active()`, which names the Today-only rules
+    /// the other two do not inherit.
     pub fn flat_pane(&self) -> bool {
-        self.today_active() || self.search
+        self.today_active() || self.search || self.week_active()
     }
 
     /// The Tasks in the current `sort`'s **display order**.
@@ -734,6 +807,9 @@ impl Model {
         // `display_successor`, `move_task_cursor`, and `visible_tasks` all read
         // `sorted_tasks()`, so navigation and cursor re-anchoring walk exactly what
         // the pane renders.
+        if self.week_active() {
+            return self.week_ordered();
+        }
         if self.flat_pane() {
             return self.cross_list_ordered();
         }
@@ -765,6 +841,43 @@ impl Model {
             }
         }
         groups.into_iter().flatten().collect()
+    }
+
+    /// The **Weekly spread**'s order: the UNSCHEDULED pool first, then the
+    /// scheduled rows by day.
+    ///
+    /// The pool keeps its List's **Manual order** (`position`, and the pool is a
+    /// single List so that order is defined), because a brain-dump should stay in
+    /// the order it was written. The scheduled rows sort by **due date**, so the
+    /// dots fall down the grid as a readable staircase; same-day rows tie-break
+    /// on List title then `position`, as `cross_list_ordered` does — comparing
+    /// opaque per-List `position` keys across Lists would order them arbitrarily.
+    ///
+    /// The two blocks are **contiguous**, and the pool leads. `visible_tasks()`
+    /// only filters this order, so the renderer draws its group headers by
+    /// counting the leading undated run, exactly as the journal spread counts its
+    /// overdue prefix. Ignores `sort`: the spread's order is fixed, which is why
+    /// `s` is refused there.
+    fn week_ordered(&self) -> Vec<&Task> {
+        let titles: HashMap<&ListId, &str> = self
+            .lists
+            .iter()
+            .map(|l| (&l.id, l.title.as_str()))
+            .collect();
+        let list_title = |t: &Task| titles.get(&t.list).copied().unwrap_or("").to_string();
+        let mut tasks: Vec<&Task> = self.tasks.iter().collect();
+        // `false` sorts before `true`, so "is dated" second puts the undated pool
+        // first. Undated rows share the `due_key` tail, leaving them on
+        // `position` — their pool List's Manual order.
+        tasks.sort_by_cached_key(|t| {
+            (
+                t.due.is_some(),
+                due_key(t.due),
+                list_title(t),
+                t.position.clone(),
+            )
+        });
+        tasks
     }
 
     /// A flat cross-List pane's order (Today's, and Search's): **overdue first**,
@@ -984,12 +1097,44 @@ impl Model {
     /// Whether a Task is currently shown, combining the view filters with AND: the
     /// Completed filter, the distant-due horizon (#81), and — in Today only — the
     /// `due <= today` membership (#61) and completion recency.
+    ///
+    /// In the **Weekly spread** the first two are exempted at their own
+    /// predicates and the Today pair is disarmed by `today_active()`'s `!week`
+    /// gate, so `within_week` is the only thing deciding membership there.
     fn is_visible(&self, task: &Task) -> bool {
         self.completed_visible(task)
             && self.within_horizon(task)
             && self.within_today(task)
             && self.within_completion_day(task)
+            && self.within_week(task)
             && self.matches_filter(task)
+    }
+
+    /// The **Weekly spread** membership filter: outside the spread a no-op;
+    /// inside it the *only* thing that decides what is drawn. A row shows if
+    /// either half admits it.
+    ///
+    /// - **pool** — undated, in the pool List, and still `needsAction`. The
+    ///   status clause is what bounds this half: `sync` fetches with
+    ///   `show_completed: true`, so a mature List carries every
+    ///   completed-but-uncleared undated Task, and — unlike the scheduled half,
+    ///   whose `✕` rows are bounded by the five days on display — the pool has no
+    ///   date window to age them out. Without it the brain-dump block would fill
+    ///   permanently with old completions.
+    /// - **scheduled** — dated Monday–Friday of the displayed week, in **any**
+    ///   List. Status-blind: a Completed row keeps its cell, so the week reads
+    ///   back as what was done as well as what is left.
+    ///
+    /// An unresolvable pool List admits nothing to the pool half rather than
+    /// falling back to some other List's undated rows.
+    fn within_week(&self, task: &Task) -> bool {
+        if !self.week_active() {
+            return true;
+        }
+        let pool = task.due.is_none()
+            && task.status != Status::Completed
+            && self.week_pool_list() == Some(&task.list);
+        pool || crate::domain::in_week(task.due, self.week_start())
     }
 
     /// The title/notes filter (`/`): with no filter a no-op; otherwise a row shows
@@ -1018,8 +1163,15 @@ impl Model {
 
     /// The Completed filter: a Task shows unless it is Completed and Completed
     /// Tasks are hidden.
+    ///
+    /// Exempt in the **Weekly spread**, where `show_completed`'s `false` default
+    /// would take a row off screen the instant `Space` completed it: the `✕` cell
+    /// would never draw and there would be no row left to un-complete. A
+    /// completed entry in the week *is* the record of the week. Only the
+    /// scheduled half is affected — `within_week`'s pool half already excludes
+    /// Completed rows, which is what stops the exemption unbounding the pool.
     fn completed_visible(&self, task: &Task) -> bool {
-        self.show_completed || task.status != Status::Completed
+        self.show_completed || self.week_active() || task.status != Status::Completed
     }
 
     /// The Today membership filter: outside Today a no-op; in Today an entry shows
@@ -1072,8 +1224,14 @@ impl Model {
     /// Search is a retrieval surface ("where is it") — a retrieval that presumes a
     /// date range cannot answer its own question. So a far-future match is found in
     /// Search even with the horizon on, while its own List pane still hides it.
+    ///
+    /// **Exempt in the Weekly spread** for the sharper reason that the two ranges
+    /// genuinely collide: `horizon_days` is configurable and the spread reaches
+    /// eleven days out (`]`, next Friday), so any shorter horizon would silently
+    /// drop planned rows — an empty week reading as nothing planned, which is the
+    /// failure the pending notice exists to prevent.
     fn within_horizon(&self, task: &Task) -> bool {
-        if !self.hide_distant || self.search_active() {
+        if !self.hide_distant || self.search_active() || self.week_active() {
             return true;
         }
         match task.due {
@@ -1219,6 +1377,18 @@ pub enum Message {
         failed: Vec<ListId>,
         live: bool,
     },
+    /// The **Weekly spread**'s corpus (every cached Task, across all Lists) plus
+    /// the ListIds whose live fetch/mirror failed — the same shape and the same
+    /// worker as [`SearchLoaded`](Self::SearchLoaded), because the spread's
+    /// scheduled half spans every List too. Ignored unless the spread is still
+    /// active. Sent twice per load: the instant cache paint (`live: false`), then
+    /// the live fan-out result (`live: true`), which is the only signal that
+    /// clears [`Model::week_pending`].
+    WeekLoaded {
+        tasks: Vec<Task>,
+        failed: Vec<ListId>,
+        live: bool,
+    },
     /// Google's `@default` alias resolved to a concrete `ListId` (startup, online).
     DefaultListResolved(ListId),
     /// A write succeeded; reconcile the Model with the server's Task.
@@ -1336,6 +1506,11 @@ pub enum Command {
     /// aggregate. Carries the Lists to fan out over. Query-independent, so it fires
     /// on entry and `r` only, never per keystroke.
     LoadSearch { lists: Vec<List> },
+    /// Load the **Weekly spread**'s corpus: the same whole-corpus read as
+    /// `LoadSearch`, since the spread's scheduled half spans every List. The
+    /// window itself is applied by `Model::within_week`, not by the worker, so
+    /// `]`/`[` re-window an already-loaded corpus without a round trip.
+    LoadWeek { lists: Vec<List> },
     /// Write-through a completion toggle for a Task.
     SetCompleted {
         list: ListId,
@@ -1441,6 +1616,16 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             if model.overlay.is_some() {
                 return overlay_key(model, key);
             }
+            // The Weekly spread's grid keys, routed ahead of the global keymap the
+            // way an overlay's are — they are the only bindings in oxidone that
+            // mean something different inside one pane. Scoped to the task pane, so
+            // `h`/`l` keep moving focus while the sidebar has it; anything the grid
+            // declines falls through to the keymap below with its usual meaning.
+            if model.week_active() {
+                if let Some(commands) = week_key(model, key) {
+                    return commands;
+                }
+            }
             match keymap::resolve(key) {
                 Some(action) => apply(model, action),
                 None => Vec::new(),
@@ -1489,6 +1674,26 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             // never-mirrored List reads as "not yet", not "no match".
             if live {
                 model.search_pending = false;
+            }
+            set_fanout_status(model, &failed);
+            Vec::new()
+        }
+        Message::WeekLoaded {
+            tasks,
+            failed,
+            live,
+        } => {
+            // Ignore a corpus landing after the user left the spread, so it cannot
+            // overwrite the restored pane.
+            if !model.week_active() {
+                return Vec::new();
+            }
+            fill_flat_pane(model, tasks);
+            // Only the live fan-out completes the corpus; the cache paint leaves
+            // the pending notice up, so a never-mirrored List reads as "not yet"
+            // rather than as a day with nothing planned.
+            if live {
+                model.week_pending = false;
             }
             set_fanout_status(model, &failed);
             Vec::new()
@@ -1852,6 +2057,7 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             let repair_pane = match snapshot.pane {
                 PaneKey::Today => model.today_active(),
                 PaneKey::Search => model.search_active(),
+                PaneKey::Week => model.week_active(),
                 PaneKey::List(_) => false,
             };
             if repair_pane {
@@ -1901,7 +2107,9 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             // rather than leave "searching all lists…" promising work that will
             // never arrive (fail closed): the offline `LoadSearch` cache read sends
             // `LoadFailed`, not a `SearchLoaded`, when the read itself errors.
+            // `LoadWeek` reads the same corpus the same way, so its notice goes too.
             model.search_pending = false;
+            model.week_pending = false;
             Vec::new()
         }
     }
@@ -1971,17 +2179,27 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     // after the parked List disappears server-side from reaching `request_selected`
     // with `clear_pane` — belt-and-suspenders beside the Search branch's own
     // `clear_pane` opt-out, and legible if that branch ever changes.
+    //
+    // Forced `false` in the Weekly spread for the same reason, and there it is not
+    // belt-and-suspenders but the only guard: both halves of the comparison below
+    // are rigged while the spread is up, since `was_today`/`previously_selected`
+    // read the *raw* cursor while `today_active()`/`selected_list_id()` are gated
+    // to `false`/`None`. Every `ListsLoaded` would therefore read as a target
+    // change and drop `model.filter` — so `W`, `/`, a query, then `r` would
+    // silently clear it.
     let now_selected = model.selected_list_id().cloned();
     let target_changed = !model.search_active()
+        && !model.week_active()
         && (was_today != model.today_active() || previously_selected != now_selected);
     let mut commands = request_selected(model, target_changed);
 
     // Consume the flag unconditionally, so a Refresh's `full` never carries into a
     // later lazy cascade.
     let full = std::mem::take(&mut model.pending_refresh);
-    // A flat cross-List pane (Today or Search) already fans out every List (fetch +
-    // mirror) via its `LoadToday`/`LoadSearch`, so a separate per-List meter fan-out
-    // would double-fetch — skip it. Recount fills the meters from the mirrored cache.
+    // A flat cross-List pane (Today, Search or the Weekly spread) already fans out
+    // every List (fetch + mirror) via its `LoadToday`/`LoadSearch`/`LoadWeek`, so a
+    // separate per-List meter fan-out would double-fetch — skip it. Recount fills
+    // the meters from the mirrored cache.
     if model.flat_pane() {
         return commands;
     }
@@ -2035,6 +2253,20 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
         }
         model.search_pending = true;
         return vec![Command::LoadSearch {
+            lists: model.lists.clone(),
+        }];
+    }
+    // The spread's corpus is the same whole-corpus load Search takes, and for the
+    // same reason: the scheduled half spans every List. Precedes the
+    // `selected_list_id()` match below, which is `None` here too. Ignores
+    // `clear_pane` for the pane's own rows — `toggle_week` owns the clearing — so
+    // the Move repair's `clear_pane: false` keeps its bridged row.
+    //
+    // The single choke point for `LoadWeek`, so the pending notice is armed on
+    // entry, on `r`, and on the Move repair alike.
+    if model.week_active() {
+        model.week_pending = true;
+        return vec![Command::LoadWeek {
             lists: model.lists.clone(),
         }];
     }
@@ -2144,8 +2376,9 @@ fn set_tasks(model: &mut Model, list: &ListId, tasks: Vec<Task>) {
     reselect_visible(model);
 }
 
-/// Fill a **flat cross-List** pane (Today's aggregate or Search's corpus) from a
-/// cross-List Task set, keeping the cursor on the same Task by id where possible.
+/// Fill a **flat cross-List** pane — Today's aggregate, Search's corpus, or the
+/// Weekly spread's — from a cross-List Task set, keeping the cursor on the same
+/// Task by id where possible.
 ///
 /// Drops any id confirmed deleted/Cleared under its own List (the #65 stale-fetch
 /// guard) and any row with a cross-List Move in flight. Both are unconditional,
@@ -2194,7 +2427,7 @@ fn set_search_tasks(model: &mut Model, tasks: Vec<Task>) {
 
 /// Set the status line to name the Lists whose live fetch/mirror failed, or clear
 /// it when all succeeded — so a short cross-List pane never reads as a light one
-/// (fail closed). Shared by the Today and Search fan-out replies.
+/// (fail closed). Shared by the Today, Search and Weekly spread fan-out replies.
 fn set_fanout_status(model: &mut Model, failed: &[ListId]) {
     if failed.is_empty() {
         model.status_line = None;
@@ -2255,22 +2488,43 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
         Action::AddList => open_add_list(model),
         Action::RenameList => open_rename_list(model),
         Action::DeleteList => open_delete_list_confirm(model),
+        Action::ToggleWeek => return toggle_week(model),
         // View-only: cycle the local lens. `tasks` is untouched and `selected_task`
         // keeps indexing it, so the cursor stays on the same Task by id across the
         // re-sort. Never emits a Command. In a flat cross-List pane (Today or
         // Search) the cycle is Due↔Title only (Manual is undefined across Lists).
+        //
+        // Refused in the Weekly spread, and `sort` is **not** cycled: the spread's
+        // order is fixed by `week_ordered`, so a working `s` would advance the lens
+        // invisibly and hand the List pane behind it a different order on return.
         Action::CycleSort => {
-            model.sort = if model.flat_pane() {
-                model.sort.next_flat()
+            if model.week_active() {
+                model.status_line =
+                    Some("the week has one order — leave it to re-sort a list".to_string());
             } else {
-                model.sort.next()
+                model.sort = if model.flat_pane() {
+                    model.sort.next_flat()
+                } else {
+                    model.sort.next()
+                }
             }
         }
         // View-only: reveal/hide Completed Tasks. Hiding may drop the selected
         // Task out of view, so re-anchor the cursor onto a visible one.
+        //
+        // Refused in the Weekly spread, and the flag is **not** flipped, for the
+        // reason `w` is refused in Search: `completed_visible` is exempt there, so
+        // the flip would be invisible in the pane yet persist for the session.
         Action::ToggleShowCompleted => {
-            model.show_completed = !model.show_completed;
-            reselect_visible(model);
+            if model.week_active() {
+                model.status_line = Some(
+                    "completed filter doesn't apply in the week — the cross is the record"
+                        .to_string(),
+                );
+            } else {
+                model.show_completed = !model.show_completed;
+                reselect_visible(model);
+            }
         }
         // View-only: hide/reveal entries due beyond the horizon. Hiding may drop
         // the selected Task out of view, so re-anchor the cursor onto a visible
@@ -2284,6 +2538,9 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             if model.search_active() {
                 model.status_line =
                     Some("distant filter doesn't apply in Search — every match shows".to_string());
+            } else if model.week_active() {
+                model.status_line =
+                    Some("distant filter doesn't apply in the week — every day shows".to_string());
             } else {
                 model.hide_distant = !model.hide_distant;
                 reselect_visible(model);
@@ -2488,6 +2745,23 @@ impl CaptureRefusal {
 }
 
 fn capture_target(model: &Model) -> Result<CaptureTarget, CaptureRefusal> {
+    // Ahead of the Today/Search branch, and both halves are load-bearing. The
+    // target is the pool List, so a capture lands in UNSCHEDULED — the brain-dump
+    // half of the ritual. `due_default` stays `None` for the same reason: Today's
+    // branch dates its captures today, which would drop a new entry straight into
+    // the grid instead of the pool. And the branch must come first, or the
+    // `!week`-gated `today_active()`/`selected_list_id()` would both decline and
+    // the fall-through would refuse *silently* as `NoSelectedList`.
+    if model.week_active() {
+        let list = model
+            .week_pool_list()
+            .cloned()
+            .ok_or(CaptureRefusal::NoDefaultList)?;
+        return Ok(CaptureTarget {
+            list,
+            due_default: None,
+        });
+    }
     if model.today_active() || model.search_active() {
         let list = model
             .default_list
@@ -2562,11 +2836,14 @@ fn open_add_subtask(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    // Subtasks are a per-List, position-shaped concept; Today and Search are flat
-    // cross-List views, so `o` is disabled in both (like the Moves). Explicit in
-    // Search: its `today_active()` guard no longer covers it, and without this `o`
-    // would parent a Subtask into the parked List.
-    if model.today_active() || model.search_active() {
+    // Subtasks are a per-List, position-shaped concept; Today, Search and the
+    // Weekly spread are flat cross-List views, so `o` is disabled in all three
+    // (like the Moves). Explicit in the latter two: `today_active()` is gated on
+    // `!search`/`!week` and so no longer covers them, and without this `o` would
+    // parent a Subtask into the parked List — in the spread, onto a row that may
+    // belong to another List entirely, via `finish_add_subtask`'s
+    // `selected_list_id()`.
+    if model.flat_pane() {
         model.status_line = Some("subtasks are per-list — open the list to add one".to_string());
         return;
     }
@@ -2703,6 +2980,10 @@ fn move_preconditions(model: &mut Model) -> Option<(ListId, usize)> {
     }
     if model.search_active() {
         model.status_line = Some("can't move in Search — open the list to reorder".to_string());
+        return None;
+    }
+    if model.week_active() {
+        model.status_line = Some("can't move in the week — open the list to reorder".to_string());
         return None;
     }
     let list = model.selected_list_id().cloned()?;
@@ -2879,6 +3160,15 @@ fn pane_key(model: &Model) -> Option<PaneKey> {
     }
     if model.search_active() {
         return Some(PaneKey::Search);
+    }
+    // Ahead of the fallback, which `selected_list_id()`'s `!week` gate makes
+    // `None` in the spread: without this arm every `M` there would be dropped
+    // silently by `finish_move_to_list`. It also keeps the spread from sharing an
+    // identity with the parked pool List's own pane, which `restore_list_move`
+    // compares against — a week -> that-List switch during a failed Move would
+    // otherwise match and re-insert a foreign row.
+    if model.week_active() {
+        return Some(PaneKey::Week);
     }
     model.selected_list_id().cloned().map(PaneKey::List)
 }
@@ -3165,6 +3455,16 @@ fn open_clear_completed_confirm(model: &mut Model) {
             Some("can't clear in Search — open the list to clear completed".to_string());
         return;
     }
+    // Refused in the Weekly spread on the same reasoning, and it is the same
+    // shape of pane: a Today-style sweep would clear every Completed row in the
+    // corpus, while falling through to the List branch would issue
+    // `ClearCompleted { list: pool }` — a command that sweeps the parked pool List
+    // while the confirm counts Completed rows across every List on screen.
+    if model.week_active() {
+        model.status_line =
+            Some("can't clear in the week — open the list to clear completed".to_string());
+        return;
+    }
     if model.today_active() {
         // Cross-List sweep: group the aggregate's Completed rows by their own List.
         // Google's clear_completed is per-List, so one command per contributing
@@ -3270,11 +3570,19 @@ fn finish_add_list(model: &mut Model, buffer: String) -> Vec<Command> {
     if title.is_empty() {
         return Vec::new();
     }
-    // `A` moves `selected` onto the new List deliberately (like `j`/`k`), so it
-    // leaves Search. This bypasses `request_selected` entirely, so `leave_search`
-    // is what drops the query — otherwise a stale search query would narrow the
-    // brand-new empty List.
+    // `A` moves `selected` onto the new List deliberately, so it leaves Search.
+    // This bypasses `request_selected` entirely, so `leave_search` is what drops
+    // the query — otherwise a stale search query would narrow the brand-new empty
+    // List.
     leave_search(model);
+    // And the Weekly spread, which `model.tasks.clear()` below would otherwise
+    // leave holding an empty corpus with nothing to refill it: `ListInserted`'s
+    // reload is gated on `selected_list_id() == Some(list)`, which the spread's
+    // `!week` gate answers `None`, and `week_pending` would be `false` — so the
+    // pane would read as a week with nothing planned, without even the notice
+    // that says otherwise. Unlike a sidebar `j`/`k`, which re-scopes the pool in
+    // place, `A` names a pane to land in.
+    leave_week(model);
     let temp = ListId(format!("temp-list-{}", model.next_temp));
     model.next_temp += 1;
     model.lists.push(List {
@@ -3486,6 +3794,10 @@ fn command_state(
     if command == OmniCommand::Refresh {
         return refresh_state(model, arg);
     }
+    // Argument-less too, for the same reason.
+    if command == OmniCommand::Week {
+        return week_state(model, arg);
+    }
 
     let Some(arg) = arg else {
         // The target is built rather than appended to, so a typed `:` survives
@@ -3549,6 +3861,27 @@ fn command_state(
         // rather than panicking, so the row stays right if the early return ever
         // moves — `arg` is `Some` here, which is the case that refuses.
         OmniCommand::Refresh => refresh_state(model, Some(arg)),
+        OmniCommand::Week => week_state(model, Some(arg)),
+    }
+}
+
+/// The `:week` row's state.
+///
+/// Argument-less like `:refresh`, and the argument is likewise the first
+/// question. Never refused, though: the spread reads the local corpus, so it
+/// needs no connection, and it toggles from either side.
+fn week_state(model: &Model, arg: Option<&str>) -> CommandState {
+    if arg.is_some() {
+        return CommandState::Invalid {
+            reason: "takes no argument".to_string(),
+        };
+    }
+    CommandState::Valid {
+        effect: if model.week {
+            "close the weekly spread".to_string()
+        } else {
+            "open the weekly spread".to_string()
+        },
     }
 }
 
@@ -3629,6 +3962,225 @@ fn enter_search(model: &mut Model) -> Vec<Command> {
     model.filter = Some(String::new());
     model.overlay = Some(Overlay::Filter);
     commands
+}
+
+/// Toggle the **Weekly spread** (`W`). Entering loads the whole corpus and parks
+/// the day cursor at home; leaving reloads whatever pane `selected` still names.
+///
+/// The sidebar cursor never moves either way — that is the whole point of the
+/// lens being orthogonal to `selected`: it keeps naming the pool List while the
+/// spread is up, and naming the pane to return to when it comes down.
+fn toggle_week(model: &mut Model) -> Vec<Command> {
+    if model.week {
+        leave_week(model);
+        // Leaving is a pane change, so the pane's own rows go with it, exactly as
+        // `exit_search` drops Search's corpus.
+        return request_selected(model, true);
+    }
+    // Search and the spread are separate panes; entering one leaves the other, or
+    // `week_active()`'s `!search` gate would strand the corpus behind a query.
+    leave_search(model);
+    model.week = true;
+    model.week_day = None;
+    model.tasks.clear();
+    model.selected_task = None;
+    let commands = request_selected(model, true);
+    model.focus = Focus::Tasks;
+    commands
+}
+
+/// Show the week `offset` whole weeks from the one containing today (`]` → 1,
+/// `[` → 0).
+///
+/// A set, not a step — the two keys name the two weeks the spread has rather than
+/// walking a cursor, so `]` twice is still next week.
+///
+/// Re-windows the corpus already loaded rather than fetching: the worker reads
+/// every List regardless of week, and `within_week` applies the window. The
+/// cursor may be left on a row the new week excludes, so re-anchor it.
+fn show_week(model: &mut Model, offset: u32) {
+    model.week_offset = offset;
+    reselect_visible(model);
+}
+
+/// The **Weekly spread**'s own keys, tried before the global keymap the way an
+/// overlay's are. `None` means "not mine" — the key falls through to its
+/// ordinary meaning.
+///
+/// These are the only bindings in oxidone that mean something different inside
+/// one pane, which is why they are routed here rather than added to `bindings()`:
+/// a global `h` must keep moving focus, and a global `Space` must keep completing.
+/// `LegendContext::Week` advertises them in the pane they apply to.
+///
+/// `]`/`[` answer wherever focus is — paging the week is a property of the pane,
+/// not of the row cursor. Everything below the focus gate is the grid itself.
+///
+/// `h`/`l` walk the day cursor, and `h` falls **through** at the left edge
+/// (Monday → home → `FocusLeft`), so the "h goes left, eventually out of the
+/// pane" reflex survives the rebinding intact. `l` clamps at Friday: there is
+/// nothing to its right, and focusing away from a row mid-plan is not what the
+/// key means here.
+fn week_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Option<Vec<Command>> {
+    use crossterm::event::KeyCode;
+    // Leave the readline chords and any other modified key alone.
+    if keymap::is_control_chord(key.modifiers) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(']') => {
+            show_week(model, 1);
+            return Some(Vec::new());
+        }
+        KeyCode::Char('[') => {
+            show_week(model, 0);
+            return Some(Vec::new());
+        }
+        _ => {}
+    }
+    if model.focus != Focus::Tasks {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('h') => match model.week_day {
+            // At home already: not ours, so `h` focuses the sidebar as usual.
+            None => return None,
+            Some(0) => model.week_day = None,
+            Some(day) => model.week_day = Some(day - 1),
+        },
+        KeyCode::Char('l') => {
+            let next = model.week_day.map_or(0, |day| day + 1);
+            if next >= WEEK_DAYS {
+                // Clamped, not passed on: `l` inside the grid must never focus
+                // away from the row being planned.
+                return Some(Vec::new());
+            }
+            model.week_day = Some(next);
+        }
+        KeyCode::Char(' ') => return Some(week_space(model)),
+        // `1`..`5` jump-assign, `0` unschedules — the fast path past the cursor.
+        KeyCode::Char(c @ '0'..='9') => {
+            let digit = c as usize - '0' as usize;
+            if digit > WEEK_DAYS {
+                return None;
+            }
+            let due =
+                (digit > 0).then(|| model.week_start() + chrono::Duration::days(digit as i64 - 1));
+            return Some(set_week_due(model, due));
+        }
+        _ => return None,
+    }
+    Some(Vec::new())
+}
+
+/// `Space` in the spread: act on the cell under the cursor.
+///
+/// | Cursor | Row | Effect |
+/// | --- | --- | --- |
+/// | home | any | toggle complete — as in every other pane |
+/// | day D | not due D | set `due = D` |
+/// | day D | due D, `needsAction` | complete it (`•` → `✕`) |
+/// | day D | due D, completed | un-complete it (`✕` → `•`) |
+///
+/// Drawing the dot and then crossing it out is the bullet-journal ritual itself,
+/// which is why one key covers both: `Space` still means "complete" for anything
+/// already scheduled on the day being looked at.
+fn week_space(model: &mut Model) -> Vec<Command> {
+    let Some(day) = model.week_day else {
+        return toggle_complete(model);
+    };
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let due = model.week_start() + chrono::Duration::days(day as i64);
+    if task.due == Some(due) {
+        return toggle_complete(model);
+    }
+    set_week_due(model, Some(due))
+}
+
+/// Write the selected row's due date from the spread — the dot landing in a day
+/// column, or `None` returning it to the UNSCHEDULED pool.
+///
+/// Rides the same optimistic `SetDue` path as `d` and `m`, so single-flight
+/// guarding and rollback come from there. Targets the row's *own* List, since
+/// the spread spans Lists.
+fn set_week_due(model: &mut Model, due: Option<NaiveDate>) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    // Already there. Says so rather than returning silently: every other outcome
+    // in this function reports, so a mute one reads as a dropped keystroke.
+    if task.due == due {
+        model.status_line = Some(match due {
+            Some(_) => "already planned for that day".to_string(),
+            None => "already unscheduled".to_string(),
+        });
+        return Vec::new();
+    }
+    let (id, list) = (task.id.clone(), task.list.clone());
+    // Single-flight: don't lose the plan silently if a write is running.
+    if model.pending_writes.contains_key(&id) {
+        model.status_line = Some("a write is already in progress for this task".to_string());
+        return Vec::new();
+    }
+    // Unscheduling can take the row out of the spread altogether, and there are
+    // two ways in — the two halves of `within_week`. A **Completed** row is
+    // refused: the pool admits only `needsAction`, and re-dating a Completed entry
+    // means nothing anyway, which is the same reason `m` refuses one.
+    if due.is_none() && task.status == Status::Completed {
+        model.status_line =
+            Some("completed tasks stay on their day — un-complete it first".to_string());
+        return Vec::new();
+    }
+    let Some(index) = model.tasks.iter().position(|t| t.id == id) else {
+        return Vec::new();
+    };
+    // The other way is a row from a List that is not the pool's — the week half is
+    // cross-List while the pool half is one List, so undating such a row leaves it
+    // in neither. Not refused: taking a task off your week is a legitimate thing to
+    // want, and the write is correct. But it is *reported*, because "back to the
+    // pool" is what `0` advertises and this row went somewhere else — and a pane a
+    // row silently vanishes from reads as a dropped keystroke.
+    let mut after = model.tasks[index].clone();
+    after.due = due;
+    let leaves = !model.within_week(&after);
+    let home = leaves.then(|| {
+        model
+            .lists
+            .iter()
+            .find(|l| l.id == after.list)
+            .map_or_else(|| after.list.0.clone(), |l| l.title.clone())
+    });
+    model
+        .pending_writes
+        .insert(id.clone(), model.tasks[index].clone());
+    model.tasks[index].due = due;
+    if let Some(home) = home {
+        model.status_line = Some(format!("unscheduled — now undated in {home}"));
+    }
+    // The row may have just crossed between the pool and the week — or left the
+    // spread outright, or, with a filter on, gone out of view; re-anchor the cursor
+    // onto a visible row.
+    reselect_visible(model);
+    vec![Command::SetDue {
+        list,
+        task: id,
+        due,
+    }]
+}
+
+/// Shared teardown for the sites that drop the Weekly spread (`toggle_week`'s
+/// exit and `open_selection`): the lens, its pending notice, and the day cursor.
+/// The sidebar cursor is deliberately untouched — it names the pane to return to.
+fn leave_week(model: &mut Model) {
+    model.week = false;
+    model.week_pending = false;
+    model.week_day = None;
+    // Back to the current week, like the day cursor going back to home: `W`
+    // always opens on the week you are in, and `]` is one keystroke away. Left
+    // set, the spread would reopen on next week with only the panel title saying
+    // so.
+    model.week_offset = 0;
 }
 
 /// Shared teardown for the three sites that drop Search (`exit_search`,
@@ -3929,6 +4481,10 @@ fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Comm
     if command == OmniCommand::Refresh {
         return refresh(model);
     }
+    // Likewise argument-less, and the same lens `W` fires.
+    if command == OmniCommand::Week {
+        return toggle_week(model);
+    }
 
     let (_, arg) = split_command(query.trim());
     let Some(arg) = arg else {
@@ -3991,6 +4547,7 @@ fn run_command(model: &mut Model, command: OmniCommand, query: &str) -> Vec<Comm
         // match is exhaustive. It delegates rather than panicking, so the verb
         // still fires if that early return ever moves.
         OmniCommand::Refresh => return refresh(model),
+        OmniCommand::Week => return toggle_week(model),
     }
     Vec::new()
 }
@@ -4509,13 +5066,24 @@ fn toggle_complete(model: &mut Model) -> Vec<Command> {
     let snapshot = model.tasks[index].clone();
     // Completing iff open.
     let completed = model.tasks[index].status == Status::NeedsAction;
-    // Completing a Task while completed are hidden drops it from view, so the
+    // Completing a Task that the pane then hides drops it from view, so the
     // cursor moves onto the next visible Task (the Google-app behaviour). Take
     // that successor *before* the status changes: completing empties the Task's
     // group key, which sinks it to the undated tail, and scanning from there
     // would anchor on the row before its new position instead of the next one
     // by due date.
-    let hides_it = completed && !model.show_completed;
+    //
+    // Asked of `is_visible` on the row as it *will* be, rather than read off
+    // `show_completed` — that flag is only one of the filters, and the Weekly
+    // spread is exempt from it (`completed_visible`). There the answer differs
+    // per row and no single flag can stand in for it: a **scheduled** row keeps
+    // its cell and its `✕`, so the cursor must stay on it or the next `Space`
+    // would act on a neighbour — re-dating it, if that neighbour sits on another
+    // day. An **undated pool** row genuinely does leave, because `within_week`'s
+    // pool half admits only `needsAction`. One predicate, one answer.
+    let mut after = model.tasks[index].clone();
+    set_completed(&mut after, completed);
+    let hides_it = !model.is_visible(&after);
     let successor = hides_it.then(|| display_successor(model, &id)).flatten();
 
     set_completed(&mut model.tasks[index], completed);
@@ -4621,6 +5189,15 @@ fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
     if model.selected == before {
         return Vec::new();
     }
+    // The Weekly spread does *not* leave on a sidebar move, unlike Search: its
+    // cursor names the pool List, so moving it re-scopes UNSCHEDULED rather than
+    // choosing a different pane. No fetch either — the corpus already spans every
+    // List — only the cursor re-anchored, since the rows `within_week` admits have
+    // just changed. Above `open_selection`, which is the leave-the-pane path.
+    if model.week_active() {
+        reselect_visible(model);
+        return Vec::new();
+    }
     // Below the no-movement early return, so a clamped `j`/`k` at the sidebar's
     // edges is inert in Search rather than silently dropping the corpus. A genuine
     // move is the "open the List instead" gesture, so it leaves Search — here, not
@@ -4645,5 +5222,11 @@ fn move_list_selection(model: &mut Model, delta: isize) -> Vec<Command> {
 /// cursor that may not have moved.
 fn open_selection(model: &mut Model) -> Vec<Command> {
     leave_search(model);
+    // Leaves the spread for the same reason it leaves Search: this is the tail of
+    // *naming a pane*. The sidebar's own `j`/`k` never reaches here while the
+    // spread is up — `move_list_selection` re-scopes the pool and returns first —
+    // so what remains is the Omnibox's JUMP, which is a deliberate choice of
+    // where to land.
+    leave_week(model);
     request_selected(model, true)
 }

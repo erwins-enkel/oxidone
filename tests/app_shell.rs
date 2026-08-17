@@ -220,8 +220,9 @@ fn key_ev(code: KeyCode) -> KeyEvent {
 // inline) and `tests/legend_render.rs`.
 
 /// Every context, so a new one can't skip the guards below.
-const CONTEXTS: [LegendContext; 11] = [
+const CONTEXTS: [LegendContext; 12] = [
     LegendContext::Tasks,
+    LegendContext::Week,
     LegendContext::Sidebar,
     LegendContext::TextInput,
     LegendContext::DueInput,
@@ -260,6 +261,7 @@ fn contexts_covers_every_legend_context() {
     for context in CONTEXTS {
         match context {
             LegendContext::Tasks
+            | LegendContext::Week
             | LegendContext::Sidebar
             | LegendContext::TextInput
             | LegendContext::DueInput

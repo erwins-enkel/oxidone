@@ -331,38 +331,22 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                 }
             }
             Command::LoadSearch { lists } => {
-                // Instant paint of the whole cached corpus, then — online — the
-                // fan-out for fresh data. Offline the cache read *is* the final
-                // answer, so it is sent `live: true` and the pending notice never
-                // sticks; online the cache paint is `live: false` and the fan-out
-                // reply below clears the notice.
-                let live = api.is_none();
-                let cached = sync::all_from_cache(&cache.lock().unwrap());
-                let _ = tx.send(match cached {
-                    Ok(tasks) => Message::SearchLoaded {
+                load_corpus(api, cache, tx, lists, "search", |tasks, failed, live| {
+                    Message::SearchLoaded {
                         tasks,
-                        failed: Vec::new(),
+                        failed,
                         live,
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to read search corpus from cache");
-                        Message::LoadFailed(format!("failed to read search: {e}"))
                     }
-                });
-                if let Some(api) = api {
-                    spawn_fanout(
-                        api.clone(),
-                        cache.clone(),
-                        tx.clone(),
-                        lists,
-                        sync::Aggregate::All,
-                        |tasks, failed| Message::SearchLoaded {
-                            tasks,
-                            failed,
-                            live: true,
-                        },
-                    );
-                }
+                })
+            }
+            Command::LoadWeek { lists } => {
+                load_corpus(api, cache, tx, lists, "week", |tasks, failed, live| {
+                    Message::WeekLoaded {
+                        tasks,
+                        failed,
+                        live,
+                    }
+                })
             }
             Command::SetCompleted {
                 list,
@@ -1020,6 +1004,42 @@ fn spawn_load_tasks(
     });
 }
 
+/// Load a whole-corpus pane — Search's and the Weekly spread's, which read the
+/// same every-List corpus and differ only in the `Message` they answer with.
+///
+/// Instant paint from the cache, then — online — the fan-out for fresh data.
+/// Offline the cache read *is* the final answer, so it is sent `live: true` and
+/// the pending notice never sticks; online the cache paint is `live: false` and
+/// the fan-out reply clears the notice.
+fn load_corpus(
+    api: &Api,
+    cache: &SharedCache,
+    tx: &UnboundedSender<Message>,
+    lists: Vec<List>,
+    what: &'static str,
+    to_message: impl Fn(Vec<Task>, Vec<ListId>, bool) -> Message + Copy + Send + 'static,
+) {
+    let live = api.is_none();
+    let cached = sync::all_from_cache(&cache.lock().unwrap());
+    let _ = tx.send(match cached {
+        Ok(tasks) => to_message(tasks, Vec::new(), live),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read {what} corpus from cache");
+            Message::LoadFailed(format!("failed to read {what}: {e}"))
+        }
+    });
+    if let Some(api) = api {
+        spawn_fanout(
+            api.clone(),
+            cache.clone(),
+            tx.clone(),
+            lists,
+            sync::Aggregate::All,
+            move |tasks, failed| to_message(tasks, failed, true),
+        );
+    }
+}
+
 /// Load the **Today** aggregate live: a concurrent per-List fan-out (fetch-only,
 /// no cache lock across the await), then a single sequential mirror pass under one
 /// cache lock, then the `due <= today` aggregate read back. Reports the aggregate
@@ -1030,7 +1050,8 @@ fn spawn_load_tasks(
 /// `sync::mirror_and_aggregate` — the spawn-free core, covered by
 /// `tests/search_boundary.rs` — which mirrors, attributes failures, and reads the
 /// requested `aggregate` back. `to_message` wraps that `(tasks, failed)` in the
-/// pane's own `Message` (`TodayLoaded`, or `SearchLoaded { live: true }`).
+/// pane's own `Message` (`TodayLoaded`, or `SearchLoaded`/`WeekLoaded` with
+/// `live: true`).
 ///
 /// Keeping the `tokio::spawn`/`JoinSet` glue here honours the "all spawns in
 /// `main.rs`" convention; it is branch-free but for logging a worker-join panic.

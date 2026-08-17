@@ -1122,8 +1122,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     let flat = model.flat_pane();
     let spread = model.today_active();
     // The Weekly spread: a grid of day columns instead of a due gutter, and the
-    // pane's own header rows. Mutually exclusive with `spread` — `today_active()`
-    // is gated on `!week` — so the two never interleave their headers.
+    // pane's own header rows. Mutually exclusive with `spread` because the sidebar
+    // row decides the lens (`app::select`): the lens is up only on the Week row or
+    // on a List, never on Today, so the two never interleave their headers.
     let week = model.week_active();
     let week_start = model.week_start();
     // The day cursor, drawn only on the selected row: the cursor is a (row, day)

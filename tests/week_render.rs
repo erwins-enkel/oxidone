@@ -64,7 +64,8 @@ fn open(title: &str, list: &str, due: Option<NaiveDate>) -> Task {
 }
 
 /// A Model in the spread, clock fixed to `today()`, corpus handed in as
-/// `WeekLoaded` would deliver it. Sits on the first List, so that is the pool.
+/// `WeekLoaded` would deliver it. Sits on the first List, so that is both the pool
+/// and the scope.
 fn week_model(lists: &[&str], tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
     m.now = Local

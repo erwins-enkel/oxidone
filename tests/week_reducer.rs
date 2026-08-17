@@ -68,7 +68,7 @@ fn at(id: &str, list: &str, due: Option<NaiveDate>, position: &str) -> Task {
 }
 
 /// A Model with `lists` known and the whole corpus loaded, sitting on List `w`
-/// (so the pool is `w`) with the task pane focused. The spread is **not** open;
+/// (so that is both the pool and the scope) with the task pane focused. The spread is **not** open;
 /// each test presses `W` itself, so what the key does is part of the assertion.
 fn model(lists: &[&str], tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
@@ -102,8 +102,8 @@ fn in_week(lists: &[&str], tasks: Vec<Task>) -> Model {
 }
 
 /// A Model already in the spread on the pinned **Week** row — the week across
-/// every List — reached the way a user reaches it, by `W` from Today. The pool's
-/// List is `default_list`, which no row on that row can name.
+/// every List — reached the way a user reaches it, by `W` from Today. That row names
+/// no List, so the pool draws from `default_list`.
 fn in_week_row(lists: &[&str], tasks: Vec<Task>) -> Model {
     let mut m = model(lists, tasks);
     m.default_list = Some(ListId(lists[0].into()));
@@ -150,8 +150,9 @@ fn due_of(m: &Model, title: &str) -> Option<NaiveDate> {
 // --- Entering, and the Today interaction ----------------------------------
 
 /// `Model::new` opens on Today, so the very first `W` a user can press is from
-/// there. Without `today_active()`'s `!week` gate both lenses would be live:
-/// `within_today` would drop the whole undated pool *and* every row due after
+/// there. It lands on the pinned Week row, which is what disarms Today's rules —
+/// the row decides the lens, and Today is not the row any more. Were both lenses
+/// live, `within_today` would drop the whole undated pool *and* every row due after
 /// today, and the pane would still be claimed by the journal spread.
 #[test]
 fn w_from_the_opening_state_shows_the_pool_and_the_whole_week() {
@@ -184,8 +185,8 @@ fn w_from_the_opening_state_shows_the_pool_and_the_whole_week() {
     assert_eq!(visible(&m), ["pool", "monday", "friday"]);
 }
 
-/// Entering leaves the sidebar cursor alone — that is what lets it keep naming
-/// the pool List — and leaving returns to whatever pane it still names.
+/// On a List, `W` leaves the sidebar cursor alone — that is what lets the row keep
+/// naming the List it scopes — and leaving returns to that List's own pane.
 #[test]
 fn the_lens_toggles_without_moving_the_sidebar_cursor() {
     let mut m = in_week(&["w", "h"], vec![open("a", "w", None)]);
@@ -909,10 +910,10 @@ fn a_list_set_refresh_keeps_the_filter_in_the_spread() {
 
 // --- Refusals -------------------------------------------------------------
 
-/// Each of these guards tested `today_active()`, which the `!week` gate now
-/// answers `false` for — so each is asserted with a **cross-List** row selected
-/// as well as a pool one. That is the bug being closed: the guard passing while
-/// `selected_list_id()` still named the parked pool List.
+/// Each of these guards tested `today_active()`, which answers `false` in the
+/// spread because the spread is never on the Today row — so each is asserted with a
+/// **cross-List** row selected as well as a pool one. That is the bug being closed:
+/// the guard passing while `selected_list_id()` still named the cursor's List.
 #[test]
 fn the_pane_refuses_every_per_list_verb_on_a_cross_list_row() {
     for row in ["pool", "foreign"] {

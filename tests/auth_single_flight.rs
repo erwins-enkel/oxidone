@@ -77,15 +77,37 @@ impl TokenProvider for AbandonedFlow {
     }
 }
 
-/// Presents a URL and then fails outright.
+/// Presents a URL, takes `delay` over it, and then fails — the shape of a real
+/// flow that ends badly, which is never instant: the browser has to open, the user
+/// has to act or refuse, and the code exchange has to come back. `delay` is what
+/// lets other callers queue up behind it, as they do in the app.
+#[derive(Clone)]
 struct FailedFlow {
     prompt: Arc<ConsentPrompt>,
+    calls: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl FailedFlow {
+    fn new(prompt: &Arc<ConsentPrompt>, delay: Duration) -> Self {
+        Self {
+            prompt: Arc::clone(prompt),
+            calls: Arc::new(AtomicUsize::new(0)),
+            delay,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait]
 impl TokenProvider for FailedFlow {
     async fn bearer(&self) -> Result<String, ApiError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
         self.prompt.present(CONSENT_URL);
+        tokio::time::sleep(self.delay).await;
         Err(ApiError::Network("no route".to_string()))
     }
 }
@@ -249,13 +271,7 @@ async fn an_abandoned_flow_times_out_and_releases_the_gate() {
 #[tokio::test]
 async fn a_failed_acquisition_reports_its_reason() {
     let (prompt, log) = recording_prompt();
-    let guard = SingleFlight::new(
-        FailedFlow {
-            prompt: Arc::clone(&prompt),
-        },
-        prompt,
-        PATIENT,
-    );
+    let guard = SingleFlight::new(FailedFlow::new(&prompt, Duration::ZERO), prompt, PATIENT);
 
     assert!(matches!(guard.bearer().await, Err(ApiError::Network(_))));
 
@@ -309,4 +325,95 @@ async fn a_presented_prompt_is_dismissed_exactly_once() {
         events(&log),
         vec![format!("present {CONSENT_URL}"), "dismiss".to_string()]
     );
+}
+
+/// Serializing alone would only slow the flood down. Eight callers racing a cache
+/// that fails *every* read — a corrupt `token.json` — must produce one consent URL
+/// between them, not one each in turn: the reported doubled prompt arriving single
+/// file, eight browser windows, and every caller waiting out eight timeouts.
+#[tokio::test]
+async fn a_failure_is_shared_with_the_callers_queued_behind_it() {
+    let (prompt, log) = recording_prompt();
+    let inner = FailedFlow::new(&prompt, Duration::from_millis(20));
+    let guard = Arc::new(SingleFlight::new(inner.clone(), prompt, PATIENT));
+
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let guard = Arc::clone(&guard);
+            tokio::spawn(async move { guard.bearer().await })
+        })
+        .collect();
+    for call in calls {
+        let outcome = call.await.expect("join");
+        assert!(
+            matches!(outcome, Err(ApiError::Network(_))),
+            "every caller must learn the flow failed, got {outcome:?}"
+        );
+    }
+
+    assert_eq!(inner.calls(), 1, "the failed flow was repeated");
+    assert_eq!(
+        events(&log),
+        vec![
+            format!("present {CONSENT_URL}"),
+            "dismiss authorization failed: network error: no route".to_string(),
+        ],
+        "one consent URL between them, retracted once"
+    );
+}
+
+/// The same for a timeout, which is the expensive case: eight callers must wait out
+/// *one* `CONSENT_TIMEOUT` between them, not one each.
+#[tokio::test]
+async fn a_timeout_is_shared_with_the_callers_queued_behind_it() {
+    let (prompt, log) = recording_prompt();
+    let guard = Arc::new(SingleFlight::new(
+        AbandonedFlow {
+            prompt: Arc::clone(&prompt),
+        },
+        prompt,
+        IMPATIENT,
+    ));
+
+    let started = tokio::time::Instant::now();
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let guard = Arc::clone(&guard);
+            tokio::spawn(async move { guard.bearer().await })
+        })
+        .collect();
+    for call in calls {
+        assert!(matches!(
+            call.await.expect("join"),
+            Err(ApiError::AuthExpired)
+        ));
+    }
+
+    assert!(
+        started.elapsed() < IMPATIENT * 4,
+        "eight callers waited {:?}, which is more than one timeout's worth",
+        started.elapsed()
+    );
+    assert_eq!(events(&log).len(), 2, "{:?}", events(&log));
+}
+
+/// A failure is shared with the callers it happened *to*, and nobody else: a call
+/// made afterwards tries again. Otherwise one timeout would latch the session out
+/// of ever authorizing, and the in-TUI prompt could never be answered.
+#[tokio::test]
+async fn a_failure_does_not_latch_the_guard_shut() {
+    let (prompt, log) = recording_prompt();
+    let inner = FailedFlow::new(&prompt, Duration::ZERO);
+    let guard = SingleFlight::new(inner.clone(), prompt, PATIENT);
+
+    assert!(matches!(guard.bearer().await, Err(ApiError::Network(_))));
+    // Sequential, so this one was never queued behind the failure above.
+    assert!(matches!(guard.bearer().await, Err(ApiError::Network(_))));
+
+    assert_eq!(
+        inner.calls(),
+        2,
+        "the second attempt never reached the flow"
+    );
+    assert_eq!(events(&log).len(), 4, "{:?}", events(&log));
 }

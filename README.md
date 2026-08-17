@@ -116,8 +116,10 @@ control of your credentials. It's a one-time, ~10-minute setup.
 
 If that grant later goes stale — you revoke it, or it expires with no refresh token —
 oxidone re-authorizes from inside the TUI: a panel shows the consent URL and your
-browser opens on it. Leave it unanswered for three minutes and oxidone gives up and
-carries on from the cache, so a walked-away-from prompt never wedges the app.
+browser opens on it. One panel and one browser window, however many background reads
+were waiting on a token. Leave it unanswered for three minutes and oxidone gives up
+and carries on from the cache — all of them, together — so a walked-away-from prompt
+never wedges the app. Whatever asks for a token next prompts again.
 
 ## Configuration
 

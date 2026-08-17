@@ -49,9 +49,9 @@ A **date, never a time**. Google's API discards the time portion, so oxidone nev
 _Avoid_: deadline, due time, due-at.
 
 **Today**:
-The pinned, cross-List view of what is due — the sidebar's first row, always selectable, never a real List. Membership is `due <= today` (`domain::due_on_or_before`, the one definition, shared by the cache aggregate and the view filter); an **undated** entry is therefore never in it. A Completed row shows only if it was completed today, so the pane answers "among what was due, what got done". Flat and read-only in ordering terms: no Subtask nesting, no Manual lens (`position` is per-List, so a cross-List hand order is undefined), and a Manual lens carried in from a List is normalised to Due on entry. Renders as a **Journal spread**.
+The pinned, cross-List view of what is due — the first of the sidebar's two pinned rows (the **Weekly spread** is the second), always selectable, never a real List. Membership is `due <= today` (`domain::due_on_or_before`, the one definition, shared by the cache aggregate and the view filter); an **undated** entry is therefore never in it. A Completed row shows only if it was completed today, so the pane answers "among what was due, what got done". Flat and read-only in ordering terms: no Subtask nesting, no Manual lens (`position` is per-List, so a cross-List hand order is undefined), and a Manual lens carried in from a List is normalised to Due on entry. Renders as a **Journal spread**.
 
-Answers *what am I doing now*; the **Weekly spread** answers *what am I doing this week, and on which day*. The two never coexist — the spread's lens gates Today's rules off — and both read the same due date.
+Answers *what am I doing now*; the **Weekly spread** answers *what am I doing this week, and on which day*. The two never coexist — each has its own sidebar row, and landing on Today takes the spread down — and both read the same due date.
 _Avoid_: today list, agenda, inbox, dashboard.
 
 ### Ordering
@@ -135,12 +135,18 @@ The due gutter exists here on exactly the Overdue group's condition, so the two 
 _Avoid_: section, bucket, page, agenda.
 
 **Weekly spread**:
-The planning surface `W` opens: a **Day grid** of Monday–Friday columns beside the rows, in which a **Dot** marks the day an entry is planned for. Toggled with `W` (`w` is the distant filter) or `:week`, and — like **Search** — a lens *orthogonal* to the sidebar cursor rather than a pane the cursor moves to. That is what lets the cursor keep naming the **Unscheduled pool**'s List while the spread is up.
+The planning surface: a **Day grid** of Monday–Friday columns beside the rows, in which a **Dot** marks the day an entry is planned for. Opened with `W` (`w` is the distant filter), by moving the sidebar cursor to the **Week row**, or from the **Omnibox** — whose JUMP band offers that row beside Today while `:week` fires `W`.
 
-Two blocks, and two scoping rules: **Unscheduled** is the selected List's undated entries that are still `needsAction`, **Week** is every List's entries dated within the five days on display. Nothing else is in it — an entry dated Saturday, Sunday or before Monday is simply absent, since there is no column to draw it in and overdue is **Today**'s work. Flat, like Today, and its order is fixed (pool in Manual order, then by day), so the Sort lens is refused rather than silently ignored.
+Two blocks: **Unscheduled** is the undated entries still `needsAction`, **Week** is those dated within the five days on display. Nothing else is in it — an entry dated Saturday, Sunday or before Monday is simply absent, since there is no column to draw it in and overdue is **Today**'s work. Flat, like Today, and its order is fixed (pool in Manual order, then by day), so the Sort lens is refused rather than silently ignored.
 
-Reads *every* List, so it takes the same whole-corpus load Search does — and the same pending notice, because an incomplete corpus must never read as a week with nothing planned.
+The sidebar row is what **scopes** it, and the row is likewise the source of truth for whether the spread is up at all — so the highlighted row always names what the task pane shows. On a List, both blocks are that List's. On the pinned **Week row** the Week block spans every List, while the pool stays the one `default_list` names: the pool is where `a` captures, and it needs one unambiguous target. Landing on **Today** takes the spread down, Today being a pane of its own; walking between Lists re-scopes it and stays in it. `W` follows from that: on a List it flips the lens without moving the cursor, and on either pinned row it walks between the two.
+
+Reads *every* List whatever its scope — scoping is a filter, not a narrower fetch, so walking between Lists costs nothing — which is why it takes the same whole-corpus load Search does, and the same pending notice: an incomplete corpus must never read as a week with nothing planned.
 _Avoid_: week view, planner, calendar, agenda, board.
+
+**Week row**:
+The second of the sidebar's two pinned rows, below **Today** and above the Lists. A cursor stop like Today, and the one place the **Weekly spread** spans every List. Lit in the accent whenever the spread is up — including a List-scoped week, whose cursor sits on the List rather than here — which is independent of the cursor highlight the row carries when the cursor is on it.
+_Avoid_: week tab, week entry, all-lists week.
 
 **Day grid**:
 The five fixed-width cells trailing each row of the **Weekly spread**, one per weekday, under a `Mo Tu We Th Fr` header. Its width is reserved unconditionally — a narrow pane clips the title, never the columns, because the grid *is* the view. Today's column is accented, and only while the week on screen contains today.
@@ -155,7 +161,7 @@ One per row, which falls out of the model rather than being enforced: a Task has
 _Avoid_: mark, bullet (that is the **Signifier**'s family), pin, flag.
 
 **Unscheduled pool**:
-The **Weekly spread**'s first block: the undated, still-`needsAction` entries of the List the sidebar cursor names — the week's brain-dump, and where `a` captures to. The status clause bounds it: unlike the Week block, whose `✕` rows are bounded by five days, the pool has no window to age old completions out of.
+The **Weekly spread**'s first block: the undated, still-`needsAction` entries of the List the sidebar cursor names, or of `default_list` on either pinned row — the week's brain-dump, and where `a` captures to. Single-List even on the **Week row**, where the Week block is not: a capture surface needs one target. The status clause bounds it: unlike the Week block, whose `✕` rows are bounded by five days, the pool has no window to age old completions out of.
 _Avoid_: backlog, inbox, staging, unplanned.
 
 **Day cursor**:
@@ -166,9 +172,9 @@ _Avoid_: selection, caret (that is the text inputs'), cell cursor.
 
 **Omnibox**:
 The modal surface `p` opens: one query over a grouped result list, offering the
-Lists to **jump** to, the **commands** (keyless, bar `:refresh` and `:week`,
-which `r` and `W` also fire), a hand-off to **Search**, and — pinned last —
-**capturing** the query as
+two pinned rows and the Lists to **jump** to, the **commands** (keyless, bar
+`:refresh` and `:week`, which `r` and `W` also fire), a hand-off to **Search**,
+and — pinned last — **capturing** the query as
 a Task. `Enter` runs whichever row is highlighted, so what it will do is legible
 before it is pressed, and a write is never what happens by default.
 

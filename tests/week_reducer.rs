@@ -68,7 +68,7 @@ fn at(id: &str, list: &str, due: Option<NaiveDate>, position: &str) -> Task {
 }
 
 /// A Model with `lists` known and the whole corpus loaded, sitting on List `w`
-/// (so the pool is `w`) with the task pane focused. The spread is **not** open;
+/// (so that is both the pool and the scope) with the task pane focused. The spread is **not** open;
 /// each test presses `W` itself, so what the key does is part of the assertion.
 fn model(lists: &[&str], tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
@@ -89,6 +89,28 @@ fn in_week(lists: &[&str], tasks: Vec<Task>) -> Model {
     update(&mut m, press('W'));
     // `W` clears the pane and asks for a load; hand the corpus straight back, as
     // `LoadWeek`'s reply would.
+    update(
+        &mut m,
+        Message::WeekLoaded {
+            tasks: corpus,
+            failed: Vec::new(),
+            live: true,
+        },
+    );
+    m.focus = Focus::Tasks;
+    m
+}
+
+/// A Model already in the spread on the pinned **Week** row — the week across
+/// every List — reached the way a user reaches it, by `W` from Today. That row names
+/// no List, so the pool draws from `default_list`.
+fn in_week_row(lists: &[&str], tasks: Vec<Task>) -> Model {
+    let mut m = model(lists, tasks);
+    m.default_list = Some(ListId(lists[0].into()));
+    m.selected = Selection::Today;
+    let corpus = m.tasks.clone();
+    update(&mut m, press('W'));
+    assert_eq!(m.selected, Selection::Week, "`W` on Today lands on the row");
     update(
         &mut m,
         Message::WeekLoaded {
@@ -128,8 +150,9 @@ fn due_of(m: &Model, title: &str) -> Option<NaiveDate> {
 // --- Entering, and the Today interaction ----------------------------------
 
 /// `Model::new` opens on Today, so the very first `W` a user can press is from
-/// there. Without `today_active()`'s `!week` gate both lenses would be live:
-/// `within_today` would drop the whole undated pool *and* every row due after
+/// there. It lands on the pinned Week row, which is what disarms Today's rules —
+/// the row decides the lens, and Today is not the row any more. Were both lenses
+/// live, `within_today` would drop the whole undated pool *and* every row due after
 /// today, and the pane would still be claimed by the journal spread.
 #[test]
 fn w_from_the_opening_state_shows_the_pool_and_the_whole_week() {
@@ -162,8 +185,8 @@ fn w_from_the_opening_state_shows_the_pool_and_the_whole_week() {
     assert_eq!(visible(&m), ["pool", "monday", "friday"]);
 }
 
-/// Entering leaves the sidebar cursor alone — that is what lets it keep naming
-/// the pool List — and leaving returns to whatever pane it still names.
+/// On a List, `W` leaves the sidebar cursor alone — that is what lets the row keep
+/// naming the List it scopes — and leaving returns to that List's own pane.
 #[test]
 fn the_lens_toggles_without_moving_the_sidebar_cursor() {
     let mut m = in_week(&["w", "h"], vec![open("a", "w", None)]);
@@ -214,9 +237,10 @@ fn the_pending_notice_survives_the_cache_paint_and_clears_on_the_live_reply() {
 
 // --- Membership -----------------------------------------------------------
 
-/// The pool is one List's undated rows; the scheduled half spans every List.
+/// On a List, **both** halves are that List's: its undated rows in the pool, its
+/// dated ones in the week. A foreign List's in-window row is simply not here.
 #[test]
-fn the_pool_is_one_list_and_the_week_is_all_of_them() {
+fn on_a_list_both_halves_are_that_list() {
     let m = in_week(
         &["w", "h"],
         vec![
@@ -226,7 +250,133 @@ fn the_pool_is_one_list_and_the_week_is_all_of_them() {
             open("week-h", "h", day(2)),
         ],
     );
+    assert_eq!(visible(&m), ["pool-w", "week-w"]);
+}
+
+/// On the pinned Week row the scheduled half spans every List. The pool does not
+/// follow it — it stays the one List `default_list` names, because `a` captures
+/// there and needs an unambiguous target.
+#[test]
+fn on_the_week_row_the_week_spans_every_list() {
+    let m = in_week_row(
+        &["w", "h"],
+        vec![
+            open("pool-w", "w", None),
+            open("pool-h", "h", None),
+            open("week-w", "w", day(1)),
+            open("week-h", "h", day(2)),
+        ],
+    );
     assert_eq!(visible(&m), ["pool-w", "week-w", "week-h"]);
+}
+
+// --- The pinned Week row ---------------------------------------------------
+
+/// The Week row is a cursor stop: `k` off the first List reaches it, and landing
+/// there opens the week across every List. The entry work comes with it — the
+/// corpus asked for, the notice armed, the List's own rows dropped — or the spread
+/// would draw over the pane it came from and read as a week with nothing planned.
+#[test]
+fn the_sidebar_cursor_reaches_the_week_row_and_opens_it() {
+    let mut m = model(&["w", "h"], vec![open("a", "w", None)]);
+    m.selected_task = Some(0);
+    m.focus = Focus::Sidebar;
+
+    let commands = update(&mut m, press('k'));
+
+    assert_eq!(m.selected, Selection::Week);
+    assert!(m.week_active());
+    assert_eq!(m.week_scope(), None, "the row means every List");
+    assert!(m.week_pending, "an incomplete corpus must say so");
+    assert!(m.tasks.is_empty(), "the pane it came from is dropped");
+    assert_eq!(m.selected_task, None);
+    assert!(matches!(commands.as_slice(), [Command::LoadWeek { .. }]));
+    assert_eq!(m.focus, Focus::Sidebar, "a cursor step keeps the sidebar");
+}
+
+/// One more `k` reaches Today, which is a pane of its own rather than a scope: the
+/// lens comes down with the move and Today's aggregate is what loads.
+#[test]
+fn moving_from_the_week_row_to_today_leaves_the_spread() {
+    let mut m = in_week_row(&["w"], vec![open("a", "w", day(1))]);
+    m.focus = Focus::Sidebar;
+
+    let commands = update(&mut m, press('k'));
+
+    assert_eq!(m.selected, Selection::Today);
+    assert!(!m.week_active(), "Today is a pane, not a scope");
+    assert!(!m.week_pending, "and takes the pending notice with it");
+    assert!(matches!(commands.as_slice(), [Command::LoadToday { .. }]));
+}
+
+/// `j` off the Week row onto a List keeps the spread and scopes it to that List —
+/// one continuous planning surface. No fetch: the corpus already spans every List,
+/// so only the filter moved.
+#[test]
+fn moving_from_the_week_row_to_a_list_scopes_the_spread() {
+    let mut m = in_week_row(
+        &["w", "h"],
+        vec![open("week-w", "w", day(1)), open("week-h", "h", day(2))],
+    );
+    m.focus = Focus::Sidebar;
+    assert_eq!(visible(&m), ["week-w", "week-h"]);
+
+    let commands = update(&mut m, press('j'));
+
+    assert!(m.week_active(), "the spread persists across the move");
+    assert_eq!(m.selected, Selection::List(0));
+    assert_eq!(m.week_scope(), Some(&ListId("w".into())));
+    assert!(
+        commands.is_empty(),
+        "a scope change is a filter, not a fetch"
+    );
+    assert_eq!(visible(&m), ["week-w"]);
+}
+
+/// A re-scope is not a pane change, so the `/` filter narrowing the spread
+/// survives the move — the same promise `r` keeps in it.
+#[test]
+fn a_sidebar_move_inside_the_spread_keeps_the_filter() {
+    let mut m = in_week_row(
+        &["w", "h"],
+        vec![open("ship", "w", day(1)), open("other", "w", day(2))],
+    );
+    m.filter = Some("ship".to_string());
+    m.focus = Focus::Sidebar;
+    assert_eq!(visible(&m), ["ship"]);
+
+    update(&mut m, press('j'));
+
+    assert!(m.week_active(), "still the spread");
+    assert_eq!(m.filter.as_deref(), Some("ship"), "and still narrowed");
+    assert_eq!(visible(&m), ["ship"]);
+}
+
+/// `W` walks between the two pinned rows: from the Week row it goes back to Today.
+#[test]
+fn w_on_the_week_row_jumps_back_to_today() {
+    let mut m = in_week_row(&["w"], vec![open("a", "w", day(1))]);
+
+    let commands = update(&mut m, press('W'));
+
+    assert_eq!(m.selected, Selection::Today);
+    assert!(!m.week_active());
+    assert!(matches!(commands.as_slice(), [Command::LoadToday { .. }]));
+}
+
+/// A List-set replacement leaves the pinned Week row where it is: it is not a
+/// List, so nothing about the new set can invalidate it — and the spread stands.
+#[test]
+fn a_lists_reload_keeps_the_week_row() {
+    let mut m = in_week_row(&["w", "h"], vec![open("a", "w", day(1))]);
+
+    let commands = update(&mut m, Message::ListsLoaded(vec![list("h")]));
+
+    assert_eq!(m.selected, Selection::Week);
+    assert!(m.week_active(), "and the spread with it");
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, Command::LoadWeek { .. })));
 }
 
 /// Moving the sidebar cursor re-scopes the pool **without** leaving the spread,
@@ -503,17 +653,17 @@ fn the_digits_assign_a_day_and_zero_unschedules() {
 }
 
 /// `0` on a row from a List that is **not** the pool's takes it out of the spread
-/// altogether — the week half is cross-List, the pool half is one List, so an
-/// undated foreign row is in neither. The write is legitimate and happens; what it
-/// must not do is happen silently, since `0` advertises "back to the pool" and this
-/// row went somewhere else.
+/// altogether — on the pinned Week row the scheduled half is cross-List while the
+/// pool half is one List, so an undated foreign row is in neither. The write is
+/// legitimate and happens; what it must not do is happen silently, since `0`
+/// advertises "back to the pool" and this row went somewhere else.
 ///
-/// The sibling of the Completed refusal, and the case a single-List fixture cannot
-/// reach: with one List the pool List *is* the row's List, so the row lands in the
-/// pool and nothing vanishes.
+/// The sibling of the Completed refusal, and the case neither a single-List fixture
+/// nor a List-scoped week can reach: there the pool List *is* the row's List, so
+/// the row lands in the pool and nothing vanishes.
 #[test]
 fn unscheduling_a_cross_list_row_reports_that_it_left_the_week() {
-    let mut m = in_week(&["w", "h"], vec![open("foreign", "h", day(1))]);
+    let mut m = in_week_row(&["w", "h"], vec![open("foreign", "h", day(1))]);
     select(&mut m, "foreign");
     assert_eq!(visible(&m), ["foreign"]);
 
@@ -600,11 +750,10 @@ fn the_week_pages_forward_and_back_without_a_fetch() {
     assert_eq!(visible(&m), ["this"]);
 }
 
-/// A JUMP names a pane, so it *leaves* the spread — unlike the sidebar's `j`/`k`,
-/// which re-scopes the pool in place. Jumping to Today while in the spread and
-/// landing on a week grid would answer a different question than the one asked.
+/// A JUMP obeys the same rule the cursor keys do, because both land on a row: a
+/// jump to another List re-scopes the spread rather than leaving it.
 #[test]
-fn an_omnibox_jump_leaves_the_spread() {
+fn an_omnibox_jump_to_a_list_rescopes_the_spread() {
     let mut m = in_week(&["w", "h"], vec![open("a", "w", None)]);
 
     update(&mut m, press('p'));
@@ -613,9 +762,49 @@ fn an_omnibox_jump_leaves_the_spread() {
     }
     update(&mut m, Message::Key(enter()));
 
-    assert!(!m.week_active(), "a jump names the pane to land in");
-    assert!(!m.week_pending, "and takes its pending notice with it");
+    assert!(m.week_active(), "the row landed on still means the spread");
     assert_eq!(m.selected, Selection::List(1));
+    assert_eq!(m.week_scope(), Some(&ListId("h".into())));
+}
+
+/// A JUMP to Today leaves the spread, for the reason a cursor move onto that row
+/// does: Today is its own pane, and landing on a week grid would answer a
+/// different question than the one asked.
+#[test]
+fn an_omnibox_jump_to_today_leaves_the_spread() {
+    let mut m = in_week(&["w", "h"], vec![open("a", "w", None)]);
+
+    update(&mut m, press('p'));
+    for c in "Today".chars() {
+        update(&mut m, press(c));
+    }
+    update(&mut m, Message::Key(enter()));
+
+    assert!(!m.week_active(), "Today is a pane, not a scope");
+    assert!(!m.week_pending, "and takes the pending notice with it");
+    assert_eq!(m.selected, Selection::Today);
+}
+
+/// A JUMP to the pinned Week row is a way *into* the spread, so it must carry the
+/// entry work: the corpus requested, the notice armed, and the pane it came from
+/// dropped. Without the clearing it would draw the week over a List's Tasks.
+#[test]
+fn an_omnibox_jump_to_the_week_row_loads_the_corpus() {
+    let mut m = model(&["w", "h"], vec![open("a", "w", None)]);
+    m.selected_task = Some(0);
+
+    update(&mut m, press('p'));
+    for c in "Week".chars() {
+        update(&mut m, press(c));
+    }
+    let commands = update(&mut m, Message::Key(enter()));
+
+    assert_eq!(m.selected, Selection::Week);
+    assert!(m.week_active());
+    assert!(m.week_pending, "an incomplete corpus must say so");
+    assert!(m.tasks.is_empty(), "the pane it came from is dropped");
+    assert_eq!(m.selected_task, None);
+    assert!(matches!(commands.as_slice(), [Command::LoadWeek { .. }]));
 }
 
 /// A failed corpus read must take the pending notice with it, or the pane
@@ -721,10 +910,10 @@ fn a_list_set_refresh_keeps_the_filter_in_the_spread() {
 
 // --- Refusals -------------------------------------------------------------
 
-/// Each of these guards tested `today_active()`, which the `!week` gate now
-/// answers `false` for — so each is asserted with a **cross-List** row selected
-/// as well as a pool one. That is the bug being closed: the guard passing while
-/// `selected_list_id()` still named the parked pool List.
+/// Each of these guards tested `today_active()`, which answers `false` in the
+/// spread because the spread is never on the Today row — so each is asserted with a
+/// **cross-List** row selected as well as a pool one. That is the bug being closed:
+/// the guard passing while `selected_list_id()` still named the cursor's List.
 #[test]
 fn the_pane_refuses_every_per_list_verb_on_a_cross_list_row() {
     for row in ["pool", "foreign"] {

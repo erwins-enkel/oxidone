@@ -218,7 +218,9 @@ fn entering_today_normalises_a_manual_lens_to_due() {
     m.selected = Selection::List(0);
     m.sort = SortView::Manual;
     m.focus = Focus::Sidebar;
-    update(&mut m, press('k')); // move the sidebar cursor up to the pinned Today row
+    // Up to the pinned Today row — two steps, past the pinned Week row between them.
+    update(&mut m, press('k'));
+    update(&mut m, press('k'));
     assert_eq!(m.selected, Selection::Today);
     assert_eq!(m.sort, SortView::Due);
 }

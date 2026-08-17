@@ -266,7 +266,8 @@ fn the_highlight_lands_on_the_intended_row_below_its_headers() {
 fn a_scrolled_popup_still_highlights_the_intended_row() {
     let titles: Vec<String> = (0..40).map(|i| format!("list{i:02}")).collect();
     let mut model = open_with(&titles.iter().map(String::as_str).collect::<Vec<_>>());
-    for _ in 0..39 {
+    // Two pinned rows (Today, Week) precede the Lists, so `list38` is 40 down.
+    for _ in 0..40 {
         update(&mut model, key(KeyCode::Down));
     }
 

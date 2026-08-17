@@ -77,6 +77,29 @@ fn in_week(tasks: Vec<Task>) -> Model {
     m
 }
 
+/// The same, on the pinned **Week** row: the week across every List, reached by
+/// `W` from Today the way a user reaches it.
+fn in_week_row(tasks: Vec<Task>) -> Model {
+    let mut m = Model::new();
+    m.now = Local
+        .with_ymd_and_hms(TODAY.0, TODAY.1, TODAY.2, 12, 0, 0)
+        .unwrap();
+    m.lists = vec![list("w"), list("h")];
+    m.selected = Selection::Today;
+    update(&mut m, press('W'));
+    assert_eq!(m.selected, Selection::Week, "`W` on Today lands on the row");
+    update(
+        &mut m,
+        Message::WeekLoaded {
+            tasks,
+            failed: Vec::new(),
+            live: true,
+        },
+    );
+    m.focus = Focus::Tasks;
+    m
+}
+
 fn select(m: &mut Model, id: &str) {
     let at = m
         .tasks
@@ -177,13 +200,14 @@ fn a_second_dot_while_a_write_is_in_flight_is_refused() {
 
 // --- `M`, and why `PaneKey::Week` exists -----------------------------------
 
-/// A **scheduled** row relocated to another List stays on screen: the week half
-/// of `within_week` spans every List, so its new home changes nothing about its
-/// membership. Without a `PaneKey::Week` arm the repair would not fire and the
-/// row — optimistically removed by `finish_move_to_list` — would silently vanish.
+/// On the pinned Week row, a **scheduled** row relocated to another List stays on
+/// screen: the week half of `within_week` spans every List there, so its new home
+/// changes nothing about its membership. Without a `PaneKey::Week` arm the repair
+/// would not fire and the row — optimistically removed by `finish_move_to_list` —
+/// would silently vanish.
 #[test]
 fn a_relocated_scheduled_row_is_bridged_back_and_reloads() {
-    let mut m = in_week(vec![task("ship", "w", day(2))]);
+    let mut m = in_week_row(vec![task("ship", "w", day(2))]);
     select(&mut m, "ship");
 
     update(&mut m, press('M'));
@@ -222,16 +246,17 @@ fn a_relocated_pool_row_leaves_the_spread() {
 }
 
 /// A failed `M` restores the row only into the pane it was removed from. After
-/// leaving the spread for the pool List's own pane, the snapshot must **not**
-/// match — which is exactly what a shared `PaneKey::List(pool)` identity would
-/// have got wrong, putting a corpus row into a single-List pane.
+/// leaving the spread for the scope List's own pane, the snapshot must **not**
+/// match — which is exactly what a shared `PaneKey::List(scope)` identity would
+/// have got wrong, putting a spread row back into a single-List pane that has since
+/// been reloaded from Google.
 #[test]
-fn a_failed_move_does_not_restore_into_the_pool_lists_own_pane() {
-    let mut m = in_week(vec![task("foreign", "h", day(1))]);
-    select(&mut m, "foreign");
+fn a_failed_move_does_not_restore_into_the_scope_lists_own_pane() {
+    let mut m = in_week(vec![task("ship", "w", day(1))]);
+    select(&mut m, "ship");
 
     update(&mut m, press('M'));
-    choose_list(&mut m, "w");
+    choose_list(&mut m, "h");
 
     // Leave the spread; `selected` still names List `w`, whose pane now loads.
     update(&mut m, press('W'));
@@ -244,7 +269,7 @@ fn a_failed_move_does_not_restore_into_the_pool_lists_own_pane() {
     update(
         &mut m,
         Message::MoveToListFailed {
-            task: TaskId("foreign".into()),
+            task: TaskId("ship".into()),
             reason: "nope".to_string(),
         },
     );
@@ -252,6 +277,6 @@ fn a_failed_move_does_not_restore_into_the_pool_lists_own_pane() {
     assert_eq!(
         m.tasks.iter().map(|t| t.id.0.clone()).collect::<Vec<_>>(),
         ["local"],
-        "no foreign row restored into List w's pane"
+        "no spread row restored into List w's pane"
     );
 }

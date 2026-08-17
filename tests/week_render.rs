@@ -64,7 +64,8 @@ fn open(title: &str, list: &str, due: Option<NaiveDate>) -> Task {
 }
 
 /// A Model in the spread, clock fixed to `today()`, corpus handed in as
-/// `WeekLoaded` would deliver it. Sits on the first List, so that is the pool.
+/// `WeekLoaded` would deliver it. Sits on the first List, so that is both the pool
+/// and the scope.
 fn week_model(lists: &[&str], tasks: Vec<Task>) -> Model {
     let mut m = Model::new();
     m.now = Local
@@ -116,6 +117,24 @@ fn pane_rows_at(model: &Model, width: u16, ascii: bool) -> Vec<String> {
 
 fn pane_rows(model: &Model) -> Vec<String> {
     pane_rows_at(model, WIDTH, false)
+}
+
+/// The sidebar's columns of every row — the complement of `pane_rows`, for the
+/// rows the sidebar draws and the cursor it carries.
+fn sidebar_rows(model: &Model) -> Vec<String> {
+    let buffer = buffer(model);
+    let split = WIDTH as usize * 30 / 100;
+    (0..HEIGHT)
+        .map(|y| row_text(&buffer, y, WIDTH).chars().take(split).collect())
+        .collect()
+}
+
+/// The sidebar row carrying `needle`.
+fn sidebar_row_with(model: &Model, needle: &str) -> String {
+    sidebar_rows(model)
+        .into_iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no sidebar row contains {needle:?}"))
 }
 
 /// The task-pane row carrying `needle`. Panics rather than returning `None`: a
@@ -289,13 +308,13 @@ fn the_week_header_names_its_days_and_follows_the_paging() {
     );
 }
 
-/// Fail closed: with no List selected and no default resolved there is no pool
+/// Fail closed: on the pinned Week row, with no default resolved, there is no pool
 /// to draw from, and the header must say so rather than let an absent block read
 /// as "nothing undated".
 #[test]
 fn an_unresolvable_pool_says_so_instead_of_drawing_nothing() {
     let mut model = week_model(&["w"], vec![open("ship", "w", day(0))]);
-    model.selected = Selection::Today;
+    model.selected = Selection::Week;
     model.default_list = None;
 
     let header = row_with(&model, "UNSCHEDULED");
@@ -404,14 +423,14 @@ fn the_pending_notice_does_not_leak_into_the_search_header() {
 /// block. The "no list selected" notice denies they exist, so it is keyed on
 /// there being no rows either.
 ///
-/// The fixture is the only shape that reaches it: `default_list` naming a List
-/// absent from `lists`, with the pool rows in that same List — so
-/// `week_pool_list()` answers `Some`, `within_week` admits them, and the title
-/// lookup still comes back empty.
+/// The fixture is the only shape that reaches it: the pinned Week row, with
+/// `default_list` naming a List absent from `lists` and the pool rows in that same
+/// List — so `week_pool_list()` answers `Some`, `within_week` admits them, and the
+/// title lookup still comes back empty.
 #[test]
 fn pool_rows_are_never_headed_by_the_no_pool_notice() {
     let mut model = week_model(&["w"], vec![open("jot", "ghost", None)]);
-    model.selected = Selection::Today;
+    model.selected = Selection::Week;
     model.default_list = Some(ListId("ghost".into()));
 
     let rows = pane_rows(&model);
@@ -452,12 +471,70 @@ fn the_spread_pins_the_help_cell_like_every_other_pane() {
     assert!(legend.contains("plan/done"), "{legend:?}");
 }
 
-/// The panel names the pane, since the sidebar cursor stays parked on a List and
-/// cannot say it. No Sort label: the spread has one fixed order.
+/// The panel names the pane and the week it shows. No Sort label: the spread has
+/// one fixed order.
 #[test]
 fn the_panel_title_names_the_spread_and_its_week() {
     let model = week_model(&["w"], vec![open("ship", "w", day(0))]);
     let title = row_with(&model, "WEEKLY SPREAD");
     assert!(title.contains("week 34"), "{title:?}");
     assert!(!title.contains("due"), "no sort lens is named: {title:?}");
+}
+
+/// And it names the **scope**, because the scope is a filter that can empty the
+/// pane: a List by title, the pinned Week row as every List.
+#[test]
+fn the_panel_title_names_the_scope() {
+    let mut model = week_model(&["w", "h"], vec![open("ship", "w", day(0))]);
+    let scoped = row_with(&model, "WEEKLY SPREAD");
+    assert!(scoped.contains("— W"), "the List's own title: {scoped:?}");
+
+    model.selected = Selection::Week;
+    let every = row_with(&model, "WEEKLY SPREAD");
+    assert!(every.contains("all lists"), "{every:?}");
+}
+
+// --- The sidebar's Week row ------------------------------------------------
+
+/// The Week row is a cursor stop, so the cursor is drawn on it — the same gutter
+/// marker every other selectable row gets, and the proof the sidebar's slot
+/// arithmetic agrees with the reducer's.
+#[test]
+fn the_sidebar_cursor_is_drawn_on_the_week_row() {
+    let mut model = week_model(&["w"], vec![open("ship", "w", day(0))]);
+    model.selected = Selection::Week;
+    model.focus = Focus::Sidebar;
+
+    let week = sidebar_row_with(&model, "Week");
+    assert!(week.contains("› Week"), "{week:?}");
+    // And nowhere else: one cursor, on the row the model names.
+    let today = sidebar_row_with(&model, "Today");
+    assert!(!today.contains('›'), "{today:?}");
+}
+
+/// A List-scoped week still lights the Week row, even with the cursor parked on the
+/// List it is scoped to — the accent says *the lens is up*, independently of where
+/// the cursor is.
+#[test]
+fn the_week_row_is_accented_while_a_lists_week_is_up() {
+    let model = week_model(&["w"], vec![open("ship", "w", day(0))]);
+    assert_eq!(
+        model.selected,
+        Selection::List(0),
+        "the cursor is on the List"
+    );
+
+    let theme = Theme::from_flavor("mocha");
+    let buffer = buffer(&model);
+    let rows = sidebar_rows(&model);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("Week"))
+        .expect("a sidebar Week row") as u16;
+    // Cells, not bytes: the panel's border glyph is multi-byte.
+    let x = rows[y as usize]
+        .chars()
+        .position(|c| c == 'W')
+        .expect("the label starts somewhere") as u16;
+    assert_eq!(buffer[(x, y)].style().fg, Some(theme.accent));
 }

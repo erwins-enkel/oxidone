@@ -81,9 +81,9 @@ pub enum Action {
     AddList,
     RenameList,
     DeleteList,
-    /// Toggle the **Weekly spread** (`W`): a planning lens over Monday–Friday,
-    /// orthogonal to the sidebar selection. `w` is already `ToggleHideDistant`,
-    /// so this takes the shift-pair, as `t`/`T` and `J`/`K` do.
+    /// Open or close the **Weekly spread** (`W`): a planning surface over
+    /// Monday–Friday, scoped by the sidebar row it is opened on. `w` is already
+    /// `ToggleHideDistant`, so this takes the shift-pair, as `t`/`T` and `J`/`K` do.
     ///
     /// The spread's *own* keys — the day cursor, the dot, `]`/`[` — are not
     /// `Action`s: they are routed ahead of this table in the reducer, because

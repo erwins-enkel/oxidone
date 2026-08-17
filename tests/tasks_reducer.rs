@@ -16,6 +16,13 @@ fn tab() -> Message {
     Message::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
 }
 
+/// Put the cursor on the first List. Assigns rather than walking the sidebar:
+/// `j` from Today lands on the pinned Week row, and a second `j` would carry that
+/// row's lens onto the List — a week, not the plain List pane these tests want.
+fn select_first_list(m: &mut Model) {
+    m.selected = Selection::List(0);
+}
+
 async fn list_with_tasks(titles: &[&str]) -> (List, Vec<Task>) {
     let api = FakeTasksApi::new();
     let l = api.insert_list("L").await.unwrap();
@@ -63,7 +70,7 @@ async fn loading_lists_fans_out_to_uncovered_lists_active_first() {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists.clone())); // lands on Today
-    update(&mut m, press('j')); // select Work (List 0), leaving Today
+    select_first_list(&mut m); // leaving Today
     let cmds = update(&mut m, Message::ListsLoaded(lists.clone()));
     assert_eq!(
         cmds,
@@ -86,8 +93,8 @@ async fn list_fan_out_skips_lists_the_aggregate_covers() {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists.clone()));
-    update(&mut m, press('j')); // Work active
-                                // Cover Home so only an uncovered List is fetched.
+    select_first_list(&mut m); // Work active
+                               // Cover Home so only an uncovered List is fetched.
     let mut counts = HashMap::new();
     counts.insert(home, (1usize, 2usize));
     update(&mut m, Message::CountsLoaded(counts));
@@ -116,8 +123,8 @@ async fn a_full_refresh_fans_out_to_every_list_active_first() {
     let mut m = Model::new();
     m.api_available = true;
     update(&mut m, Message::ListsLoaded(lists.clone()));
-    update(&mut m, press('j')); // Work active
-                                // Cover every List, so only a *full* refresh re-fetches them.
+    select_first_list(&mut m); // Work active
+                               // Cover every List, so only a *full* refresh re-fetches them.
     let mut counts = HashMap::new();
     counts.insert(work.clone(), (0usize, 1usize));
     counts.insert(home.clone(), (0usize, 1usize));
@@ -149,7 +156,7 @@ async fn the_full_refresh_flag_is_consumed_after_one_cascade() {
     let mut m = Model::new();
     m.api_available = true;
     update(&mut m, Message::ListsLoaded(lists.clone()));
-    update(&mut m, press('j')); // Work active
+    select_first_list(&mut m); // Work active
     let mut counts = HashMap::new();
     counts.insert(work.clone(), (0usize, 1usize));
     counts.insert(home, (0usize, 1usize));
@@ -180,7 +187,7 @@ async fn an_offline_refresh_does_not_latch_the_full_flag() {
     counts.insert(home, (0usize, 1usize));
     update(&mut m, Message::CountsLoaded(counts));
     update(&mut m, Message::ListsLoaded(lists.clone()));
-    update(&mut m, press('j')); // Work active
+    select_first_list(&mut m); // Work active
 
     assert!(
         update(&mut m, press('r')).is_empty(),
@@ -253,7 +260,7 @@ async fn changing_list_requests_new_tasks_and_clears_the_pane() {
     let lists = api.list_lists().await.unwrap();
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists.clone())); // lands on Today
-    update(&mut m, press('j')); // select Work (List 0)
+    select_first_list(&mut m); // Work active
     let wtasks = api.list_tasks(&work.id, true, false, None).await.unwrap();
     update(&mut m, Message::TasksLoaded(work.id.clone(), wtasks));
 
@@ -290,7 +297,7 @@ async fn stale_tasks_loaded_for_another_list_is_ignored() {
 
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(lists)); // lands on Today
-    update(&mut m, press('j')); // select Work (List 0)
+    select_first_list(&mut m); // Work active
     update(&mut m, Message::TasksLoaded(home.id.clone(), htasks)); // stale (Home not active)
     assert!(m.tasks.is_empty());
 }

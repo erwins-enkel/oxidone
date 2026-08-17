@@ -292,19 +292,19 @@ fn entering_search_clears_the_inherited_cursor() {
 #[test]
 fn jk_with_the_sidebar_focused_leaves_search_and_loads_the_list() {
     let mut m = base(&["work", "home"]);
-    m.selected = Selection::Today;
+    m.selected = Selection::List(0);
     enter_search(&mut m, vec![undated("a", "work")]);
     commit(&mut m);
     update(&mut m, key(KeyCode::Tab)); // focus the sidebar
-    let cmds = update(&mut m, press('j')); // Today -> work
+    let cmds = update(&mut m, press('j')); // work -> home
     assert!(!m.search_active(), "a genuine sidebar move leaves Search");
-    assert_eq!(m.selected, Selection::List(0));
-    assert_eq!(cmds, vec![Command::LoadTasks(ListId("work".into()))]);
-    // The tail this shares with the Omnibox's JUMP is `open_selection`, which
-    // must not absorb `focus`: the Omnibox sets it at its own call site, because
-    // a landing chosen by name wants the pane and a cursor step does not. Pulling
-    // that line into `open_selection` would make every sidebar `j`/`k` steal
-    // focus, and nothing above would notice.
+    assert_eq!(m.selected, Selection::List(1));
+    assert_eq!(cmds, vec![Command::LoadTasks(ListId("home".into()))]);
+    // The landing this shares with the Omnibox's JUMP is `land`, which must not
+    // absorb `focus`: the Omnibox sets it at its own call site, because a landing
+    // chosen by name wants the pane and a cursor step does not. Pulling that line
+    // into `land` would make every sidebar `j`/`k` steal focus, and nothing above
+    // would notice.
     assert_eq!(m.focus, Focus::Sidebar, "a sidebar step keeps the sidebar");
 }
 

@@ -1,8 +1,9 @@
 //! Reducer tests for the List read path (ticket #4): `ListsLoaded` handling and
 //! sidebar selection. `update` is pure — no terminal.
 //!
-//! The sidebar cursor spans `[Today, …lists]`: the pinned Today view (#61) sits
-//! above the real Lists, and startup lands on it.
+//! The sidebar cursor spans `[Today, Week, …lists]`: the two pinned rows — the
+//! Today view (#61) and the cross-List Weekly spread — sit above the real Lists,
+//! and startup lands on Today.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::api::{FakeTasksApi, TasksApi};
@@ -42,11 +43,13 @@ async fn empty_lists_stays_on_today() {
 }
 
 #[tokio::test]
-async fn j_and_k_move_selection_across_today_and_the_lists() {
+async fn j_and_k_move_selection_across_the_pinned_rows_and_the_lists() {
     let mut m = Model::new();
     update(&mut m, Message::ListsLoaded(two_lists().await));
     assert_eq!(m.selected, Selection::Today);
 
+    update(&mut m, press('j'));
+    assert_eq!(m.selected, Selection::Week); // the second pinned row
     update(&mut m, press('j'));
     assert_eq!(m.selected, Selection::List(0)); // Work
     update(&mut m, press('j'));
@@ -56,7 +59,9 @@ async fn j_and_k_move_selection_across_today_and_the_lists() {
     update(&mut m, press('k'));
     assert_eq!(m.selected, Selection::List(0));
     update(&mut m, press('k'));
-    assert_eq!(m.selected, Selection::Today); // back up to the pinned row
+    assert_eq!(m.selected, Selection::Week);
+    update(&mut m, press('k'));
+    assert_eq!(m.selected, Selection::Today); // back up to the first pinned row
     update(&mut m, press('k')); // clamped at the start
     assert_eq!(m.selected, Selection::Today);
 }
@@ -67,7 +72,8 @@ async fn reload_preserves_the_selected_list_by_id() {
     let lists = two_lists().await;
     let home = lists[1].clone();
     update(&mut m, Message::ListsLoaded(lists));
-    update(&mut m, press('j')); // Today -> Work
+    update(&mut m, press('j')); // Today -> Week
+    update(&mut m, press('j')); // Week  -> Work
     update(&mut m, press('j')); // Work  -> Home (index 1)
     assert_eq!(m.selected, Selection::List(1));
 

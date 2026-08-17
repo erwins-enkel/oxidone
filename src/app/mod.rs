@@ -2308,11 +2308,13 @@ fn request_selected(model: &mut Model, clear_pane: bool) -> Vec<Command> {
             lists: model.lists.clone(),
         }];
     }
-    // The spread's corpus is the same whole-corpus load Search takes, and for the
-    // same reason: the scheduled half spans every List. Precedes the
-    // `selected_list_id()` match below, which is `None` here too. Ignores
-    // `clear_pane` for the pane's own rows — `toggle_week` owns the clearing — so
-    // the Move repair's `clear_pane: false` keeps its bridged row.
+    // The spread's corpus is the same whole-corpus load Search takes, and for a
+    // reason no scope narrows: on the pinned Week row the scheduled half spans every
+    // List, the pool is always `default_list`'s, and walking the cursor from List to
+    // List must not refetch. Precedes the `selected_list_id()` match below, which is
+    // `None` here too. Ignores `clear_pane` for the pane's own rows —
+    // `enter_week_pane` owns that clearing — so the Move repair's
+    // `clear_pane: false` keeps its bridged row.
     //
     // The single choke point for `LoadWeek`, so the pending notice is armed on
     // entry, on `r`, and on the Move repair alike.

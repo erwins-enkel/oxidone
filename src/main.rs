@@ -19,12 +19,15 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 
 use oxidone::api::{RestClient, TasksApi};
 use oxidone::app::{classify_event, update, Command, Message, Model, OFFLINE};
-use oxidone::auth::{self, FileTokenStore, TokenStore, YupTokenProvider};
+use oxidone::auth::{
+    self, ConsentPrompt, ConsentSink, FileTokenStore, SingleFlight, TokenStore, YupTokenProvider,
+    CONSENT_TIMEOUT,
+};
 use oxidone::cache::Cache;
 use oxidone::config::{self, Config, Flavor};
 use oxidone::domain::{List, ListId, Task, TaskId};
@@ -85,9 +88,15 @@ async fn main_inner() -> Result<()> {
     init_tracing();
     let config = Config::load();
 
+    // The reducer's channel is created here, not in `run`, because `build_api`
+    // needs the sender: a consent flow that fires later — from a background worker,
+    // with the TUI already up — reaches the user as a `Message`, never as a write
+    // to the terminal `ratatui` owns.
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+
     // Build the live client (and run first-run auth) BEFORE entering the TUI, so
     // the consent browser flow isn't hidden behind the alternate screen.
-    let api = build_api(&config).await;
+    let api = build_api(&config, tx.clone()).await;
 
     let cache: SharedCache = Arc::new(Mutex::new(open_cache()));
     let (initial_lists, load_error) = {
@@ -114,6 +123,7 @@ async fn main_inner() -> Result<()> {
         cache,
         initial_lists,
         load_error,
+        (tx, rx),
     )
     .await;
     ratatui::restore();
@@ -127,8 +137,12 @@ async fn run(
     cache: SharedCache,
     initial_lists: Vec<List>,
     load_error: Option<String>,
+    channel: (UnboundedSender<Message>, UnboundedReceiver<Message>),
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // The reducer's channel, made in `main_inner` because `build_api` needs the
+    // sender before the TUI exists. Passed as one value: the two halves are one
+    // channel, and splitting them would be two more parameters saying so.
+    let (tx, mut rx) = channel;
 
     // Editor for the notes feature (`$VISUAL`/`$EDITOR`). Resolved once: its
     // presence decides the reducer's notes path, and the tokens drive the spawn.
@@ -1237,10 +1251,33 @@ fn run_suspended_editor(
     Ok(Some(trimmed.to_string()))
 }
 
+/// Surfaces a consent URL through the reducer, as [`Model::auth_prompt`] — the
+/// only way to reach the user once `ratatui` owns the terminal.
+struct TuiConsentSink {
+    tx: UnboundedSender<Message>,
+}
+
+impl ConsentSink for TuiConsentSink {
+    fn present(&self, url: &str) {
+        let _ = self.tx.send(Message::AuthPromptOpened(url.to_string()));
+    }
+
+    fn dismiss(&self, reason: Option<&str>) {
+        let _ = self.tx.send(Message::AuthPromptClosed {
+            reason: reason.map(str::to_owned),
+        });
+    }
+}
+
 /// Build the live Google client from BYO credentials, running the first-run
 /// browser authorization if no token is cached yet. Returns `None` (offline) if
 /// no credentials are configured or auth setup fails.
-async fn build_api(config: &Config) -> Api {
+///
+/// `tx` is only for the consent prompt: the token cache can turn out to be
+/// unusable (expired with no refresh token, or a grant Google has since rejected),
+/// and then the interactive flow fires later, from whichever worker asked for a
+/// token first.
+async fn build_api(config: &Config, tx: UnboundedSender<Message>) -> Api {
     let secret = config.client_secret_path.as_ref()?;
     let store = FileTokenStore::in_config_dir()?;
     let has_token = match store.load() {
@@ -1261,8 +1298,16 @@ async fn build_api(config: &Config) -> Api {
         }
     }
 
-    match YupTokenProvider::new(secret, store).await {
-        Ok(provider) => Some(Arc::new(RestClient::new(Arc::new(provider)))),
+    // This provider outlives the TUI's startup, so its prompt goes to the frame.
+    // `SingleFlight` is what keeps a cache miss to one consent flow: the startup
+    // workers ask for a token concurrently, and `yup-oauth2` would otherwise run
+    // the whole interactive flow once per caller, on a loopback port each.
+    let prompt = Arc::new(ConsentPrompt::new(Box::new(TuiConsentSink { tx })));
+    match YupTokenProvider::new(secret, store, Arc::clone(&prompt)).await {
+        Ok(provider) => {
+            let provider = SingleFlight::new(provider, prompt, CONSENT_TIMEOUT);
+            Some(Arc::new(RestClient::new(Arc::new(provider))))
+        }
         Err(e) => {
             tracing::warn!(error = %e, "auth setup failed; starting offline");
             None

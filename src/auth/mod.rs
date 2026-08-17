@@ -2,10 +2,14 @@
 //! Token persistence is behind `TokenStore` so a keychain backend can replace
 //! the plaintext-600 file later without touching call sites.
 
+mod consent;
 mod oauth;
+mod single_flight;
 mod store;
 
+pub use consent::{ConsentPrompt, ConsentSink};
 pub use oauth::{login, YupTokenProvider};
+pub use single_flight::{SingleFlight, CONSENT_TIMEOUT};
 pub use store::FileTokenStore;
 
 use crate::api::ApiError;

@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 
 use oxidone::api::{RestClient, TasksApi};
-use oxidone::app::{classify_event, update, Command, Message, Model, OFFLINE};
+use oxidone::app::{classify_event, offline_failure_for, update, Command, Message, Model};
 use oxidone::auth::{
     self, ConsentPrompt, ConsentSink, FileTokenStore, SingleFlight, TokenStore, YupTokenProvider,
     CONSENT_TIMEOUT,
@@ -297,11 +297,43 @@ async fn run(
     Ok(())
 }
 
+/// Fire-and-forget a [`Message`] to the UI loop. The only error is the receiver
+/// having dropped — i.e. the loop has quit and the message is lost regardless —
+/// so the discard is logged rather than left as a swallowed `Result`
+/// (CLAUDE.md: no `let _ =` on a `Result`). Centralising the send keeps that
+/// intent in one place instead of scattered across every worker.
+fn emit(tx: &UnboundedSender<Message>, msg: Message) {
+    if tx.send(msg).is_err() {
+        tracing::debug!("UI loop gone; dropping message");
+    }
+}
+
+/// The live Google client for a write `Command`. Reachable only after the
+/// offline guard in [`dispatch`] has continued on `api = None` — a write never
+/// reaches a spawn with no client — so a missing client here is a structural
+/// bug, not a runtime condition, and fails explicitly rather than silently.
+fn live_client(api: &Api) -> Arc<dyn TasksApi> {
+    api.as_ref()
+        .expect("offline writes are handled by offline_failure_for before dispatch")
+        .clone()
+}
+
 /// Execute the reducer's side-effect `Command`s. Online, each becomes a
 /// background worker that refreshes from Google and mirrors into the cache;
-/// offline, it reads straight from the cache (ADR-0001).
+/// offline, writes roll back via [`offline_failure_for`] and reads serve from
+/// the cache (ADR-0001).
 fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &UnboundedSender<Message>) {
     for command in commands {
+        // Offline (no live Google client): writes roll their optimistic change
+        // back with the matching `*Failed` message (ADR-0001).
+        // `offline_failure_for` is the one place that decides what each write
+        // becomes; reads return `None` and fall through to the cache paths below.
+        if api.is_none() {
+            if let Some(failed) = offline_failure_for(&command) {
+                emit(tx, failed);
+                continue;
+            }
+        }
         match command {
             Command::LoadTasks(list) => match api {
                 Some(api) => spawn_load_tasks(api.clone(), cache.clone(), tx.clone(), list),
@@ -316,23 +348,26 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                             }
                         }
                     };
-                    let _ = tx.send(message);
+                    emit(tx, message);
                 }
             },
             Command::LoadToday { lists, today } => {
                 // Instant paint from the cache (borrow-based, spawn-free), then —
                 // online — the concurrent per-List fan-out for fresh data.
                 let cached = sync::today_from_cache(&cache.lock().unwrap(), today);
-                let _ = tx.send(match cached {
-                    Ok(tasks) => Message::TodayLoaded {
-                        tasks,
-                        failed: Vec::new(),
+                emit(
+                    tx,
+                    match cached {
+                        Ok(tasks) => Message::TodayLoaded {
+                            tasks,
+                            failed: Vec::new(),
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to read today from cache");
+                            Message::LoadFailed(format!("failed to read today: {e}"))
+                        }
                     },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to read today from cache");
-                        Message::LoadFailed(format!("failed to read today: {e}"))
-                    }
-                });
+                );
                 if let Some(api) = api {
                     spawn_fanout(
                         api.clone(),
@@ -366,184 +401,103 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                 list,
                 task,
                 completed,
-            } => match api {
-                Some(api) => spawn_write_completed(
-                    api.clone(),
-                    cache.clone(),
-                    tx.clone(),
-                    list,
-                    task,
-                    completed,
-                ),
-                None => {
-                    // No offline editing in v1 (ADR-0001): roll the optimistic
-                    // change back with an explanation.
-                    let _ = tx.send(Message::TaskWriteFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::SetTitle { list, task, title } => match api {
-                Some(api) => {
-                    spawn_write_title(api.clone(), cache.clone(), tx.clone(), list, task, title)
-                }
-                None => {
-                    let _ = tx.send(Message::TaskWriteFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::SetDue { list, task, due } => match api {
-                Some(api) => {
-                    spawn_write_due(api.clone(), cache.clone(), tx.clone(), list, task, due)
-                }
-                None => {
-                    let _ = tx.send(Message::TaskWriteFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::SetNotes { list, task, notes } => match api {
-                Some(api) => {
-                    spawn_write_notes(api.clone(), cache.clone(), tx.clone(), list, task, notes)
-                }
-                None => {
-                    let _ = tx.send(Message::TaskWriteFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
+            } => spawn_write_completed(
+                live_client(api),
+                cache.clone(),
+                tx.clone(),
+                list,
+                task,
+                completed,
+            ),
+            Command::SetTitle { list, task, title } => spawn_write_title(
+                live_client(api),
+                cache.clone(),
+                tx.clone(),
+                list,
+                task,
+                title,
+            ),
+            Command::SetDue { list, task, due } => {
+                spawn_write_due(live_client(api), cache.clone(), tx.clone(), list, task, due)
+            }
+            Command::SetNotes { list, task, notes } => spawn_write_notes(
+                live_client(api),
+                cache.clone(),
+                tx.clone(),
+                list,
+                task,
+                notes,
+            ),
             Command::OpenUrl(url) => spawn_open_url(tx.clone(), url),
             // `SpawnEditor` never reaches here: it owns the terminal and is
             // handled synchronously in the run loop, not by a background worker.
             Command::SpawnEditor { .. } => {
                 tracing::error!("SpawnEditor reached the worker dispatch; ignoring");
             }
-            Command::DeleteTask { list, task } => match api {
-                Some(api) => spawn_delete_task(api.clone(), cache.clone(), tx.clone(), list, task),
-                None => {
-                    let _ = tx.send(Message::TaskDeleteFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
+            Command::DeleteTask { list, task } => {
+                spawn_delete_task(live_client(api), cache.clone(), tx.clone(), list, task)
+            }
             Command::AddTask {
                 list,
                 temp,
                 title,
                 parent,
                 due,
-            } => match api {
-                Some(api) => {
-                    let new = oxidone::api::NewTask {
-                        title,
-                        parent,
-                        due,
-                        ..Default::default()
-                    };
-                    spawn_add_task(api.clone(), cache.clone(), tx.clone(), list, temp, new)
-                }
-                None => {
-                    let _ = tx.send(Message::TaskAddFailed {
-                        temp,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
+            } => {
+                let new = oxidone::api::NewTask {
+                    title,
+                    parent,
+                    due,
+                    ..Default::default()
+                };
+                spawn_add_task(live_client(api), cache.clone(), tx.clone(), list, temp, new)
+            }
             Command::Move {
                 list,
                 task,
                 parent,
                 previous,
-            } => match api {
-                Some(api) => spawn_move(
-                    api.clone(),
-                    cache.clone(),
-                    tx.clone(),
-                    list,
-                    task,
-                    parent,
-                    previous,
-                ),
-                None => {
-                    let _ = tx.send(Message::MoveFailed {
-                        list,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
+            } => spawn_move(
+                live_client(api),
+                cache.clone(),
+                tx.clone(),
+                list,
+                task,
+                parent,
+                previous,
+            ),
             Command::MoveToList {
                 source,
                 task,
                 destination,
-            } => match api {
-                Some(api) => spawn_move_to_list(
-                    api.clone(),
-                    cache.clone(),
-                    tx.clone(),
-                    source,
-                    task,
-                    destination,
-                ),
-                None => {
-                    let _ = tx.send(Message::MoveToListFailed {
-                        task,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::AddList { temp, title } => match api {
-                Some(api) => spawn_add_list(api.clone(), cache.clone(), tx.clone(), temp, title),
-                None => {
-                    let _ = tx.send(Message::ListAddFailed {
-                        temp,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::RenameList { list, title } => match api {
-                Some(api) => spawn_rename_list(api.clone(), cache.clone(), tx.clone(), list, title),
-                None => {
-                    let _ = tx.send(Message::ListWriteFailed {
-                        list,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::DeleteList { list } => match api {
-                Some(api) => spawn_delete_list(api.clone(), cache.clone(), tx.clone(), list),
-                None => {
-                    let _ = tx.send(Message::ListDeleteFailed {
-                        list,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            Command::ClearCompleted { list } => match api {
-                Some(api) => spawn_clear_completed(api.clone(), cache.clone(), tx.clone(), list),
-                None => {
-                    let _ = tx.send(Message::ClearCompletedFailed {
-                        list,
-                        reason: OFFLINE.to_string(),
-                    });
-                }
-            },
-            // The reducer already gates this on `api_available`, so the `None`
-            // arm is unreachable in practice; it fails closed rather than
-            // silently dropping the Refresh (cf. `run_notes_editor`). Unlike
-            // the write commands above, a Refresh has no optimistic change to
-            // roll back, so it reports via the id-less `LoadFailed`.
-            Command::RefreshLists => match api {
-                Some(api) => spawn_refresh_lists(api.clone(), cache.clone(), tx.clone()),
-                None => {
-                    let _ = tx.send(Message::LoadFailed(OFFLINE.to_string()));
-                }
-            },
+            } => spawn_move_to_list(
+                live_client(api),
+                cache.clone(),
+                tx.clone(),
+                source,
+                task,
+                destination,
+            ),
+            Command::AddList { temp, title } => {
+                spawn_add_list(live_client(api), cache.clone(), tx.clone(), temp, title)
+            }
+            Command::RenameList { list, title } => {
+                spawn_rename_list(live_client(api), cache.clone(), tx.clone(), list, title)
+            }
+            Command::DeleteList { list } => {
+                spawn_delete_list(live_client(api), cache.clone(), tx.clone(), list)
+            }
+            Command::ClearCompleted { list } => {
+                spawn_clear_completed(live_client(api), cache.clone(), tx.clone(), list)
+            }
+            // The reducer gates this on `api_available`, so the offline path is
+            // unreachable in practice; `offline_failure_for` still fails it
+            // closed (as `LoadFailed`) rather than silently dropping the Refresh.
+            // A Refresh has no optimistic change to roll back, hence `LoadFailed`
+            // rather than a per-row `*Failed`.
+            Command::RefreshLists => {
+                spawn_refresh_lists(live_client(api), cache.clone(), tx.clone())
+            }
         }
     }
 }
@@ -571,7 +525,7 @@ fn spawn_write_completed(
                 reason: format!("failed to update task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -598,7 +552,7 @@ fn spawn_write_title(
                 reason: format!("failed to update task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -625,7 +579,7 @@ fn spawn_add_task(
                 reason: format!("failed to add task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -646,10 +600,13 @@ fn spawn_move(
             .move_task(&list, &task, parent.as_ref(), previous.as_ref())
             .await
         {
-            let _ = tx.send(Message::MoveFailed {
-                list,
-                reason: format!("failed to move task: {e}"),
-            });
+            emit(
+                &tx,
+                Message::MoveFailed {
+                    list,
+                    reason: format!("failed to move task: {e}"),
+                },
+            );
             return;
         }
         // A Move renumbers many positions; re-fetch the active view and mirror it
@@ -670,7 +627,7 @@ fn spawn_move(
                 reason: format!("failed to refresh after move: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -697,7 +654,7 @@ fn spawn_write_due(
                 reason: format!("failed to update task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -713,9 +670,12 @@ fn spawn_write_due(
 fn spawn_open_url(tx: UnboundedSender<Message>, url: OpenableUrl) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = open::that_detached(url.as_str()) {
-            let _ = tx.send(Message::LinkOpenFailed {
-                reason: e.to_string(),
-            });
+            emit(
+                &tx,
+                Message::LinkOpenFailed {
+                    reason: e.to_string(),
+                },
+            );
         }
     });
 }
@@ -743,7 +703,7 @@ fn spawn_write_notes(
                 reason: format!("failed to update task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -780,7 +740,7 @@ fn spawn_move_to_list(
                     reason: format!("{e:#}"),
                 },
             };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -806,7 +766,7 @@ fn spawn_delete_task(
                 reason: format!("failed to delete task: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -832,7 +792,7 @@ fn spawn_add_list(
                 reason: format!("failed to add list: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -858,7 +818,7 @@ fn spawn_rename_list(
                 reason: format!("failed to rename list: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -884,7 +844,7 @@ fn spawn_delete_list(
                 reason: format!("failed to delete list: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -900,10 +860,13 @@ fn spawn_clear_completed(
 ) {
     tokio::spawn(async move {
         if let Err(e) = api.clear_completed(&list).await {
-            let _ = tx.send(Message::ClearCompletedFailed {
-                list,
-                reason: format!("failed to clear completed: {e}"),
-            });
+            emit(
+                &tx,
+                Message::ClearCompletedFailed {
+                    list,
+                    reason: format!("failed to clear completed: {e}"),
+                },
+            );
             return;
         }
         // Refresh the cache to match Google (the cleared Tasks are now hidden).
@@ -918,7 +881,7 @@ fn spawn_clear_completed(
             }
             Err(e) => tracing::warn!(error = %e, "failed to refetch after clear"),
         }
-        let _ = tx.send(Message::ClearedCompleted(list));
+        emit(&tx, Message::ClearedCompleted(list));
     });
 }
 
@@ -989,7 +952,7 @@ fn spawn_refresh_lists(api: Arc<dyn TasksApi>, cache: SharedCache, tx: Unbounded
             },
             Err(e) => Message::LoadFailed(format!("failed to load lists: {e}")),
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -1014,7 +977,7 @@ fn spawn_load_tasks(
                 reason: format!("failed to load tasks: {e}"),
             },
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -1035,13 +998,16 @@ fn load_corpus(
 ) {
     let live = api.is_none();
     let cached = sync::all_from_cache(&cache.lock().unwrap());
-    let _ = tx.send(match cached {
-        Ok(tasks) => to_message(tasks, Vec::new(), live),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read {what} corpus from cache");
-            Message::LoadFailed(format!("failed to read {what}: {e}"))
-        }
-    });
+    emit(
+        tx,
+        match cached {
+            Ok(tasks) => to_message(tasks, Vec::new(), live),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read {what} corpus from cache");
+                Message::LoadFailed(format!("failed to read {what}: {e}"))
+            }
+        },
+    );
     if let Some(api) = api {
         spawn_fanout(
             api.clone(),
@@ -1104,7 +1070,7 @@ fn spawn_fanout(
                 Err(e) => Message::LoadFailed(format!("failed to build pane: {e}")),
             }
         };
-        let _ = tx.send(message);
+        emit(&tx, message);
     });
 }
 
@@ -1115,7 +1081,7 @@ fn spawn_resolve_default(api: Arc<dyn TasksApi>, tx: UnboundedSender<Message>) {
     tokio::spawn(async move {
         match api.default_list().await {
             Ok(list) => {
-                let _ = tx.send(Message::DefaultListResolved(list.id));
+                emit(&tx, Message::DefaultListResolved(list.id));
             }
             Err(e) => tracing::warn!(error = %e, "failed to resolve @default list"),
         }
@@ -1259,13 +1225,16 @@ struct TuiConsentSink {
 
 impl ConsentSink for TuiConsentSink {
     fn present(&self, url: &str) {
-        let _ = self.tx.send(Message::AuthPromptOpened(url.to_string()));
+        emit(&self.tx, Message::AuthPromptOpened(url.to_string()));
     }
 
     fn dismiss(&self, reason: Option<&str>) {
-        let _ = self.tx.send(Message::AuthPromptClosed {
-            reason: reason.map(str::to_owned),
-        });
+        emit(
+            &self.tx,
+            Message::AuthPromptClosed {
+                reason: reason.map(str::to_owned),
+            },
+        );
     }
 }
 

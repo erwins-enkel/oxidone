@@ -1656,6 +1656,82 @@ pub enum Command {
     RefreshLists,
 }
 
+/// The ADR-0001 write-through rule, as a single decision: with no live Google
+/// client, a write `Command` rolls its optimistic change back by reporting the
+/// matching `*Failed` variant with [`OFFLINE`] as the reason. This is the one
+/// place that knows which writes exist and what each becomes offline — the
+/// runtime's `dispatch` calls it on the `api = None` path and emits the result,
+/// so the rollback message is defined once rather than copy-pasted per arm.
+///
+/// Read commands (`Load*`) are `None` here: they stay online-optional and fall
+/// through to the cache in `dispatch`, so they are not failed. `OpenUrl` and
+/// `SpawnEditor` need no Google client either, so they map to `None` too.
+pub fn offline_failure_for(command: &Command) -> Option<Message> {
+    let reason = OFFLINE.to_string();
+    let failed = match command {
+        Command::SetCompleted { task, .. } => Message::TaskWriteFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::SetTitle { task, .. } => Message::TaskWriteFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::SetDue { task, .. } => Message::TaskWriteFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::SetNotes { task, .. } => Message::TaskWriteFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::DeleteTask { task, .. } => Message::TaskDeleteFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::AddTask { temp, .. } => Message::TaskAddFailed {
+            temp: temp.clone(),
+            reason,
+        },
+        Command::Move { list, .. } => Message::MoveFailed {
+            list: list.clone(),
+            reason,
+        },
+        Command::MoveToList { task, .. } => Message::MoveToListFailed {
+            task: task.clone(),
+            reason,
+        },
+        Command::AddList { temp, .. } => Message::ListAddFailed {
+            temp: temp.clone(),
+            reason,
+        },
+        Command::RenameList { list, .. } => Message::ListWriteFailed {
+            list: list.clone(),
+            reason,
+        },
+        Command::DeleteList { list, .. } => Message::ListDeleteFailed {
+            list: list.clone(),
+            reason,
+        },
+        Command::ClearCompleted { list, .. } => Message::ClearCompletedFailed {
+            list: list.clone(),
+            reason,
+        },
+        // A Refresh has no optimistic change to roll back, so it reports via the
+        // id-less `LoadFailed` — the same surface a failed `list_lists` uses.
+        Command::RefreshLists => Message::LoadFailed(reason),
+        // Reads serve from the cache whether online or not; URL open and the
+        // external editor need no Google client. None of these fail offline.
+        Command::LoadTasks(_)
+        | Command::LoadToday { .. }
+        | Command::LoadSearch { .. }
+        | Command::LoadWeek { .. }
+        | Command::OpenUrl(_)
+        | Command::SpawnEditor { .. } => return None,
+    };
+    Some(failed)
+}
+
 /// Map a terminal event to the `Message` that should wake the reducer loop, or
 /// `None` for events the app ignores.
 ///

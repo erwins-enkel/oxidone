@@ -630,6 +630,55 @@ fn a_refuses_loudly_when_no_pool_list_resolves() {
     assert!(m.status_line.is_some(), "and it says why");
 }
 
+/// `A` names a pane to land in, so it leaves the spread — unlike a sidebar
+/// `j`/`k`, which re-scopes the pool in place. Left in, `finish_add_list`'s
+/// `model.tasks.clear()` would strand the spread on an empty corpus: nothing
+/// reloads it (`ListInserted` is gated on `selected_list_id()`, `None` here) and
+/// `week_pending` is `false`, so the pane would read as a week with nothing
+/// planned and no notice saying otherwise.
+#[test]
+fn adding_a_list_leaves_the_spread_rather_than_stranding_an_empty_corpus() {
+    let mut m = in_week(&["w"], vec![open("ship", "w", day(2))]);
+    m.focus = Focus::Sidebar;
+
+    update(&mut m, press('A'));
+    for c in "Home".chars() {
+        update(&mut m, press(c));
+    }
+    update(&mut m, Message::Key(enter()));
+
+    assert!(!m.week_active(), "A names the new List's pane");
+    assert!(!m.week_pending);
+}
+
+/// A `ListsLoaded` must not read as a target change while the spread is up, or
+/// `request_selected`'s `clear_pane` prologue drops the `/` filter under the
+/// user: `W`, a query, then `r`.
+#[test]
+fn a_list_set_refresh_keeps_the_filter_in_the_spread() {
+    let mut m = in_week(
+        &["w"],
+        vec![
+            open("ship the release", "w", day(2)),
+            open("call", "w", day(3)),
+        ],
+    );
+    update(&mut m, press('/'));
+    for c in "ship".chars() {
+        update(&mut m, press(c));
+    }
+    update(&mut m, Message::Key(enter()));
+    assert_eq!(m.filter.as_deref(), Some("ship"));
+    assert_eq!(visible(&m), ["ship the release"]);
+
+    // What `r` delivers: the List set, unchanged.
+    let lists = m.lists.clone();
+    update(&mut m, Message::ListsLoaded(lists));
+
+    assert_eq!(m.filter.as_deref(), Some("ship"), "the filter survives `r`");
+    assert!(m.week_active());
+}
+
 // --- Refusals -------------------------------------------------------------
 
 /// Each of these guards tested `today_active()`, which the `!week` gate now

@@ -429,6 +429,29 @@ fn pool_rows_are_never_headed_by_the_no_pool_notice() {
     );
 }
 
+/// `?` opens the cheatsheet in the spread — `week_key` declines it and lets the
+/// keymap have it — so the legend must pin the help cell there, as it does in
+/// every other *pane* context. Only overlays go without, where `?` would type a
+/// literal `?` into a buffer.
+#[test]
+fn the_spread_pins_the_help_cell_like_every_other_pane() {
+    let model = week_model(&["w"], vec![open("ship", "w", day(2))]);
+    // The legend spans the whole terminal, not just the task pane, and sits on
+    // the last row above the status line.
+    let buffer = buffer_with(&model, WIDTH, false);
+    let legend = (0..HEIGHT)
+        .map(|y| row_text(&buffer, y, WIDTH))
+        .find(|r| r.contains("? help"))
+        .unwrap_or_else(|| {
+            let all: Vec<String> = (0..HEIGHT).map(|y| row_text(&buffer, y, WIDTH)).collect();
+            panic!("no pinned help cell in the spread: {all:?}")
+        });
+    // Pinned means flush right, not merely present.
+    assert!(legend.trim_end().ends_with("? help"), "{legend:?}");
+    // And it is the spread's own legend below it, not the ordinary Tasks one.
+    assert!(legend.contains("plan/done"), "{legend:?}");
+}
+
 /// The panel names the pane, since the sidebar cursor stays parked on a List and
 /// cannot say it. No Sort label: the spread has one fixed order.
 #[test]

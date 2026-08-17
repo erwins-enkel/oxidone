@@ -2179,8 +2179,17 @@ fn set_lists(model: &mut Model, lists: Vec<List>) -> Vec<Command> {
     // after the parked List disappears server-side from reaching `request_selected`
     // with `clear_pane` — belt-and-suspenders beside the Search branch's own
     // `clear_pane` opt-out, and legible if that branch ever changes.
+    //
+    // Forced `false` in the Weekly spread for the same reason, and there it is not
+    // belt-and-suspenders but the only guard: both halves of the comparison below
+    // are rigged while the spread is up, since `was_today`/`previously_selected`
+    // read the *raw* cursor while `today_active()`/`selected_list_id()` are gated
+    // to `false`/`None`. Every `ListsLoaded` would therefore read as a target
+    // change and drop `model.filter` — so `W`, `/`, a query, then `r` would
+    // silently clear it.
     let now_selected = model.selected_list_id().cloned();
     let target_changed = !model.search_active()
+        && !model.week_active()
         && (was_today != model.today_active() || previously_selected != now_selected);
     let mut commands = request_selected(model, target_changed);
 
@@ -3558,11 +3567,19 @@ fn finish_add_list(model: &mut Model, buffer: String) -> Vec<Command> {
     if title.is_empty() {
         return Vec::new();
     }
-    // `A` moves `selected` onto the new List deliberately (like `j`/`k`), so it
-    // leaves Search. This bypasses `request_selected` entirely, so `leave_search`
-    // is what drops the query — otherwise a stale search query would narrow the
-    // brand-new empty List.
+    // `A` moves `selected` onto the new List deliberately, so it leaves Search.
+    // This bypasses `request_selected` entirely, so `leave_search` is what drops
+    // the query — otherwise a stale search query would narrow the brand-new empty
+    // List.
     leave_search(model);
+    // And the Weekly spread, which `model.tasks.clear()` below would otherwise
+    // leave holding an empty corpus with nothing to refill it: `ListInserted`'s
+    // reload is gated on `selected_list_id() == Some(list)`, which the spread's
+    // `!week` gate answers `None`, and `week_pending` would be `false` — so the
+    // pane would read as a week with nothing planned, without even the notice
+    // that says otherwise. Unlike a sidebar `j`/`k`, which re-scopes the pool in
+    // place, `A` names a pane to land in.
+    leave_week(model);
     let temp = ListId(format!("temp-list-{}", model.next_temp));
     model.next_temp += 1;
     model.lists.push(List {

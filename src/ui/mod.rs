@@ -2138,11 +2138,13 @@ fn legend_spans(
 /// The always-visible hotkey legend.
 fn render_legend(frame: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     let context = legend_context(model);
-    // Overlays get no pinned help: `?` would type a literal `?` into the buffer
-    // rather than opening the cheatsheet.
+    // Every *pane* context pins it, as `legend_spans` promises. Only overlays go
+    // without: there `?` would type a literal `?` into the buffer rather than
+    // opening the cheatsheet. The Weekly spread is a pane — `week_key` declines
+    // `?` and lets the keymap have it — so it pins the cell like the other two.
     let pinned = matches!(
         context,
-        keymap::LegendContext::Tasks | keymap::LegendContext::Sidebar
+        keymap::LegendContext::Tasks | keymap::LegendContext::Week | keymap::LegendContext::Sidebar
     );
     let spans = legend_spans(keymap::legend(context), pinned, area.width as usize, theme);
     frame.render_widget(

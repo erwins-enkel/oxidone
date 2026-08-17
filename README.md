@@ -36,12 +36,19 @@ a Tasks costume.
   end
 - Bullet Journal entry types — Task, Event (`○`), Note (`—`) — flipped with
   `t`/`T`, and migration (`m`) to push an entry forward a day
+- A **weekly spread** (`W`) for planning the week: jot the week's entries into an
+  undated pool, then drop a bullet-journal dot into one of five day columns
+  (Mon–Fri) to plan each one. `h`/`l` walk the columns and `Space` acts on the
+  cell under the cursor — empty schedules, the row's own dot completes it (`•` →
+  `✕`); `1`–`5` assign a day outright, `0` returns a row to the pool, and `]`/`[`
+  step to next week and back. The dot *is* the due date, so a plan syncs to your
+  phone and shows up in Today on its day
 - Notes edited in your `$EDITOR`
 - Full list management (create / rename / delete)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
   due → title → "my order" (Google's), the only view a reorder writes to
 - An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a command
-  (`:refresh`, `:horizon`, `:flavor`, `:ascii`), search every List, or capture
+  (`:refresh`, `:week`, `:horizon`, `:flavor`, `:ascii`), search every List, or capture
   the query as a Task — `Enter` runs the highlighted row
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*

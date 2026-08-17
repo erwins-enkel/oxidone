@@ -103,10 +103,11 @@ fn model_with(tasks: Vec<Task>, counts: &[(&str, (usize, usize))]) -> Model {
     model
 }
 
-/// The sidebar row for List `L`. Row 0 is the panel's top border, row 1 the
-/// pinned "Today" row, so the first real List sits on row 2.
+/// The sidebar row for List `L`. Row 0 is the panel's top border, then the two
+/// pinned rows — "Today" and the Weekly spread's indicator — so the first real
+/// List sits on row 3.
 fn sidebar_row(rows: &[String]) -> String {
-    rows[2].clone()
+    rows[3].clone()
 }
 
 /// Just the task pane's columns of a row. A terminal row spans *both* panes, so

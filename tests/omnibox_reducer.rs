@@ -127,9 +127,9 @@ fn esc_closes_and_mutates_nothing() {
 
 // ─── rows and order ─────────────────────────────────────────────────────────
 
-/// The empty query lists Today, then the Lists in order, then the four
-/// commands — and **no** SEARCH row. So `selected == 0` names Today, and
-/// `p`+`Enter` on an untouched Omnibox goes there.
+/// The empty query lists Today, then the Lists in order, then every command —
+/// and **no** SEARCH row. So `selected == 0` names Today, and `p`+`Enter` on an
+/// untouched Omnibox goes there.
 #[test]
 fn the_empty_query_lists_today_then_lists_then_commands() {
     let model = open_with(&["work", "home"]);
@@ -145,7 +145,7 @@ fn the_empty_query_lists_today_then_lists_then_commands() {
                 OmniRow::Capture(_) => "CAPTURE".to_string(),
             })
             .collect::<Vec<_>>(),
-        ["Today", "work", "home", ":horizon", ":flavor", ":ascii", ":refresh"]
+        ["Today", "work", "home", ":horizon", ":flavor", ":ascii", ":week", ":refresh"]
     );
     assert_eq!(selected(&model), 0);
 }

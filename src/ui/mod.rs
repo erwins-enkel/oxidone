@@ -11,7 +11,7 @@
 pub mod theme;
 pub mod widgets;
 
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Datelike, Local, NaiveDate};
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -27,7 +27,8 @@ use crate::app::{
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
-    due_before, due_on_or_before, EntryType, ListId, Selection, Status, Task, TaskId,
+    due_before, due_on_or_before, week_column, EntryType, ListId, Selection, Status, Task, TaskId,
+    WEEK_DAYS,
 };
 use crate::keymap;
 use crate::links::{self, Link};
@@ -487,11 +488,11 @@ fn omnibox_line(
                     OmniCommand::Horizon => format!("now {}", model.horizon_days),
                     OmniCommand::Flavor => format!("now {}", model.flavor.as_str()),
                     OmniCommand::Ascii => format!("now {}", on_off(model.ascii)),
-                    // `:refresh` takes no argument, so `command_state` never
-                    // hands it this state, and it sets no value there would be a
-                    // `now …` for. Empty rather than `unreachable!` — a missing
-                    // trail is not worth panicking the TUI over.
-                    OmniCommand::Refresh => String::new(),
+                    // `:refresh` and `:week` take no argument, so `command_state`
+                    // never hands them this state, and they set no value there
+                    // would be a `now …` for. Empty rather than `unreachable!` — a
+                    // missing trail is not worth panicking the TUI over.
+                    OmniCommand::Refresh | OmniCommand::Week => String::new(),
                 },
                 CommandState::Invalid { reason } => reason.clone(),
                 CommandState::RefusedHere { reason } => (*reason).to_string(),
@@ -727,8 +728,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, the
     // The pinned Today row sits above the real Lists (no meter — its cross-List
     // completion is only known while it is the active pane). The cursor spans
     // `[Today, …lists]`, so the highlight index is offset by the one pinned row.
-    let mut items: Vec<ListItem> = Vec::with_capacity(model.lists.len() + 1);
+    let mut items: Vec<ListItem> = Vec::with_capacity(model.lists.len() + 2);
     items.push(ListItem::new("Today"));
+    // The Weekly spread's row: an indicator, never a cursor stop. It cannot be
+    // selectable, because the cursor is what names the pool List the spread draws
+    // UNSCHEDULED from — landing the cursor here would leave the spread with no
+    // pool. So it shows the lens's state and the key that toggles it, and the
+    // cursor steps straight over it (a non-selectable row among selectable ones,
+    // exactly as the journal spread's headers are in the task pane).
+    items.push(week_sidebar_row(model.week_active(), theme));
     for l in &model.lists {
         items.push(ListItem::new(sidebar_row(
             &l.title,
@@ -737,11 +745,35 @@ fn render_sidebar(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, the
             ascii,
         )));
     }
+    // Offset by the two pinned rows above the Lists, not one.
     let selected = match model.selected {
         Selection::Today => Some(0),
-        Selection::List(i) => Some(i + 1),
+        Selection::List(i) => Some(i + 2),
     };
     render_selectable(frame, area, "Lists", items, selected, focused, theme);
+}
+
+/// The sidebar's Weekly spread row: the label, and the key that toggles it.
+///
+/// Lit in the accent while the lens is on, dim otherwise — it is the one place
+/// the sidebar says which pane the task pane is showing, since the cursor stays
+/// parked on a List either way.
+///
+/// Carries no glyph, deliberately. A `●`/`○` pair would read as an **Entry
+/// type** signifier — `○ ` is the Event glyph, two rows from Tasks that wear it
+/// — and it would have to degrade under `ascii_fallback` into `-`, which is the
+/// Note glyph. The label's own weight and colour say enough, and the panel title
+/// names the pane besides.
+fn week_sidebar_row(active: bool, theme: &Theme) -> ListItem<'static> {
+    let style = if active {
+        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(theme.subtext)
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled("Week", style),
+        Span::styled("  W", Style::new().fg(theme.muted)),
+    ]))
 }
 
 /// A sidebar row: the List title, then its completion meter flush right.
@@ -1086,6 +1118,14 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // signifier gutter, and the overdue-only due column.
     let flat = model.flat_pane();
     let spread = model.today_active();
+    // The Weekly spread: a grid of day columns instead of a due gutter, and the
+    // pane's own header rows. Mutually exclusive with `spread` — `today_active()`
+    // is gated on `!week` — so the two never interleave their headers.
+    let week = model.week_active();
+    let week_start = model.week_start();
+    // The day cursor, drawn only on the selected row: the cursor is a (row, day)
+    // pair, so a bracket on every row would claim five cursors.
+    let cursor_day = model.week_day;
     // The Overdue group, as a count of rows: `cross_list_ordered` sorts them to the
     // front, so they are a contiguous prefix and `take_while` sees all of them.
     // Zero outside a spread, where there is no such group.
@@ -1106,7 +1146,11 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // there on the *Overdue group's* condition instead — exactly the one that
     // draws the `Overdue` header — so the two appear and vanish together and
     // titles never shift without the header announcing it.
-    let due_gutter = if spread {
+    // In the Weekly spread the grid *is* the date: a gutter repeating it would
+    // spend twelve cells restating which column already has the dot.
+    let due_gutter = if week {
+        false
+    } else if spread {
         overdue_rows > 0
     } else {
         ordered.iter().any(|t| t.due.is_some())
@@ -1118,7 +1162,9 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     // The spread is the exception: it reserves the gutter always, so titles hold
     // their column as Events and Notes enter and leave the day. That fixed position
     // is what makes it a gutter rather than a cell.
-    let signifiers = spread || ordered.iter().any(|t| t.entry_type() != EntryType::Task);
+    // The Weekly spread reserves it for the journal spread's reason: titles must
+    // hold their column as Events and Notes enter and leave the week.
+    let signifiers = spread || week || ordered.iter().any(|t| t.entry_type() != EntryType::Task);
     // Built once per render: the per-row indent check is then a hash lookup, not
     // a scan of every Task.
     let top_level = model.top_level_ids();
@@ -1134,6 +1180,22 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     } else {
         HashMap::new()
     };
+    // The row width the List widget leaves for content: the panel's borders and
+    // the cursor gutter come off it. Read once, outside the per-row closure.
+    let inner_row_width =
+        (area.width.saturating_sub(PANEL_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
+    let grid = WeekGrid {
+        start: week_start,
+        today_column: week_column(Some(today), week_start),
+        inner_width: inner_row_width,
+    };
+    // The selected Task's id, for the day cursor's brackets. `selected` below is a
+    // *display* position, computed after this map, so the id is what the rows can
+    // compare against.
+    let selected_id = model
+        .selected_task
+        .and_then(|i| model.tasks.get(i))
+        .map(|t| t.id.clone());
     let items: Vec<ListItem> = ordered
         .iter()
         .map(|t| {
@@ -1259,7 +1321,11 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             // clip a bounded widget. Dim prose (`subtext`), and the strike is
             // *kept* on a Completed row — struck prose stays legible, the opposite
             // of the meter just above, whose braille it would render unreadable.
-            if let Some(line) = preview_line {
+            //
+            // Suppressed in the Weekly spread, where the grid is the row's tail:
+            // an unbounded preview would push the columns off the right edge, and
+            // the `≡` marker above already says there is something to read.
+            if let (false, Some(line)) = (week, preview_line) {
                 if let Some(preview) = notes_preview_segment(
                     line,
                     area.width,
@@ -1270,6 +1336,29 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
                 ) {
                     spans.push(Span::styled(preview, style.fg(theme.subtext)));
                 }
+            }
+            if week {
+                // Clip the row's own text to the budget the grid leaves, then pad
+                // to the right edge. Clipping here rather than letting the List
+                // widget do it is what keeps the grid on screen: the widget would
+                // truncate from the right, taking the columns first.
+                let budget = week_text_budget(grid.inner_width);
+                let mut used = spans_width(&spans);
+                if used > budget {
+                    spans = clip_spans(spans, budget);
+                    used = spans_width(&spans);
+                }
+                spans.push(Span::raw(week_grid_pad(used, grid.inner_width)));
+                spans.extend(week_row_cells(
+                    t,
+                    &grid,
+                    // Only the selected row wears the cursor.
+                    (selected_id.as_ref() == Some(&t.id))
+                        .then_some(cursor_day)
+                        .flatten(),
+                    ascii,
+                    theme,
+                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -1284,18 +1373,35 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
 
     // A spread interleaves the journal spread's header rows, which shifts every
     // display index below them — so the cursor is translated in the same place
-    // the rows are inserted, and cannot be left behind.
+    // the rows are inserted, and cannot be left behind. The Weekly spread does the
+    // same with its own headers; the two are mutually exclusive.
     let (items, selected) = if spread {
         journal_spread(items, selected, &ordered, overdue_rows, today, theme)
+    } else if week {
+        // The pool as a count: `week_ordered` sorts the undated rows to the front,
+        // so they are a contiguous prefix and `take_while` sees all of them.
+        let pool_rows = ordered.iter().take_while(|t| t.due.is_none()).count();
+        let pool_title = model.week_pool_list().and_then(|id| {
+            model
+                .lists
+                .iter()
+                .find(|l| &l.id == id)
+                .map(|l| l.title.as_str())
+        });
+        week_spread(items, selected, pool_rows, pool_title, &grid, theme)
     } else {
         (items, selected)
     };
 
-    // Search names itself in the header — it has no sidebar row and the parked
-    // cursor still highlights the List it was opened from, so the title is where
-    // the user reads that they are in Search.
+    // Search and the Weekly spread name themselves in the header — neither has a
+    // sidebar row of its own and the parked cursor still highlights the List it
+    // was opened from, so the title is where the user reads which pane this is.
     let base = if model.search_active() {
         format!("SEARCH — {}", model.sort.label())
+    } else if week {
+        // No Sort label: the spread has one fixed order, which is why `s` is
+        // refused in it. The week it shows takes that slot instead.
+        format!("WEEKLY SPREAD — week {}", week_start.iso_week().week())
     } else {
         format!("Tasks — {}", model.sort.label())
     };
@@ -1305,6 +1411,272 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
     let inner_width = area.width.saturating_sub(PANEL_BORDERS);
     let title = header_title(&base, model, inner_width, ascii);
     render_selectable(frame, area, &title, items, selected, focused, theme);
+}
+
+/// One day column, in display cells: a space, the glyph, a space — or the two
+/// brackets around it. Wide enough for the two-letter header label too.
+const WEEK_CELL_WIDTH: usize = 3;
+/// The whole grid's width, derived from the column count rather than restated,
+/// so a day added to `WEEK_DAYS` widens every reservation that reads this.
+const WEEK_GRID_WIDTH: usize = WEEK_DAYS * WEEK_CELL_WIDTH;
+/// Gap between a row's text and the grid, so a full-width title never touches it.
+const WEEK_GRID_GAP: usize = 2;
+/// Two-letter day labels, one per column. Length is checked against `WEEK_DAYS`
+/// by `week_labels_cover_every_column`.
+const WEEK_LABELS: [&str; WEEK_DAYS] = ["Mo", "Tu", "We", "Th", "Fr"];
+/// The spread's dateline range: `Mon 17 – Fri 21 Aug`.
+const WEEK_DAY_FORMAT: &str = "%a %-d";
+const WEEK_END_FORMAT: &str = "%a %-d %b";
+
+/// The Weekly spread's geometry for one frame: which week is on screen, which
+/// of its columns is today, and how wide the rows are.
+///
+/// One value rather than three parameters threaded through every grid function —
+/// the header, the row cells and the padding all answer to the same three facts,
+/// and passing them separately let a caller pair a `start` with another week's
+/// `today_column`.
+struct WeekGrid {
+    /// Monday of the displayed week.
+    start: NaiveDate,
+    /// Today's column, or `None` once the spread is paged off the current week —
+    /// so a stale accent never marks a column that is not today.
+    today_column: Option<usize>,
+    /// The row width the List widget leaves for content, borders and the cursor
+    /// gutter already deducted.
+    inner_width: usize,
+}
+
+/// What a day cell holds. Derived from the row, never stored — the dot *is* the
+/// due date (ADR-0003), and the cross is its status.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeekCell {
+    /// No dot on this day.
+    Empty,
+    /// Planned here and still `needsAction`.
+    Planned,
+    /// Planned here and completed — bullet journal's dot crossed out.
+    Done,
+}
+
+/// The glyph for a cell, degrading to ASCII under `ascii_fallback` exactly as the
+/// signifier and marker glyphs do.
+fn week_glyph(cell: WeekCell, ascii: bool) -> &'static str {
+    match (cell, ascii) {
+        (WeekCell::Empty, false) => "·",
+        (WeekCell::Empty, true) => ".",
+        (WeekCell::Planned, false) => "•",
+        (WeekCell::Planned, true) => "*",
+        (WeekCell::Done, false) => "✕",
+        (WeekCell::Done, true) => "x",
+    }
+}
+
+/// One day cell, three display cells wide: the glyph centred, bracketed when the
+/// day cursor is on it.
+///
+/// Brackets rather than a colour or a reverse: the selected row is already drawn
+/// reversed by the List's highlight, so any style-based marker would have to
+/// survive being inverted. `[•]` reads the same under every theme, in ASCII
+/// fallback, and on a monochrome terminal — and it costs no extra width, since
+/// the cell reserves three cells either way.
+fn week_cell(cell: WeekCell, cursor: bool, ascii: bool) -> String {
+    let glyph = week_glyph(cell, ascii);
+    if cursor {
+        format!("[{glyph}]")
+    } else {
+        format!(" {glyph} ")
+    }
+}
+
+/// The grid's column header, right-aligned over the cells it labels. Each label
+/// sits one cell in, the same offset the glyph below it takes, so the two line up.
+///
+/// The grid's `today_column` is painted in the accent, and is `None` unless the
+/// week on screen actually contains today — paging to next week must not leave a
+/// stale "today" marker behind.
+fn week_header_cells(grid: &WeekGrid, theme: &Theme) -> Vec<Span<'static>> {
+    WEEK_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if grid.today_column == Some(i) {
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme.subtext)
+            };
+            Span::styled(format!(" {label}"), style)
+        })
+        .collect()
+}
+
+/// The grid for one row: a cell per day, the dot in whichever column the entry's
+/// due date names.
+///
+/// A row can hold at most one dot, and that falls straight out of the data model
+/// rather than being enforced here — a Task has one due date.
+fn week_row_cells(
+    task: &Task,
+    grid: &WeekGrid,
+    cursor: Option<usize>,
+    ascii: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let column = week_column(task.due, grid.start);
+    (0..WEEK_DAYS)
+        .map(|i| {
+            let cell = match (column == Some(i), task.status == Status::Completed) {
+                (false, _) => WeekCell::Empty,
+                (true, false) => WeekCell::Planned,
+                (true, true) => WeekCell::Done,
+            };
+            // An empty cell is scaffolding, so it recedes; a dot is the row's own
+            // information and reads at full strength. Today's column keeps the
+            // accent it carries in the header, so the eye finds the day it is on.
+            let style = match (cell, grid.today_column == Some(i)) {
+                (WeekCell::Empty, _) => Style::new().fg(theme.surface),
+                (_, true) => Style::new().fg(theme.accent),
+                (_, false) => Style::new().fg(theme.text),
+            };
+            Span::styled(week_cell(cell, cursor == Some(i), ascii), style)
+        })
+        .collect()
+}
+
+/// The spread's header rows, interleaved into the Task rows, and the cursor
+/// shifted to match — the Weekly spread's answer to [`journal_spread`].
+///
+/// - The **column header** always leads. It is the grid's legend, and like the
+///   journal spread's dateline it is drawn even when the pane below is empty.
+/// - **UNSCHEDULED** heads the pool: the undated entries of the List the sidebar
+///   cursor names. Drawn when the pool has rows, *or* when there is no pool List
+///   to draw from — an absent block would otherwise read as "nothing undated"
+///   when it means "nowhere to look".
+/// - **WEEK n** heads the scheduled rows, and names the days on display.
+///
+/// `pool_rows` is a count, not a partition: `week_ordered` sorts the undated rows
+/// to the front, so they are a contiguous prefix exactly as the journal spread's
+/// Overdue group is.
+fn week_spread<'a>(
+    rows: Vec<ListItem<'a>>,
+    selected: Option<usize>,
+    pool_rows: usize,
+    pool_title: Option<&str>,
+    grid: &WeekGrid,
+    theme: &Theme,
+) -> (Vec<ListItem<'a>>, Option<usize>) {
+    let scheduled_rows = rows.len() - pool_rows;
+    let pool_header = pool_rows > 0 || pool_title.is_none();
+
+    let mut header = vec![Span::raw(week_grid_pad(0, grid.inner_width))];
+    header.extend(week_header_cells(grid, theme));
+    let mut out = Vec::with_capacity(rows.len() + 3);
+    out.push(ListItem::new(Line::from(header)));
+
+    let mut rows = rows.into_iter();
+    if pool_header {
+        out.push(match pool_title {
+            Some(title) => week_header(format!("UNSCHEDULED ({title})"), theme),
+            // Fail closed: say why the block is empty rather than letting an
+            // absent pool read as an empty one.
+            None => week_header(
+                "UNSCHEDULED — no list selected, and no default list".to_string(),
+                theme,
+            ),
+        });
+        out.extend(rows.by_ref().take(pool_rows));
+    }
+    if scheduled_rows > 0 {
+        let end = grid.start + chrono::Duration::days(WEEK_DAYS as i64 - 1);
+        out.push(week_header(
+            format!(
+                "WEEK {} · {} – {}",
+                grid.start.iso_week().week(),
+                grid.start.format(WEEK_DAY_FORMAT),
+                end.format(WEEK_END_FORMAT)
+            ),
+            theme,
+        ));
+    }
+    out.extend(rows);
+
+    let selected = selected.map(|p| week_offset(p, pool_rows, pool_header));
+    (out, selected)
+}
+
+/// Rows the Weekly spread inserts above the Task at display position `p`: the
+/// column header always, the UNSCHEDULED header when it is drawn, and the WEEK
+/// header once past the pool.
+fn week_offset(p: usize, pool_rows: usize, pool_header: bool) -> usize {
+    p + 1 + usize::from(pool_header) + usize::from(p >= pool_rows)
+}
+
+/// One group header of the Weekly spread. No count: the grid answers "how much,
+/// which day" cell by cell, so a tally at the top would restate it less precisely.
+fn week_header(label: String, theme: &Theme) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        label,
+        Style::new().fg(theme.subtext).add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// Padding that right-aligns the grid: whatever is left of the row after `used`
+/// cells of text and the grid's own width, floored at the gap so the two never
+/// touch even when the text has taken the whole row.
+fn week_grid_pad(used: usize, inner_width: usize) -> String {
+    let pad = inner_width
+        .saturating_sub(used + WEEK_GRID_WIDTH)
+        .max(WEEK_GRID_GAP);
+    " ".repeat(pad)
+}
+
+/// The text budget a spread row has before the grid: the row minus the grid and
+/// its gap. Floored at a few cells so a very narrow pane clips the title to an
+/// ellipsis rather than to nothing.
+fn week_text_budget(inner_width: usize) -> usize {
+    inner_width
+        .saturating_sub(WEEK_GRID_WIDTH + WEEK_GRID_GAP)
+        .max(WEEK_TITLE_FLOOR)
+}
+
+/// The narrowest a spread row's text is ever clipped to. Below this the grid is
+/// still drawn in full — it is the view, and a spread without its columns is not
+/// a narrower spread but a different one.
+const WEEK_TITLE_FLOOR: usize = 4;
+
+/// How many display cells a run of spans has already taken.
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// Clip a styled run to `budget` display cells, ending in an ellipsis.
+///
+/// Span-aware because a spread row is several styled pieces — signifier, title,
+/// markers, List name — and clipping the joined text would lose their styles.
+/// Each span keeps its own; the one straddling the budget is cut with
+/// [`truncate`], which measures in cells and never splits a wide character.
+fn clip_spans(spans: Vec<Span<'_>>, budget: usize) -> Vec<Span<'_>> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0usize;
+    for span in spans {
+        let width = span.content.width();
+        if used + width <= budget {
+            used += width;
+            out.push(span);
+            continue;
+        }
+        let room = budget - used;
+        let style = span.style;
+        let cut = truncate(&span.content, room, "…");
+        // `truncate` spends its ellipsis unconditionally, so at zero room it
+        // answers a one-cell `…` — which would overflow the very budget being
+        // enforced and push the grid's last column off the row. Dropped rather
+        // than trusted.
+        if !cut.is_empty() && cut.width() <= room {
+            out.push(Span::styled(cut, style));
+        }
+        break;
+    }
+    out
 }
 
 /// How the spread's dateline renders the day: `Wednesday 30 September 2026`.
@@ -1457,11 +1829,19 @@ fn header_title(base: &str, model: &Model, inner_width: u16, ascii: bool) -> Str
     if model.search_pending {
         title.push_str("  · searching all lists…");
     }
+    // The same notice for the Weekly spread, which reads the same whole corpus:
+    // until the fan-out lands a never-mirrored List contributes nothing, and an
+    // empty week must read as "not yet", never as "nothing planned".
+    if model.week_pending {
+        title.push_str("  · reading all lists…");
+    }
 
-    // Both header widgets are suppressed in Search: the meter would report a
-    // whole-corpus ratio (a fact about no pane you are reading), and the strip
-    // forecasts a workload "every Task in every List" is not.
-    if model.search_active() {
+    // Both header widgets are suppressed in Search and the Weekly spread: the
+    // meter would report a whole-corpus ratio (a fact about no pane you are
+    // reading), and the strip forecasts a workload "every Task in every List" is
+    // not. The spread's grid already answers "how much, which day" for the days it
+    // covers, and does it per row.
+    if model.search_active() || model.week_active() {
         return title;
     }
 
@@ -1656,6 +2036,10 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
             | Overlay::RenameList { .. },
         ) => keymap::LegendContext::TextInput,
         None => match model.focus {
+            // The spread rebinds `h`/`l` and `Space` in this pane, so it needs
+            // its own legend or the row would advertise two keys that no longer
+            // do what it says.
+            Focus::Tasks if model.week_active() => keymap::LegendContext::Week,
             Focus::Tasks => keymap::LegendContext::Tasks,
             Focus::Sidebar => keymap::LegendContext::Sidebar,
         },
@@ -1995,6 +2379,7 @@ mod tests {
     use crate::domain::{ListId, TaskId};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     /// The smallest terminal oxidone supports; the cheatsheet must fit it whole.
@@ -3271,5 +3656,140 @@ mod tests {
             Some((1, 1)),
             "the Note child should not be counted"
         );
+    }
+
+    // --- The Weekly spread's grid ----------------------------------------
+
+    /// The label table and the column count are one fact stated twice; a day
+    /// added to one without the other would draw a header the cells do not match.
+    #[test]
+    fn week_labels_cover_every_column() {
+        assert_eq!(WEEK_LABELS.len(), WEEK_DAYS);
+        assert_eq!(WEEK_GRID_WIDTH, WEEK_DAYS * WEEK_CELL_WIDTH);
+    }
+
+    /// Every cell is exactly `WEEK_CELL_WIDTH` wide, bracketed or not, in either
+    /// glyph set — which is what lets the grid's width be reserved up front.
+    #[test]
+    fn every_day_cell_is_the_same_width() {
+        for cell in [WeekCell::Empty, WeekCell::Planned, WeekCell::Done] {
+            for cursor in [false, true] {
+                for ascii in [false, true] {
+                    let drawn = week_cell(cell, cursor, ascii);
+                    assert_eq!(
+                        drawn.width(),
+                        WEEK_CELL_WIDTH,
+                        "{drawn:?} (cursor {cursor}, ascii {ascii})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The cursor is drawn with brackets rather than a style, so it survives the
+    /// List widget's reverse on the selected row and reads on a monochrome
+    /// terminal. The glyph inside is unchanged.
+    #[test]
+    fn the_cursor_brackets_the_cell_without_changing_its_glyph() {
+        assert_eq!(week_cell(WeekCell::Planned, false, false), " • ");
+        assert_eq!(week_cell(WeekCell::Planned, true, false), "[•]");
+        assert_eq!(week_cell(WeekCell::Done, true, true), "[x]");
+    }
+
+    /// The pad right-aligns the grid, and never lets a full-width row touch it:
+    /// at any width the gap survives, so the columns are always readable as
+    /// columns.
+    #[test]
+    fn the_grid_pad_right_aligns_and_never_closes_the_gap() {
+        // Room to spare: text + pad + grid fills the row exactly.
+        let pad = week_grid_pad(10, 60);
+        assert_eq!(10 + pad.width() + WEEK_GRID_WIDTH, 60);
+
+        // No room at all — the pad floors at the gap rather than vanishing.
+        assert_eq!(week_grid_pad(60, 60).width(), WEEK_GRID_GAP);
+        assert_eq!(week_grid_pad(0, 0).width(), WEEK_GRID_GAP);
+    }
+
+    /// The text budget floors above zero, so a very narrow pane clips a title to
+    /// an ellipsis rather than to nothing at all.
+    #[test]
+    fn the_text_budget_floors_instead_of_reaching_zero() {
+        assert_eq!(week_text_budget(80), 80 - WEEK_GRID_WIDTH - WEEK_GRID_GAP);
+        assert_eq!(week_text_budget(0), WEEK_TITLE_FLOOR);
+        assert_eq!(week_text_budget(WEEK_GRID_WIDTH), WEEK_TITLE_FLOOR);
+    }
+
+    /// Clipping is span-aware: spans that fit keep their own styles, the one
+    /// straddling the budget is cut with an ellipsis, and the rest are dropped.
+    #[test]
+    fn clipping_keeps_whole_spans_and_cuts_the_straddling_one() {
+        let spans = vec![
+            Span::styled("ab", Style::new().fg(Color::Red)),
+            Span::styled("cdefgh", Style::new().fg(Color::Blue)),
+            Span::raw("ignored"),
+        ];
+        let clipped = clip_spans(spans, 5);
+
+        assert_eq!(spans_width(&clipped), 5);
+        assert_eq!(clipped.len(), 2, "the third span is past the budget");
+        assert_eq!(clipped[0].content, "ab");
+        assert_eq!(clipped[0].style.fg, Some(Color::Red));
+        assert!(
+            clipped[1].content.ends_with('…'),
+            "{:?}",
+            clipped[1].content
+        );
+        assert_eq!(clipped[1].style.fg, Some(Color::Blue));
+    }
+
+    /// Zero room spends no ellipsis. `truncate` answers `"…"` even at width 0, and
+    /// trusting it would overflow the very budget being enforced by a cell —
+    /// enough to push the grid's last column off the row.
+    #[test]
+    fn clipping_at_zero_room_drops_the_span_rather_than_overflowing() {
+        let spans = vec![Span::raw("ab"), Span::raw("cd")];
+        let clipped = clip_spans(spans, 2);
+        assert_eq!(spans_width(&clipped), 2);
+        assert_eq!(clipped.len(), 1, "no ellipsis span past the budget");
+    }
+
+    /// A run that already fits is returned untouched — clipping must not spend an
+    /// ellipsis on a row that had room.
+    #[test]
+    fn clipping_leaves_a_run_that_fits_alone() {
+        let spans = vec![Span::raw("abc"), Span::raw("de")];
+        let clipped = clip_spans(spans, 5);
+        assert_eq!(clipped.len(), 2);
+        assert_eq!(spans_width(&clipped), 5);
+    }
+
+    /// `week_offset` must count exactly the rows `week_spread` inserts, or the
+    /// cursor lands on a header. Derived by building the spread and finding the
+    /// row, never by restating the arithmetic.
+    #[test]
+    fn the_cursor_offset_counts_the_headers_the_spread_inserts() {
+        let theme = Theme::from_flavor("mocha");
+        let grid = WeekGrid {
+            start: NaiveDate::from_ymd_opt(2026, 8, 17).expect("valid date"),
+            today_column: Some(0),
+            inner_width: 60,
+        };
+        // Two pool rows then two scheduled ones, and every cursor position over
+        // them — including the first row of each block, where the offset changes.
+        for (pool_rows, pool_title) in [(2usize, Some("Work")), (0, Some("Work")), (0, None)] {
+            let rows: Vec<ListItem> = (0..4)
+                .map(|i| ListItem::new(Line::from(format!("row{i}"))))
+                .collect();
+            for p in 0..rows.len() {
+                let (out, selected) =
+                    week_spread(rows.clone(), Some(p), pool_rows, pool_title, &grid, &theme);
+                let at = selected.expect("a cursor in, a cursor out");
+                assert_eq!(
+                    out[at].clone(),
+                    ListItem::new(Line::from(format!("row{p}"))),
+                    "pool_rows {pool_rows}, title {pool_title:?}, p {p}"
+                );
+            }
+        }
     }
 }

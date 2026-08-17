@@ -1,7 +1,7 @@
 //! The ubiquitous language, as Rust types. Mirrors Google's model exactly
 //! (ADR-0003: pure mirror). See `CONTEXT.md` for definitions.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 /// A Google TaskList — a named container of Tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +293,50 @@ pub fn due_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
     due.is_some_and(|d| d < today)
 }
 
+/// How many day columns the **Weekly spread** draws: Monday through Friday.
+/// Every width, index bound and column lookup derives from this — the grid never
+/// hardcodes a `5`.
+pub const WEEK_DAYS: usize = 5;
+
+/// The Monday of the week `today` falls in, plus `offset` whole weeks. `offset`
+/// is the spread's `]`/`[` position: `0` is the current week, `1` the next.
+///
+/// The single definition of the spread's window, shared by the membership
+/// predicate (`in_week`), the column lookup (`week_column`) and the dateline the
+/// panel title prints, so the three cannot name different weeks.
+///
+/// ISO weeks start on Monday, so a Saturday or Sunday belongs to the week that
+/// *began* before it: the spread you are still planning against, not the one
+/// starting in two days.
+pub fn week_start(today: NaiveDate, offset: u32) -> NaiveDate {
+    let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday().into());
+    monday + chrono::Duration::weeks(offset.into())
+}
+
+/// Which column of the spread an entry sits in, or `None` when it is outside
+/// the Monday–Friday window `start` opens.
+///
+/// The single definition of both membership and placement: `in_week` is this
+/// answering `Some`, so a row can never be in the spread without a cell to draw
+/// its dot in. Undated entries answer `None` — they belong to the UNSCHEDULED
+/// pool, which has no column.
+///
+/// Saturday and Sunday are deliberately outside it: the spread plans weekdays,
+/// and there is no column to draw a weekend entry in.
+pub fn week_column(due: Option<NaiveDate>, start: NaiveDate) -> Option<usize> {
+    let due = due?;
+    let day = (due - start).num_days();
+    (0..WEEK_DAYS as i64).contains(&day).then_some(day as usize)
+}
+
+/// Whether an entry is in the **Weekly spread**'s scheduled half: dated within
+/// the Monday–Friday window `start` opens. Status-blind and List-blind — the
+/// scheduled half spans every List, and a Completed row keeps its cell so the
+/// week reads back as what was done as well as what is left.
+pub fn in_week(due: Option<NaiveDate>, start: NaiveDate) -> bool {
+    week_column(due, start).is_some()
+}
+
 // Newtypes keep List and Task ids from being swapped by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListId(pub String);
@@ -451,6 +495,52 @@ mod tests {
         for due in [day(21), None] {
             assert!(!due_before(due, today), "{due:?} is not overdue");
             assert!(!due_on_or_before(due, today), "{due:?} is not in Today");
+        }
+    }
+
+    /// Every day of a week names the same Monday, so which day you open the
+    /// spread on never shifts the window. The weekend included: it belongs to
+    /// the week that began before it, not the one starting in two days.
+    #[test]
+    fn every_day_of_a_week_names_the_same_monday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 8, 17).expect("valid date");
+        for d in 17..=23 {
+            let day = NaiveDate::from_ymd_opt(2026, 8, d).expect("valid date");
+            assert_eq!(week_start(day, 0), monday, "{day} names its Monday");
+        }
+    }
+
+    /// The offset is whole weeks, and it crosses a year boundary by arithmetic
+    /// rather than by any calendar rule of its own.
+    #[test]
+    fn the_week_offset_steps_seven_days_across_a_year_boundary() {
+        let day = NaiveDate::from_ymd_opt(2026, 12, 30).expect("valid date");
+        assert_eq!(
+            week_start(day, 0),
+            NaiveDate::from_ymd_opt(2026, 12, 28).expect("valid date")
+        );
+        assert_eq!(
+            week_start(day, 1),
+            NaiveDate::from_ymd_opt(2027, 1, 4).expect("valid date")
+        );
+    }
+
+    /// Membership and placement are one question: a row is in the spread exactly
+    /// when it has a column to draw its dot in. Saturday, Sunday, the day before
+    /// Monday and undated all fall outside.
+    #[test]
+    fn the_week_window_is_monday_through_friday_and_membership_is_its_column() {
+        let start = NaiveDate::from_ymd_opt(2026, 8, 17).expect("valid date");
+        let day = |d: u32| Some(NaiveDate::from_ymd_opt(2026, 8, d).expect("valid date"));
+
+        for (d, column) in (17..=21).zip(0..WEEK_DAYS) {
+            assert_eq!(week_column(day(d), start), Some(column), "Aug {d}");
+            assert!(in_week(day(d), start), "Aug {d}");
+        }
+        // Sunday before, Saturday and Sunday after, and undated.
+        for due in [day(16), day(22), day(23), None] {
+            assert_eq!(week_column(due, start), None, "{due:?}");
+            assert!(!in_week(due, start), "{due:?}");
         }
     }
 }

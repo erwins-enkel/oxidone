@@ -80,6 +80,15 @@ pub enum Action {
     AddList,
     RenameList,
     DeleteList,
+    /// Toggle the **Weekly spread** (`W`): a planning lens over Monday–Friday,
+    /// orthogonal to the sidebar selection. `w` is already `ToggleHideDistant`,
+    /// so this takes the shift-pair, as `t`/`T` and `J`/`K` do.
+    ///
+    /// The spread's *own* keys — the day cursor, the dot, `]`/`[` — are not
+    /// `Action`s: they are routed ahead of this table in the reducer, because
+    /// they mean something different inside that one pane. `LegendContext::Week`
+    /// is where they are advertised.
+    ToggleWeek,
 }
 
 /// One row of the keymap: the key, the verb it triggers, and its cheatsheet text.
@@ -320,6 +329,11 @@ pub fn bindings() -> &'static [Binding] {
             help: "move to another list",
         },
         Binding {
+            key: KeyCode::Char('W'),
+            action: Action::ToggleWeek,
+            help: "toggle weekly spread",
+        },
+        Binding {
             key: KeyCode::Char('A'),
             action: Action::AddList,
             help: "add list",
@@ -471,6 +485,10 @@ pub enum LegendContext {
     /// `Up`/`Down` only — `j`/`k` type, as they do in every other text overlay —
     /// and `Enter` runs whichever row is highlighted.
     Omnibox,
+    /// The **Weekly spread**'s task pane. `h`/`l` walk the day columns instead of
+    /// moving focus and `Space` acts on the cell under the cursor, so the ordinary
+    /// `Tasks` legend would advertise two keys that no longer do what it says.
+    Week,
     /// The same input open in **Search**, where `Esc` exits Search rather than
     /// clearing the query — so the `Esc` cell must read "leave search", not
     /// "clear", or the legend promises an affordance the pane does not honour.
@@ -626,6 +644,45 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendEntry {
             keys: LegendKeys::Derived(&[Action::CycleType, Action::CycleTypeBack]),
             label: "type",
+        },
+    ];
+
+    // The spread's keys are hardcoded in the reducer's `week_grid_key`, not in
+    // `bindings()`, so they are literal — a change there must be mirrored here by
+    // hand, exactly as the overlay legends are.
+    //
+    // Ordered by what it costs not to know. `day` and `plan` are the pane: without
+    // them the grid is inert. `done` reads differently here than anywhere else —
+    // it is `Space` acting on a cell — so it earns third place over the digits,
+    // which are only a shortcut for what `day` + `plan` already do. `week` is
+    // last: the panel title already names the week on screen.
+    const WEEK: &[LegendEntry] = &[
+        MOVE,
+        QUIT,
+        LegendEntry {
+            keys: LegendKeys::Literal("h/l"),
+            label: "day",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Space"),
+            label: "plan/done",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("1-5"),
+            label: "mon-fri",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("0"),
+            label: "unschedule",
+        },
+        ADD,
+        LegendEntry {
+            keys: LegendKeys::Derived(&[Action::ToggleWeek]),
+            label: "close",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("]/["),
+            label: "week",
         },
     ];
 
@@ -858,6 +915,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
 
     match context {
         LegendContext::Tasks => TASKS,
+        LegendContext::Week => WEEK,
         LegendContext::Sidebar => SIDEBAR,
         LegendContext::TextInput => TEXT_INPUT,
         LegendContext::DueInput => DUE_INPUT,

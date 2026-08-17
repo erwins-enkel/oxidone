@@ -114,6 +114,11 @@ control of your credentials. It's a one-time, ~10-minute setup.
    unverified and you're a test user, choose *Advanced → proceed*. A local `localhost`
    listener catches the redirect, and the refresh token is saved to your config dir.
 
+If that grant later goes stale — you revoke it, or it expires with no refresh token —
+oxidone re-authorizes from inside the TUI: a panel shows the consent URL and your
+browser opens on it. Leave it unanswered for three minutes and oxidone gives up and
+carries on from the cache, so a walked-away-from prompt never wedges the app.
+
 ## Configuration
 
 Config lives at the platform config dir (`directories`):

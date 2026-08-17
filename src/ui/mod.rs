@@ -101,6 +101,11 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     if let Some(overlay) = &model.overlay {
         render_overlay(frame, area, overlay, model, theme);
     }
+    // Last, and so over everything: an authorization the user has to act on is the
+    // one thing that must not end up underneath a popup.
+    if let Some(url) = &model.auth_prompt {
+        render_auth_prompt(frame, area, url, theme);
+    }
 }
 
 /// Width shared by every overlay, so the picker lines up with the text popups
@@ -2326,6 +2331,72 @@ fn help_cell_spans(
             Style::new().fg(theme.text),
         ),
     ]
+}
+
+/// Width of the consent prompt. Wider than [`OVERLAY_WIDTH`] on purpose: a Google
+/// consent URL runs past 200 cells, and the narrower popup would spend most of the
+/// frame's rows wrapping it.
+const AUTH_PROMPT_WIDTH: u16 = 72;
+
+/// The fallback instruction under the URL. Says "if", not "we opened it": the
+/// browser hand-off is best effort, and the URL on screen is what makes a failed
+/// one recoverable.
+const AUTH_PROMPT_HINT: &str = "Waiting for your browser. If it did not open, visit the URL above.";
+
+/// The consent prompt for an interactive Google authorization: the URL, wrapped,
+/// with the copy-it-yourself fallback beneath it.
+fn render_auth_prompt(frame: &mut Frame, area: Rect, url: &str, theme: &Theme) {
+    let width = AUTH_PROMPT_WIDTH.min(area.width);
+    let text_width = width.saturating_sub(OVERLAY_BORDERS) as usize;
+
+    let mut lines: Vec<Line> = hard_wrap(url, text_width)
+        .into_iter()
+        .map(|part| Line::from(Span::styled(part, Style::new().fg(theme.text))))
+        .collect();
+    lines.extend(
+        hard_wrap(AUTH_PROMPT_HINT, text_width)
+            .into_iter()
+            .map(|part| Line::from(Span::styled(part, Style::new().fg(theme.subtext)))),
+    );
+
+    let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
+    let popup = centered(area, width, height + OVERLAY_BORDERS);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(panel("Authorize with Google", true, theme)),
+        popup,
+    );
+}
+
+/// Break `text` into lines of at most `width` cells, splitting mid-token.
+///
+/// A consent URL is a single unbroken token several times wider than the popup, so
+/// word wrapping has nothing to break it at. Measured in display cells with
+/// `unicode_width`, as [`truncate`] measures. An empty result for `width == 0` —
+/// there is no line a character could go on.
+fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cell = c.width().unwrap_or(0);
+        // `used > 0` because there is no breaking *before* a line's first
+        // character: a character wider than the whole line would otherwise emit a
+        // blank one ahead of itself, for ever.
+        if used > 0 && used + cell > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        line.push(c);
+        used += cell;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {

@@ -142,6 +142,14 @@ pub struct Model {
     pub should_quit: bool,
     /// Transient one-line message (load errors now; toasts later).
     pub status_line: Option<String>,
+    /// The consent URL an interactive Google authorization is waiting on, drawn
+    /// over the frame until the flow settles.
+    ///
+    /// A field of its own rather than an [`Overlay`] variant, because it arrives
+    /// asynchronously: `overlay` is the *user's* input state, and setting it from
+    /// a worker would destroy a half-typed capture. This is drawn on top and
+    /// routes no keys, so an open overlay keeps them.
+    pub auth_prompt: Option<String>,
     /// The active modal overlay (text input or confirmation), if any. While set,
     /// keys route to the overlay instead of the normal keymap.
     pub overlay: Option<Overlay>,
@@ -665,6 +673,7 @@ impl Default for Model {
             show_help: false,
             should_quit: false,
             status_line: None,
+            auth_prompt: None,
             overlay: None,
             pending_writes: HashMap::new(),
             pending_deletes: HashMap::new(),
@@ -1483,6 +1492,15 @@ pub enum Message {
     },
     /// A load failed; the reason is shown on the status line.
     LoadFailed(String),
+    /// An interactive Google authorization needs the user to visit the consent URL
+    /// this carries — held rather than merely announced, so it is still readable
+    /// when the browser did not start.
+    AuthPromptOpened(String),
+    /// That authorization settled. `reason` is `Some` when it failed, and goes to
+    /// the status line — a flow that ends badly must not just vanish.
+    AuthPromptClosed {
+        reason: Option<String>,
+    },
     /// Handing a URL to the browser failed. Nothing to roll back — opening a
     /// link mutates no state — but the attempt must not fail silently.
     LinkOpenFailed {
@@ -2110,6 +2128,19 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             // `LoadWeek` reads the same corpus the same way, so its notice goes too.
             model.search_pending = false;
             model.week_pending = false;
+            Vec::new()
+        }
+        // Deliberately leaves `overlay` alone: this arrives from a worker, and the
+        // overlay may hold a half-typed capture the user is still in.
+        Message::AuthPromptOpened(url) => {
+            model.auth_prompt = Some(url);
+            Vec::new()
+        }
+        Message::AuthPromptClosed { reason } => {
+            model.auth_prompt = None;
+            if let Some(reason) = reason {
+                model.status_line = Some(reason);
+            }
             Vec::new()
         }
     }

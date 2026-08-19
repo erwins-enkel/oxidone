@@ -1,13 +1,14 @@
-//! BYO OAuth loopback flow via `yup-oauth2` (ADR-0002, ADR-0004). Auth is the
-//! one part we do *not* hand-roll: the loopback listener, code exchange, and
-//! transparent refresh all come from `yup-oauth2`. We only bridge its token
-//! cache onto our `TokenStore` so the refresh token lands in the `chmod 600`
-//! file.
+//! BYO OAuth loopback flow via `yup-oauth2` (ADR-0002, ADR-0004, ADR-0009).
+//! `yup-oauth2` owns exactly one thing: the interactive consent flow — the
+//! loopback listener, the browser hand-off, and the code exchange. Refreshing an
+//! existing grant is oxidone's ([`super::refresh`]), because yup's own refresh
+//! path cannot tell a dead grant from a dropped connection and answers both by
+//! opening a browser.
 //!
-//! The interactive first-run path (opening a browser, capturing the loopback
-//! redirect) cannot run headless, so it is compile-verified only. The parts
-//! that don't need a browser — the token store and the REST layer — carry the
-//! real test coverage.
+//! The interactive path (opening a browser, capturing the loopback redirect)
+//! cannot run headless, so it is compile-verified only. Everything that does not
+//! need a browser — the refresh exchange, the token store, the REST layer —
+//! carries the real test coverage.
 
 use std::future::Future;
 use std::path::Path;
@@ -18,9 +19,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use yup_oauth2::authenticator_delegate::InstalledFlowDelegate;
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
-use yup_oauth2::{read_application_secret, InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+use yup_oauth2::{
+    read_application_secret, ApplicationSecret, InstalledFlowAuthenticator,
+    InstalledFlowReturnMethod,
+};
 
 use super::consent::{ConsentPrompt, StdoutConsentSink};
+use super::refresh;
 use super::single_flight::{SingleFlight, CONSENT_TIMEOUT};
 use super::{TokenProvider, TokenStore};
 use crate::api::ApiError;
@@ -32,22 +37,26 @@ const TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
 type BearerFuture = Pin<Box<dyn Future<Output = Result<String, ApiError>> + Send>>;
 type BearerFn = Box<dyn Fn() -> BearerFuture + Send + Sync>;
 
-/// A `TokenProvider` backed by a live `yup-oauth2` authenticator. Each
-/// `bearer()` returns a valid access token, transparently refreshing (and
-/// re-persisting via the `TokenStore`) when the cached one has expired.
+/// A `TokenProvider` over the BYO client credentials. `bearer()` answers from the
+/// stored grant — the cached access token, or a refresh of it that oxidone
+/// performs itself — and reaches the interactive consent flow only when that
+/// grant is *gone*, never when the attempt merely failed.
 ///
-/// The concrete authenticator's connector type is erased behind a boxed
-/// closure, so this struct stays a plain, nameable type.
+/// The authenticator behind the consent flow has a connector type parameter, so
+/// it is erased behind a boxed closure and this struct stays a plain, nameable
+/// type.
 pub struct YupTokenProvider {
-    fetch: BearerFn,
-    force: BearerFn,
+    http: reqwest::Client,
+    secret: ApplicationSecret,
+    store: Arc<dyn TokenStore>,
+    consent: BearerFn,
 }
 
 impl YupTokenProvider {
-    /// Build an authenticator from the BYO `client_secret.json`, persisting its
-    /// token cache through `store`. Does not itself trigger the interactive
-    /// flow — that happens lazily on the first `bearer()` if no cached token
-    /// exists (see [`login`]).
+    /// Build a provider from the BYO `client_secret.json`, persisting tokens
+    /// through `store`. Does not itself trigger the interactive flow — that
+    /// happens lazily on the first `bearer()` that finds no usable grant (see
+    /// [`login`]).
     ///
     /// `prompt` is where a consent URL goes when that lazy flow does fire. It is
     /// not optional: the default `yup-oauth2` delegate writes the URL to stdout,
@@ -63,44 +72,30 @@ impl YupTokenProvider {
                 format!("reading BYO client secret {}", client_secret_path.display())
             })?;
 
-        let auth =
-            InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
-                .with_storage(Box::new(StoreBridge { inner: store }))
-                .flow_delegate(Box::new(PromptFlowDelegate { prompt }))
-                .build()
-                .await
-                .context("building yup-oauth2 authenticator")?;
+        let auth = InstalledFlowAuthenticator::builder(
+            secret.clone(),
+            InstalledFlowReturnMethod::HTTPRedirect,
+        )
+        .with_storage(Box::new(StoreBridge {
+            inner: Arc::clone(&store),
+        }))
+        .flow_delegate(Box::new(PromptFlowDelegate { prompt }))
+        .build()
+        .await
+        .context("building yup-oauth2 authenticator")?;
 
         let auth = Arc::new(auth);
         let scopes: Arc<[String]> = Arc::from(vec![TASKS_SCOPE.to_string()]);
 
-        let fetch: BearerFn = {
-            let auth = Arc::clone(&auth);
-            let scopes = Arc::clone(&scopes);
-            Box::new(move || {
-                let auth = Arc::clone(&auth);
-                let scopes = Arc::clone(&scopes);
-                Box::pin(async move {
-                    let token = auth
-                        .token(scopes.as_ref())
-                        .await
-                        .map_err(|e| map_token_error(&e))?;
-                    token
-                        .token()
-                        .map(str::to_owned)
-                        .ok_or(ApiError::AuthExpired)
-                })
-            })
-        };
-
-        // Force a fresh access token even if the cached one still looks valid —
-        // used to retry after a server 401.
-        let force: BearerFn = Box::new(move || {
+        // The consent flow, and only the consent flow. It is reached with the
+        // store already cleared, so yup finds an empty cache and goes straight to
+        // the browser instead of retrying a refresh we have already classified.
+        let consent: BearerFn = Box::new(move || {
             let auth = Arc::clone(&auth);
             let scopes = Arc::clone(&scopes);
             Box::pin(async move {
                 let token = auth
-                    .force_refreshed_token(scopes.as_ref())
+                    .token(scopes.as_ref())
                     .await
                     .map_err(|e| map_token_error(&e))?;
                 token
@@ -110,25 +105,41 @@ impl YupTokenProvider {
             })
         });
 
-        Ok(Self { fetch, force })
+        Ok(Self {
+            http: reqwest::Client::new(),
+            secret,
+            store,
+            consent,
+        })
+    }
+
+    /// Answer from the stored grant, falling through to consent only on
+    /// [`ApiError::AuthExpired`] — which [`refresh::cached_or_refreshed`] returns
+    /// for a grant Google refused as `invalid_grant`, or for a cache with nothing
+    /// left to exchange. Every other error is returned as it is: no browser.
+    async fn grant_or_consent(&self, force: bool) -> Result<String, ApiError> {
+        match refresh::cached_or_refreshed(&self.http, &self.secret, &*self.store, force).await {
+            Err(ApiError::AuthExpired) => (self.consent)().await,
+            outcome => outcome,
+        }
     }
 }
 
 #[async_trait]
 impl TokenProvider for YupTokenProvider {
     async fn bearer(&self) -> Result<String, ApiError> {
-        (self.fetch)().await
+        self.grant_or_consent(false).await
     }
 
     async fn refresh(&self) -> Result<String, ApiError> {
-        (self.force)().await
+        self.grant_or_consent(true).await
     }
 }
 
-/// First-run: build the authenticator and force one token acquisition, which
-/// opens the system browser to Google's consent screen, runs the `localhost`
-/// loopback listener, exchanges the code, and persists the refresh token via
-/// the `TokenStore`.
+/// First-run: build the provider and force one token acquisition, which opens the
+/// system browser to Google's consent screen, runs the `localhost` loopback
+/// listener, exchanges the code, and persists the refresh token via the
+/// `TokenStore`.
 ///
 /// This one runs *before* the TUI, so its consent URL goes to stdout — the only
 /// place the user can see it yet. It is wrapped in [`SingleFlight`] for the
@@ -191,19 +202,25 @@ fn open_in_browser(url: &str) {
     });
 }
 
-/// Best-effort classification of a `yup-oauth2` token error. A refused refresh
-/// (expired/revoked grant) surfaces as `AuthExpired` so a caller can prompt for
-/// re-login; anything else is treated as a transport failure.
+/// Classify a `yup-oauth2` error from the consent flow.
+///
+/// The three cases are kept apart because they call for different things: a
+/// refused authorization means authorize again, a token that could not be *saved*
+/// means fix the disk (and will otherwise re-prompt on every start), and anything
+/// else is the transport. A persist failure used to fall through to
+/// `ApiError::Network`, where the retry advice is wrong and the class is exactly
+/// the one a caller is entitled to ignore.
 fn map_token_error(err: &yup_oauth2::Error) -> ApiError {
     match err {
         yup_oauth2::Error::AuthError(_) => ApiError::AuthExpired,
+        yup_oauth2::Error::StorageError(e) => ApiError::TokenNotPersisted(e.to_string()),
         other => ApiError::Network(other.to_string()),
     }
 }
 
-/// Adapts our single-blob `TokenStore` to yup-oauth2's per-scope `TokenStorage`.
-/// oxidone uses one fixed scope set, so a single serialized `TokenInfo` blob is
-/// sufficient; the scope key is ignored.
+/// Adapts our single-blob `TokenStore` to yup-oauth2's per-scope `TokenStorage`,
+/// for the consent flow's own write. oxidone uses one fixed scope set, so a single
+/// serialized `TokenInfo` blob is sufficient; the scope key is ignored.
 struct StoreBridge {
     inner: Arc<dyn TokenStore>,
 }
@@ -211,30 +228,53 @@ struct StoreBridge {
 #[async_trait]
 impl TokenStorage for StoreBridge {
     async fn set(&self, _scopes: &[&str], token: TokenInfo) -> Result<(), TokenStorageError> {
-        let json = serde_json::to_string(&token)
-            .map_err(|e| TokenStorageError::Other(e.to_string().into()))?;
-        self.inner
-            .save(&json)
-            .map_err(|e| TokenStorageError::Other(e.to_string().into()))
+        // Shared with the refresh path, so a consent's token and a refreshed one
+        // are written — and a failure logged — by the same code.
+        refresh::persist(&*self.inner, &token).map_err(|e| TokenStorageError::Other(e.into()))
     }
 
     async fn get(&self, _scopes: &[&str]) -> Option<TokenInfo> {
-        // yup-oauth2's storage API is `Option`-returning, so a read/parse
-        // failure can only degrade to "no token" (forcing re-login). Log it so
-        // a transient read error or a corrupt file isn't silently swallowed.
-        let blob = match self.inner.load() {
-            Ok(blob) => blob?,
-            Err(e) => {
-                tracing::warn!(error = %e, "reading cached token failed; will re-authenticate");
-                return None;
-            }
-        };
-        match serde_json::from_str(&blob) {
-            Ok(token) => Some(token),
-            Err(e) => {
-                tracing::warn!(error = %e, "cached token is corrupt; will re-authenticate");
-                None
-            }
-        }
+        refresh::load(&*self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yup_oauth2::error::{AuthError, AuthErrorCode, TokenStorageError};
+
+    #[test]
+    fn a_refused_authorization_is_an_expired_grant() {
+        let err = yup_oauth2::Error::AuthError(AuthError {
+            error: AuthErrorCode::InvalidGrant,
+            error_description: Some("Token has been expired or revoked.".to_string()),
+            error_uri: None,
+        });
+        assert_eq!(map_token_error(&err), ApiError::AuthExpired);
+    }
+
+    #[test]
+    fn a_token_that_could_not_be_stored_is_not_a_network_error() {
+        // The regression this guards: a read-only config dir reporting itself as a
+        // transient network fault, which is the one class the provider's callers
+        // are entitled to shrug off and retry later.
+        let err = yup_oauth2::Error::StorageError(TokenStorageError::Other(
+            "writing token file /nope/token.json: Permission denied".into(),
+        ));
+        assert_eq!(
+            map_token_error(&err),
+            ApiError::TokenNotPersisted(
+                "writing token file /nope/token.json: Permission denied".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn anything_else_is_the_transport() {
+        let err = yup_oauth2::Error::UserError("no listener".to_string());
+        assert_eq!(
+            map_token_error(&err),
+            ApiError::Network("Invalid user input: no listener".to_string())
+        );
     }
 }

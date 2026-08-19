@@ -31,9 +31,14 @@ catppuccin = { version = "2", features = ["ratatui"] }  # palette -> ratatui Col
 # Async runtime — scoped features only
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process"] }
 
-# HTTP + auth (hand-rolled REST; yup-oauth2 for the loopback flow only — see ADR-0004)
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+# HTTP + auth (hand-rolled REST *and* refresh exchange; yup-oauth2 for the
+# interactive consent flow only — see ADR-0004, narrowed by ADR-0009).
+# `form` is what posts `grant_type=refresh_token` to Google's token endpoint.
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls"] }
 yup-oauth2 = "12"
+# Only to build `yup_oauth2::storage::TokenInfo::expires_at`, which is a
+# `time::OffsetDateTime` that yup-oauth2 does not re-export.
+time = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"       # object-safe async TasksApi trait (or drop for RPITIT)
 
 # Local cache (see ADR-0001) + completion log (ADR-0007)

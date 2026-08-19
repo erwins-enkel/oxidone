@@ -9,10 +9,12 @@
 //! calls, where no caller can reach it.
 //!
 //! Here it is a pure function over Google's status and body ([`classify`]), and
-//! only one outcome — a refusal Google itself labelled `invalid_grant`, or a
-//! stored blob with no refresh token to send — is allowed to mean "open a
-//! browser". Everything else keeps its own [`ApiError`] class and leaves the
-//! stored grant where it is.
+//! exactly three outcomes are allowed to mean "open a browser": nothing usable is
+//! stored (a first run, or a blob that is not a token), the stored blob has no
+//! refresh token to send, and a refusal Google itself labelled `invalid_grant`.
+//! Every other outcome keeps its own [`ApiError`] class and leaves the stored
+//! grant where it is — including a [`TokenStore`] that *fails*, which is a broken
+//! file rather than a missing grant and would otherwise prompt on every launch.
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -35,16 +37,18 @@ const MAX_QUOTED_BODY: usize = 200;
 ///
 /// `Err(ApiError::AuthExpired)` is the *only* outcome that means "run the
 /// interactive consent flow". Every other failure keeps its own class, so a
-/// dropped connection, a rejected `client_secret.json`, or a config dir that
-/// refuses the write can never be mistaken for a dead grant and answered with a
-/// browser window.
+/// dropped connection, a rejected `client_secret.json`, or a token file that
+/// cannot be read or written can never be mistaken for a dead grant and answered
+/// with a browser window.
 pub async fn cached_or_refreshed(
     http: &reqwest::Client,
     secret: &ApplicationSecret,
     store: &dyn TokenStore,
     force: bool,
 ) -> Result<String, ApiError> {
-    let Some(stored) = load(store) else {
+    // `?` first: a store that *failed* is not a missing grant, and answering it
+    // with consent would prompt on every launch for as long as the file is broken.
+    let Some(stored) = load(store)? else {
         // Nothing usable cached: only consent can produce a grant from here.
         return Err(ApiError::AuthExpired);
     };
@@ -121,27 +125,36 @@ pub async fn cached_or_refreshed(
             .and_then(|seconds| OffsetDateTime::now_utc().checked_add(Duration::seconds(seconds))),
         id_token: refreshed.id_token,
     };
-    persist(store, &token).map_err(ApiError::TokenNotPersisted)?;
+    persist(store, &token).map_err(ApiError::TokenStoreFailed)?;
     Ok(bearer)
 }
 
-/// Read and parse the stored token cache, or `None` if there is nothing usable
-/// there. A read or parse failure degrades to `None` — re-authorizing is the only
-/// remedy either way — but it is logged, so a corrupt file or a transient read
-/// error is not silently indistinguishable from a first run.
-pub(super) fn load(store: &dyn TokenStore) -> Option<TokenInfo> {
-    let blob = match store.load() {
-        Ok(blob) => blob?,
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "reading the cached token failed; will re-authenticate");
-            return None;
-        }
+/// Read and parse the stored token cache.
+///
+/// `Ok(None)` means nothing usable is stored: no file yet, or contents that are
+/// not a token. Consent is the remedy for both, and it overwrites the file either
+/// way. `Err` means the *store* failed — a file we are not allowed to read, an
+/// I/O error, bytes that are not UTF-8. That is a broken file, not a missing
+/// grant: it gets its own class ([`ApiError::TokenStoreFailed`]) so it can never
+/// be answered with a browser window, which is what a root-owned `token.json`
+/// would otherwise earn on every single launch.
+pub(super) fn load(store: &dyn TokenStore) -> Result<Option<TokenInfo>, ApiError> {
+    let stored = store.load().map_err(|e| {
+        let detail = format!("{e:#}");
+        tracing::error!(
+            error = %detail,
+            "the stored token could not be read; oxidone cannot authorize until this is fixed"
+        );
+        ApiError::TokenStoreFailed(detail)
+    })?;
+    let Some(blob) = stored else {
+        return Ok(None);
     };
     match serde_json::from_str(&blob) {
-        Ok(token) => Some(token),
+        Ok(token) => Ok(Some(token)),
         Err(e) => {
             tracing::warn!(error = %e, "the cached token is corrupt; will re-authenticate");
-            None
+            Ok(None)
         }
     }
 }
@@ -150,7 +163,7 @@ pub(super) fn load(store: &dyn TokenStore) -> Option<TokenInfo> {
 /// written — the caller decides what to wrap it in, so the reason is stated once
 /// however many layers it passes through.
 ///
-/// Every caller turns this into [`ApiError::TokenNotPersisted`] and never anything
+/// Every caller turns this into [`ApiError::TokenStoreFailed`] and never anything
 /// else: the acquisition succeeded, so calling it a network error would invite a
 /// retry that cannot help, and calling it an expired grant would answer a full
 /// disk with another consent flow. Logged at `error!` because the alternative — a

@@ -267,6 +267,35 @@ async fn an_absurd_expiry_is_dropped_rather_than_panicking() {
     assert_eq!(read_stored(&store).expires_at, None);
 }
 
+/// A grant that cannot be *read* is not a missing grant. Answering it with consent
+/// is what makes a root-owned `token.json` prompt on every single launch.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_token_file_does_not_ask_for_consent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path(), &stored(Some("spent"), Some("grant-1"), -60));
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let error = cached_or_refreshed(&reqwest::Client::new(), &secret(&server), &store, false).await;
+
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        matches!(error, Err(ApiError::TokenStoreFailed(_))),
+        "an unreadable store must not read as an expired grant, got {error:?}"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "there is no grant to send"
+    );
+    assert!(
+        store.path().exists(),
+        "a file we could not read must not be deleted"
+    );
+}
+
 /// A refresh that Google grants but the disk refuses must not report itself as a
 /// network error: retrying cannot help, and the class would let a caller shrug it
 /// off — leaving a session that works today and re-authorizes tomorrow.
@@ -296,7 +325,7 @@ async fn a_token_that_cannot_be_written_is_not_a_network_error() {
 
     fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
     assert!(
-        matches!(error, Err(ApiError::TokenNotPersisted(_))),
+        matches!(error, Err(ApiError::TokenStoreFailed(_))),
         "an unwritable store must say so, got {error:?}"
     );
 }

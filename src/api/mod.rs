@@ -95,15 +95,17 @@ pub enum ApiError {
     Network(String),
     #[error("auth expired")]
     AuthExpired,
-    /// Authorization succeeded, but the token could not be written to the
-    /// `TokenStore`. Deliberately neither of its neighbours: not
-    /// [`ApiError::Network`], because retrying will not make a full or read-only
-    /// config dir accept the token, and not [`ApiError::AuthExpired`], which
-    /// would answer a disk failure with a second browser window. A token that is
-    /// acquired and never persisted is what makes a grant look like it dies
-    /// daily, so it says so in its own words.
-    #[error("authorized, but the token could not be saved: {0}")]
-    TokenNotPersisted(String),
+    /// The `TokenStore` itself failed: the stored grant could not be read, or a
+    /// freshly acquired token could not be written. One class for both directions
+    /// because the remedy is the same — fix the file — and deliberately neither of
+    /// its neighbours: not [`ApiError::Network`], because retrying will not make a
+    /// full or unreadable config dir work, and not [`ApiError::AuthExpired`],
+    /// which would answer a disk failure with a browser window on every launch. A
+    /// token that cannot be read, or is acquired and never persisted, is what
+    /// makes a grant look like it dies daily, so it says so in its own words.
+    /// The store's own error names which direction failed.
+    #[error("the token store failed: {0}")]
+    TokenStoreFailed(String),
     #[error("not found")]
     NotFound,
     #[error("google rejected the request: {status} {message}")]

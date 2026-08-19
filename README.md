@@ -122,8 +122,9 @@ and carries on from the cache — all of them, together — so a walked-away-fro
 never wedges the app. Whatever asks for a token next prompts again.
 
 Only a refresh Google itself refused as `invalid_grant` does that. A timeout, a 5xx, or
-a token file oxidone could not write keep their own error and never open a browser
-(ADR-0009), so a network blip on resume-from-sleep costs you nothing.
+a token file oxidone could not read or write keep their own error and never open a
+browser (ADR-0009), so neither a network blip on resume-from-sleep nor a token file with
+the wrong owner costs you anything more than an error.
 
 ### If it keeps asking you to authorize
 
@@ -134,11 +135,11 @@ Audience → Publish app* removes that expiry; you still click through the unver
 screen once, at consent time.
 
 If it is more often than that, the log says which of the causes it is — Google's own
-`error`/`error_description`/`error_subtype` for a refused grant, or the underlying write
-error when the token could not be saved:
+`error`/`error_description`/`error_subtype` for a refused grant, or the underlying file
+error when the token could not be saved or read back:
 
 ```sh
-grep -iE 'invalid_grant|could not be saved' \
+grep -iE 'invalid_grant|could not be (saved|read)' \
   "${XDG_STATE_HOME:-$HOME/.local/state}/oxidone/logs/oxidone.log.$(date +%F)"
 ```
 

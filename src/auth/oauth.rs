@@ -87,9 +87,11 @@ impl YupTokenProvider {
         let auth = Arc::new(auth);
         let scopes: Arc<[String]> = Arc::from(vec![TASKS_SCOPE.to_string()]);
 
-        // The consent flow, and only the consent flow. It is reached with the
-        // store already cleared, so yup finds an empty cache and goes straight to
-        // the browser instead of retrying a refresh we have already classified.
+        // The consent flow, and only the consent flow. It is reached only when
+        // there is no usable grant left — cleared because Google refused it, never
+        // written, or unparseable — so yup's own storage read comes back empty and
+        // it goes straight to the browser instead of retrying a refresh we have
+        // already classified.
         let consent: BearerFn = Box::new(move || {
             let auth = Arc::clone(&auth);
             let scopes = Arc::clone(&scopes);
@@ -115,8 +117,12 @@ impl YupTokenProvider {
 
     /// Answer from the stored grant, falling through to consent only on
     /// [`ApiError::AuthExpired`] — which [`refresh::cached_or_refreshed`] returns
-    /// for a grant Google refused as `invalid_grant`, or for a cache with nothing
-    /// left to exchange. Every other error is returned as it is: no browser.
+    /// for a grant Google refused as `invalid_grant`, for a blob with nothing left
+    /// to exchange, and for a cache with nothing usable in it at all (a first run,
+    /// or contents that are not a token). Every other error is returned as it is:
+    /// no browser. A `TokenStore` that *fails* is in that second group — it is a
+    /// broken file, not a missing grant, and consenting would only prompt again on
+    /// the next launch.
     async fn grant_or_consent(&self, force: bool) -> Result<String, ApiError> {
         match refresh::cached_or_refreshed(&self.http, &self.secret, &*self.store, force).await {
             Err(ApiError::AuthExpired) => (self.consent)().await,
@@ -205,15 +211,15 @@ fn open_in_browser(url: &str) {
 /// Classify a `yup-oauth2` error from the consent flow.
 ///
 /// The three cases are kept apart because they call for different things: a
-/// refused authorization means authorize again, a token that could not be *saved*
-/// means fix the disk (and will otherwise re-prompt on every start), and anything
-/// else is the transport. A persist failure used to fall through to
+/// refused authorization means authorize again, a token store that could not take
+/// the token means fix the file (and will otherwise re-prompt on every start), and
+/// anything else is the transport. A store failure used to fall through to
 /// `ApiError::Network`, where the retry advice is wrong and the class is exactly
 /// the one a caller is entitled to ignore.
 fn map_token_error(err: &yup_oauth2::Error) -> ApiError {
     match err {
         yup_oauth2::Error::AuthError(_) => ApiError::AuthExpired,
-        yup_oauth2::Error::StorageError(e) => ApiError::TokenNotPersisted(e.to_string()),
+        yup_oauth2::Error::StorageError(e) => ApiError::TokenStoreFailed(e.to_string()),
         other => ApiError::Network(other.to_string()),
     }
 }
@@ -234,7 +240,13 @@ impl TokenStorage for StoreBridge {
     }
 
     async fn get(&self, _scopes: &[&str]) -> Option<TokenInfo> {
-        refresh::load(&*self.inner)
+        // yup-oauth2's storage API is `Option`-returning, so a *failed* read can
+        // only be reported here as "nothing stored". That is safe on this path and
+        // nowhere else: the consent flow is only ever reached once
+        // `cached_or_refreshed` has read the store itself and classified what it
+        // found, and a read failure never gets that far. `load` has already logged
+        // it either way.
+        refresh::load(&*self.inner).ok().flatten()
     }
 }
 
@@ -263,7 +275,7 @@ mod tests {
         ));
         assert_eq!(
             map_token_error(&err),
-            ApiError::TokenNotPersisted(
+            ApiError::TokenStoreFailed(
                 "writing token file /nope/token.json: Permission denied".to_string()
             )
         );

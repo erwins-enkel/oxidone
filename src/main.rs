@@ -1238,6 +1238,31 @@ impl ConsentSink for TuiConsentSink {
     }
 }
 
+/// What the pre-TUI gate should do with whatever the token store said.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenGate {
+    /// Nothing stored — a first run. Authorize now, while stdout is still ours.
+    Consent,
+    /// A grant is on disk. The provider refreshes it, and classifies it if that
+    /// fails; nothing to do here.
+    UseStored,
+    /// The store itself failed. Deliberately *not* `Consent`: a file oxidone
+    /// cannot read is a broken file, not a missing grant, and consenting would
+    /// open a browser on every single launch and still have nowhere to put the
+    /// token it came back with.
+    Unreadable(String),
+}
+
+/// Decide the gate from the store's answer. Pure, because the wrong branch here is
+/// invisible until someone's `token.json` has the wrong owner.
+fn token_gate(stored: anyhow::Result<Option<String>>) -> TokenGate {
+    match stored {
+        Ok(None) => TokenGate::Consent,
+        Ok(Some(_)) => TokenGate::UseStored,
+        Err(e) => TokenGate::Unreadable(format!("{e:#}")),
+    }
+}
+
 /// Build the live Google client from BYO credentials, running the first-run
 /// browser authorization if no token is cached yet. Returns `None` (offline) if
 /// no credentials are configured or auth setup fails.
@@ -1245,25 +1270,30 @@ impl ConsentSink for TuiConsentSink {
 /// `tx` is only for the consent prompt: the token cache can turn out to be
 /// unusable (expired with no refresh token, or a grant Google has since rejected),
 /// and then the interactive flow fires later, from whichever worker asked for a
-/// token first.
+/// token first. An *unreadable* cache takes that same road on purpose — as
+/// `ApiError::TokenStoreFailed`, which reaches the frame where the user is looking,
+/// rather than a browser window here and a stderr line the alternate screen eats.
 async fn build_api(config: &Config, tx: UnboundedSender<Message>) -> Api {
     let secret = config.client_secret_path.as_ref()?;
     let store = FileTokenStore::in_config_dir()?;
-    let has_token = match store.load() {
-        Ok(token) => token.is_some(),
-        Err(e) => {
-            tracing::warn!(error = %e, "reading cached token failed; will re-authenticate");
-            false
-        }
-    };
+    let gate = token_gate(store.load());
     let store: Arc<dyn TokenStore> = Arc::new(store);
 
-    if !has_token {
-        eprintln!("oxidone: authorizing with Google — a browser window will open…");
-        if let Err(e) = auth::login(secret, store.clone()).await {
-            tracing::error!(error = %e, "google authorization failed");
-            eprintln!("oxidone: authorization failed ({e}); starting offline.");
-            return None;
+    match gate {
+        TokenGate::UseStored => {}
+        TokenGate::Unreadable(detail) => {
+            tracing::error!(
+                error = %detail,
+                "the stored token could not be read; oxidone cannot authorize until this is fixed"
+            );
+        }
+        TokenGate::Consent => {
+            eprintln!("oxidone: authorizing with Google — a browser window will open…");
+            if let Err(e) = auth::login(secret, store.clone()).await {
+                tracing::error!(error = %e, "google authorization failed");
+                eprintln!("oxidone: authorization failed ({e}); starting offline.");
+                return None;
+            }
         }
     }
 
@@ -1315,4 +1345,36 @@ fn init_tracing() {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_stored_authorizes_before_the_tui_takes_the_terminal() {
+        assert_eq!(token_gate(Ok(None)), TokenGate::Consent);
+    }
+
+    #[test]
+    fn a_stored_grant_is_left_to_the_provider() {
+        assert_eq!(token_gate(Ok(Some("{}".to_string()))), TokenGate::UseStored);
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_does_not_authorize() {
+        // The regression this guards: a `token.json` with the wrong owner counted
+        // as "no token", so every launch opened a consent browser — and had
+        // nowhere to write the token it earned.
+        let gate = token_gate(Err(anyhow::anyhow!(
+            "reading token file /home/x/.config/oxidone/token.json: Permission denied"
+        )));
+        assert_eq!(
+            gate,
+            TokenGate::Unreadable(
+                "reading token file /home/x/.config/oxidone/token.json: Permission denied"
+                    .to_string()
+            )
+        );
+    }
 }

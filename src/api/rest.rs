@@ -404,9 +404,9 @@ impl RestClient {
 /// already consumed the body to classify it — the body can only be read once,
 /// and the retry decision needs it first.
 ///
-/// `yup-oauth2` refreshes tokens proactively at the token layer, so a 401 that
-/// survives `send`'s forced refresh means a revoked/expired grant that no retry
-/// would fix — it surfaces as `AuthExpired` so the consuming slice can prompt
+/// The token layer refreshes proactively (`auth::cached_or_refreshed`), so a 401
+/// that survives `send`'s forced refresh means a revoked/expired grant that no
+/// retry would fix — it surfaces as `AuthExpired` so the consuming slice can prompt
 /// re-authentication, distinct from a hard rejection.
 ///
 /// The two limit cases are kept apart because the advice differs: a short-term

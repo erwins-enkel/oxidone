@@ -22,11 +22,15 @@ testable against `wiremock` with no browser and no Google account.
 - The refresh half of the flow is ours to maintain, including carrying the stored refresh
   token forward when Google's response omits one — which is Google's normal behaviour.
 - `yup-oauth2` is still the consent flow, and its internal fall-through still lives there. It
-  is unreachable on our path only because the store is cleared before we hand off; a future
-  change that stops clearing first would silently reopen it.
-- A failed *persist* is now distinguishable from a failed *request*
-  (`ApiError::TokenNotPersisted`). A token that is acquired and never written is what makes a
-  grant look like it dies daily, and it no longer reads as a transient network error.
+  is unreachable on our path only because yup never finds a refresh token to try when we hand
+  off — the store was cleared, or held nothing usable to begin with; a change that hands off
+  with a live refresh token still in the store would silently reopen it.
+- A failed token *store* is now distinguishable from a failed *request*
+  (`ApiError::TokenStoreFailed`), in both directions: a grant that cannot be read back and a
+  freshly acquired token that cannot be written share the class, because they share the
+  remedy — fix the file — and the store's own error names which way it went. Either failure is
+  what makes a grant look like it dies daily, and neither reads as a transient network error
+  any more, nor as an expired grant that a browser window would fix.
 - Access-token caching stays where it was — the stored `TokenInfo` and
   `TokenInfo::is_expired()` — so there is one expiry margin in the codebase, not a second of
   our own invention.

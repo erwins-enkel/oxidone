@@ -5,7 +5,7 @@
 //! a second one.
 //!
 //! Every assertion here that concerns *style* — the reversed prefill, the
-//! unreversed cursor bar, the red on an unparsable buffer — reads
+//! unreversed cell under the caret, the red on an unparsable buffer — reads
 //! `buffer[(x, y)].style()`, never a row string. A row string is built from
 //! `Cell::symbol()`, so it discards style entirely: a reversed prefill and an
 //! unstyled one produce byte-identical text, and a "renders reversed" assertion
@@ -46,14 +46,28 @@ fn typed(m: &mut Model, s: &str) {
     }
 }
 
-fn buffer_of(model: &Model) -> ratatui::buffer::Buffer {
+fn drawn(model: &Model) -> Terminal<TestBackend> {
     let mut terminal =
         Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("TestBackend terminal");
     let theme = Theme::from_flavor("mocha");
     terminal
         .draw(|frame| ui::view(model, &theme, false, frame))
         .expect("draw");
-    terminal.backend().buffer().clone()
+    terminal
+}
+
+fn buffer_of(model: &Model) -> ratatui::buffer::Buffer {
+    drawn(model).backend().buffer().clone()
+}
+
+/// Where the terminal's cursor lands, or `None` when the frame leaves it hidden.
+/// The caret is that cursor — it costs the line no cell — so it is read here
+/// rather than looked for in a row string.
+fn cursor_at(model: &Model) -> Option<(u16, u16)> {
+    let terminal = drawn(model);
+    let backend = terminal.backend();
+    let position = backend.cursor_position();
+    backend.cursor_visible().then_some((position.x, position.y))
 }
 
 fn rows(model: &Model) -> Vec<String> {
@@ -217,27 +231,32 @@ async fn the_untouched_prefill_is_drawn_selected() {
     );
 }
 
-/// The cursor bar sits outside the reversed span: reversed it renders as a
-/// filled block, reading as a second cursor or a stray cell of highlight past
-/// the end of the selection.
+/// The caret sits past the reversed span and takes none of it with it: inside
+/// it, the terminal's cursor would land on a reversed cell and read as a second
+/// cursor or a hole in the selection.
 #[tokio::test]
-async fn the_cursor_bar_is_not_part_of_the_selection() {
+async fn the_caret_sits_past_the_selection_and_carries_none_of_it() {
     let mut m = model_with_due().await;
     update(&mut m, ch('d'));
     let input = overlay_title_row(&m) + 1;
-    assert_eq!(
-        modifier_over(&m, input, "▏", Modifier::REVERSED),
-        Some(false),
-        "drawn, but not reversed — `None` here would mean it vanished"
+    let date = column_of(&m, input, "2026-08-14").expect("the prefill is drawn");
+    // Ten cells of ISO date, and the caret on the cell after them.
+    assert_eq!(cursor_at(&m), Some((date + 10, input)));
+    assert!(
+        !buffer_of(&m)[(date + 10, input)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "the cell under the caret is outside the selection"
     );
 }
 
 /// A caret key collapses the selection: the date stays, the reversed span goes,
-/// and the bar lands at the edge the key named. Drawn, not just modelled — the
+/// and the caret lands at the edge the key named. Drawn, not just modelled — the
 /// reverse-video is the only thing announcing that the next character replaces
 /// the line, so it must vanish the moment that stops being true.
 #[tokio::test]
-async fn collapsing_the_selection_unreverses_it_and_moves_the_bar_to_that_edge() {
+async fn collapsing_the_selection_unreverses_it_and_moves_the_caret_to_that_edge() {
     let mut m = model_with_due().await;
     update(&mut m, ch('d'));
     update(&mut m, key(KeyCode::Left));
@@ -248,10 +267,11 @@ async fn collapsing_the_selection_unreverses_it_and_moves_the_bar_to_that_edge()
         Some(false),
         "the date survives, but no longer as a selection"
     );
-    assert!(
-        rows(&m)[input as usize].contains("▏2026-08-14"),
-        "the bar collapsed to the start: {:?}",
-        rows(&m)[input as usize]
+    let date = column_of(&m, input, "2026-08-14").expect("the date survives");
+    assert_eq!(
+        cursor_at(&m),
+        Some((date, input)),
+        "the caret collapsed to the start of the date"
     );
 }
 

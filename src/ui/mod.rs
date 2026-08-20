@@ -22,8 +22,8 @@ use std::collections::HashMap;
 
 use crate::app::text_input::TextInput;
 use crate::app::{
-    omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow, CommandState, Focus,
-    JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
+    move_target_rows, omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow,
+    CommandState, Focus, JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
@@ -170,8 +170,11 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
             return render_link_picker(frame, area, links, *selected, theme)
         }
         Overlay::MoveToList {
-            targets, selected, ..
-        } => return render_list_picker(frame, area, targets, *selected, theme),
+            targets,
+            query,
+            selected,
+            ..
+        } => return render_list_picker(frame, area, targets, query, *selected, theme),
         // The filter input draws no popup — the pane header carries its query and
         // caret (see `header_title`), so the narrowed pane stays fully visible.
         Overlay::Filter => return,
@@ -422,7 +425,7 @@ fn render_omnibox(
     render_selectable(
         frame,
         popup,
-        &omnibox_title(query, text_width),
+        &query_title("Omnibox", query, text_width),
         items,
         drawn_selected,
         true,
@@ -430,25 +433,30 @@ fn render_omnibox(
     );
 }
 
-/// The panel title: a constant base, the query, and a caret.
+/// A panel title carrying a live query: the overlay's name, the query, and a
+/// caret. Shared by the Omnibox and the move-to-List picker, the two overlays
+/// whose query lives in their title rather than in a body line.
 ///
-/// The base is always drawn, so the box is never nameless on an empty query, and
+/// The name is always drawn, so the box is never nameless on an empty query, and
 /// the caret is unconditional — unlike `header_title`'s, which distinguishes a
-/// live filter from a committed one; the Omnibox has no committed state.
+/// live filter from a committed one; neither of these two has committed state.
 ///
 /// **Clipped from the left**, keeping the query's tail. `truncate` drops the
 /// tail, which here would hide the characters just typed *and* the caret with
 /// them; a leading `…` is what an input field does, and says text is hidden
 /// rather than clipping in silence.
-fn omnibox_title(query: &str, text_width: usize) -> String {
-    const BASE: &str = "Omnibox";
+fn query_title(base: &str, query: &str, text_width: usize) -> String {
     const CARET: &str = "▏";
+    /// Cells between the name and the query — its own constant rather than
+    /// `OMNIBOX_GAP`, which measures the gap inside an Omnibox *row*; the picker
+    /// draws no row of that shape.
+    const GAP: usize = 2;
     if query.is_empty() {
-        return BASE.to_string();
+        return base.to_string();
     }
-    let budget = text_width.saturating_sub(BASE.width() + OMNIBOX_GAP + CARET.width());
+    let budget = text_width.saturating_sub(base.width() + GAP + CARET.width());
     if query.width() <= budget {
-        return format!("{BASE}  {query}{CARET}");
+        return format!("{base}  {query}{CARET}");
     }
     // Walk backwards in cells, reserving the ellipsis's own width.
     let budget = budget.saturating_sub("…".width());
@@ -462,7 +470,7 @@ fn omnibox_title(query: &str, text_width: usize) -> String {
         used += w;
         start = i;
     }
-    format!("{BASE}  …{}{CARET}", &query[start..])
+    format!("{base}  …{}{CARET}", &query[start..])
 }
 
 /// One row: `{lead}{gap}{trail}`, with **`trail` reserved before `lead` is
@@ -674,39 +682,60 @@ fn render_link_picker(
     render_selectable(frame, popup, "Links", items, Some(selected), true, theme);
 }
 
-/// The move-to-List picker. Raised only when there is at least one candidate,
-/// so it always has rows.
+/// The move-to-List picker: the candidates a type-ahead query leaves standing,
+/// titled with the query itself.
+///
+/// Raised only when there is at least one candidate, but a query can narrow them
+/// to none — which draws one dimmed row saying so, and **no cursor**: there is no
+/// row to put one on, and a highlight would offer a Move that `Enter` refuses.
 fn render_list_picker(
     frame: &mut Frame,
     area: Rect,
     targets: &[crate::domain::List],
+    query: &str,
     selected: usize,
     theme: &Theme,
 ) {
+    /// What the popup says in place of rows, when the query matches no candidate.
+    /// Word for word the Omnibox MOVE band's refusal for the same condition
+    /// (`move_rows`): one sentence for one meaning, whichever surface asked.
+    const NO_MATCH: &str = "no list matches";
+
     // Same reasoning as the link picker: keep it clear of the status line and the
-    // legend spelling out `j/k move  Enter move here  Esc cancel`.
+    // legend spelling out `Up/Down ^N/^P move  Enter move here  Esc cancel`.
     let body = Rect {
         height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
         ..area
     };
+    // Narrowed by the same function the reducer resolves `Enter` with, so what is
+    // on screen and what a Move would pick cannot drift apart.
+    let rows = move_target_rows(targets, query);
+    // `max(1)` for the no-match row: it is one line like any other, and sizing off
+    // an empty `rows` would leave a borders-only box with nothing between them.
     let popup = centered(
         body,
         OVERLAY_WIDTH,
-        picker_height(targets.len(), body.height),
+        picker_height(rows.len().max(1), body.height),
     );
     let width =
         (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
-    let items: Vec<ListItem> = targets
-        .iter()
-        .map(|list| ListItem::new(truncate(&list.title, width, "…")))
-        .collect();
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new(Line::styled(
+            truncate(NO_MATCH, width, "…"),
+            Style::new().fg(theme.muted),
+        ))]
+    } else {
+        rows.iter()
+            .map(|list| ListItem::new(truncate(&list.title, width, "…")))
+            .collect()
+    };
     frame.render_widget(Clear, popup);
     render_selectable(
         frame,
         popup,
-        "Move to list",
+        &query_title("Move to list", query, width),
         items,
-        Some(selected),
+        (!rows.is_empty()).then_some(selected),
         true,
         theme,
     );
@@ -3142,6 +3171,7 @@ mod tests {
             task: TaskId("t".into()),
             source: ListId("l".into()),
             targets: Vec::new(),
+            query: String::new(),
             selected: 0,
         });
         assert_eq!(legend_context(&model), keymap::LegendContext::ListPicker);

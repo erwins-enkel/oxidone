@@ -338,9 +338,11 @@ async fn the_picker_shows_links_before_notes_urls_with_their_descriptions() {
 /// load-bearing in the text overlays, where swallowing it would stop `@ \ ~ |`
 /// being typable; it is asserted there, not here.
 ///
-/// It is also scoped to the four chords the overlay legends teach — `^A`, `^E`,
+/// It is also scoped to the chords the overlay legends teach — `^A`, `^E`, `^N`,
 /// `^U`, `^W`: every other Ctrl chord still resolves as it always has, which the
-/// `Ctrl-Q` case below pins so the narrowing cannot widen by accident.
+/// `Ctrl-Q` case below pins so the narrowing cannot widen by accident. `^P` is
+/// taught too, by the same legend as `^N`, and deliberately *not* gated: `Ctrl-P`
+/// opens the Omnibox by documented design, pinned in `omnibox_reducer.rs`.
 #[tokio::test]
 async fn a_text_editing_chord_in_the_task_pane_is_not_a_pane_verb() {
     let mut m = model_with_notes("see https://a.dev/1").await;
@@ -369,6 +371,23 @@ async fn a_text_editing_chord_in_the_task_pane_is_not_a_pane_verb() {
     let cmds = update(&mut m, chord('e'));
     assert!(cmds.is_empty());
     assert!(m.overlay.is_none(), "^E must not open the title editor");
+
+    // `^N` is the newest of the set, taught by the move-to-List picker's legend as
+    // its cursor-down. It is the worst fall-through of the lot: `n` → `EditNotes`
+    // takes the terminal away into `$EDITOR` rather than springing an overlay
+    // `Esc` closes. A bare `n` first, so what follows is the gate's doing.
+    update(&mut m, ch('n'));
+    assert!(
+        m.overlay.is_some(),
+        "a bare `n` still reaches the notes editor"
+    );
+    m.overlay = None;
+    let cmds = update(&mut m, chord('n'));
+    assert!(
+        cmds.is_empty(),
+        "^N must not reach the notes editor: {cmds:?}"
+    );
+    assert!(m.overlay.is_none(), "nor open the inline one");
 }
 
 /// The other side of that narrowing. The binding table is modifier-blind

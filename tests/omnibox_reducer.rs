@@ -385,8 +385,9 @@ fn every_setting_effect_reads_old_to_new() {
 
 // ─── keys ───────────────────────────────────────────────────────────────────
 
-/// `j` and `k` **type**, as in every other overlay with a buffer. `picker_key`
-/// moves on them only because `OpenLink`/`MoveToList` have none.
+/// `j` and `k` **type**, as in every other overlay with something to type into —
+/// the move-to-List picker included. Only `link_picker_key` still moves on them,
+/// `OpenLink` having no query.
 #[test]
 fn j_and_k_type_into_the_query() {
     let mut model = open_with(&["work"]);
@@ -413,8 +414,10 @@ fn up_and_down_move_and_clamp() {
     assert_eq!(selected(&model), 0, "clamped at the first");
 }
 
-/// `^N`/`^P` are unbound inside, and `keymap::resolve` is untouched — so `^N`
-/// outside an overlay still reaches `EditNotes`, exactly as today.
+/// `^N`/`^P` are unbound inside: neither edits the query nor moves the cursor.
+/// What they do *outside* an overlay is `keymap::resolve`'s business — `^N` is
+/// gated there (the move-to-List picker teaches it), `^P` still opens the
+/// Omnibox — and both are pinned in `open_link_reducer.rs` and above.
 #[test]
 fn ctrl_n_and_ctrl_p_do_nothing_inside() {
     let mut model = open_with(&["work"]);

@@ -311,7 +311,7 @@ fn the_due_editor_reveals_the_caret_cell_only_on_a_wider_terminal() {
 // reaches nothing here because every Omnibox cell is a `LegendKeys::Literal` — a
 // literal cell can say anything at all and no build guard objects.
 //
-// That matters more than usual: dropping `^N`/`^P` rests partly on the legend
+// That matters more than usual: leaving `^N`/`^P` out rests partly on the legend
 // never having advertised them, which an unpinned row leaves unfalsifiable.
 
 fn model_with_omnibox() -> Model {
@@ -339,8 +339,8 @@ fn the_omnibox_legend_fits_the_default_terminal() {
             "{cell:?} missing at 80 columns: {row:?}"
         );
     }
-    // Never advertised, because never bound — a `^N` a beat after the overlay
-    // closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.
+    // Not advertised, because not bound here — unlike the move-to-List picker,
+    // whose legend does teach them (`link_render.rs` pins that row).
     assert!(!row.contains("^N"), "{row:?}");
     assert!(!row.contains("^P"), "{row:?}");
 }

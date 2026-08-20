@@ -25,7 +25,10 @@ a Tasks costume.
 - Subtasks (one level, matching Google), indent/outdent, manual reorder
   (from a sort view, the first reorder key switches back to "my order")
 - Move a task to another list (`M`, or `:move` in the Omnibox), from a list or
-  from Today
+  from Today. `M`'s picker **type-aheads**: what you type narrows the lists to
+  fuzzy matches (`wk` finds "Work"), `Up`/`Down` or `^N`/`^P` pick one, and
+  `Enter` sends the task there. Every printable key now types, so `j`/`k` no
+  longer step this picker — the arrows and the chords do
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
 - The due editor (`d`) opens with the current date selected, so the first

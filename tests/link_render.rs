@@ -463,6 +463,116 @@ fn the_move_to_list_picker_marks_the_selected_row() {
     );
 }
 
+/// A picker opened on a Task in "Inbox", with `Work` and `Homework` as the two
+/// candidates — titles the type-ahead can tell apart.
+fn picker_model() -> Model {
+    let mut model = model_with(vec![task("t1", "pick a home", None)]);
+    ui_update(
+        &mut model,
+        Message::ListsLoaded(vec![
+            named_list("l", "Inbox"),
+            named_list("w", "Work"),
+            named_list("h", "Homework"),
+        ]),
+    );
+    model.selected = Selection::List(0);
+    ui_update(
+        &mut model,
+        Message::TasksLoaded(ListId("l".into()), vec![task("t1", "pick a home", None)]),
+    );
+    model.focus = Focus::Tasks;
+    ui_update(
+        &mut model,
+        Message::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::empty())),
+    );
+    model
+}
+
+fn type_query(model: &mut Model, query: &str) {
+    for c in query.chars() {
+        ui_update(
+            model,
+            Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())),
+        );
+    }
+}
+
+#[test]
+fn the_typed_query_is_drawn_in_the_pickers_title_with_a_caret() {
+    let mut model = picker_model();
+    let title = list_picker_lines(&rows(&model))
+        .first()
+        .expect("the picker's title row")
+        .clone();
+    assert!(
+        !title.contains('▏'),
+        "no caret before anything is typed: {title}"
+    );
+
+    type_query(&mut model, "wk");
+    let drawn = list_picker_lines(&rows(&model));
+    let title = drawn.first().expect("the picker's title row");
+    assert!(
+        title.contains("Move to list  wk▏"),
+        "the query and its caret sit in the title: {title}"
+    );
+}
+
+#[test]
+fn the_query_narrows_the_drawn_candidates() {
+    let mut model = picker_model();
+    let body = list_picker_lines(&rows(&model)).join("\n");
+    assert!(body.contains("Work") && body.contains("Homework"), "{body}");
+
+    // A subsequence of "Homework" alone — every subsequence of "Work" is one of
+    // "Homework" too (h-o-m-e-**work**), so it is the shorter title that has to go.
+    // Counted rather than searched for: "Homework" *contains* "Work", so no
+    // substring assertion can tell one drawn row from two.
+    type_query(&mut model, "hom");
+    let drawn = list_picker_lines(&rows(&model));
+    let body = drawn.join("\n");
+    assert!(body.contains("Homework"), "the match is drawn: {body}");
+    assert_eq!(
+        drawn.len(),
+        3,
+        "title, the one surviving candidate, bottom border: {body}"
+    );
+}
+
+#[test]
+fn a_query_matching_nothing_draws_one_row_saying_so_and_no_cursor() {
+    let mut model = picker_model();
+    type_query(&mut model, "zz");
+    let drawn = list_picker_lines(&rows(&model));
+    let body = drawn.join("\n");
+    assert!(
+        body.contains("no list matches"),
+        "an empty result says why rather than drawing a bare box: {body}"
+    );
+    assert!(
+        !body.contains('\u{203a}'),
+        "and marks no row, there being none to move to: {body}"
+    );
+    assert_eq!(
+        drawn.len(),
+        3,
+        "title, the one row, bottom border — nothing else: {body}"
+    );
+}
+
+#[test]
+fn the_pickers_legend_advertises_the_type_ahead_keys_within_eighty_columns() {
+    // Five cells now, `^U`/`^W` included: the query is editable, and the `?`
+    // cheatsheet covers pane keys only, so this row is the only place the
+    // picker's keys are ever spelled out.
+    let model = picker_model();
+    let drawn = rows(&model);
+    assert_eq!(
+        drawn.last().expect("a bottom row").trim_end(),
+        "Up/Down ^N/^P move  Enter move here  Esc cancel  ^U clear  ^W word"
+    );
+}
+
 fn named_list(id: &str, title: &str) -> List {
     List {
         id: ListId(id.into()),

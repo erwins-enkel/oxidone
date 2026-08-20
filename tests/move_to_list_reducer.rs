@@ -17,6 +17,16 @@ fn key(code: KeyCode) -> Message {
     Message::Key(KeyEvent::new(code, KeyModifiers::empty()))
 }
 
+fn chord(c: char) -> Message {
+    Message::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+}
+
+fn type_query(m: &mut Model, query: &str) {
+    for c in query.chars() {
+        update(m, press(c));
+    }
+}
+
 const TODAY: (i32, u32, u32) = (2026, 7, 20);
 
 fn today() -> NaiveDate {
@@ -24,9 +34,15 @@ fn today() -> NaiveDate {
 }
 
 fn list(id: &str) -> List {
+    named_list(id, &id.to_uppercase())
+}
+
+/// A List with a title the type-ahead can chew on, `id` being uppercased
+/// elsewhere in this file.
+fn named_list(id: &str, title: &str) -> List {
     List {
         id: ListId(id.into()),
-        title: id.to_uppercase(),
+        title: title.into(),
         etag: String::new(),
         updated: Local.timestamp_opt(0, 0).unwrap().to_utc(),
     }
@@ -103,6 +119,29 @@ fn targets(m: &Model) -> Vec<String> {
         Some(Overlay::MoveToList { targets, .. }) => {
             targets.iter().map(|l| l.id.0.clone()).collect()
         }
+        other => panic!("expected the move-to-list picker, got {other:?}"),
+    }
+}
+
+/// The picker's *narrowed* rows — what is on screen, and what `Enter` resolves
+/// against — as opposed to `targets`, the captured candidate set.
+fn rows(m: &Model) -> Vec<String> {
+    match m.overlay.as_ref() {
+        Some(Overlay::MoveToList { targets, query, .. }) => {
+            oxidone::app::move_target_rows(targets, query)
+                .into_iter()
+                .map(|l| l.id.0.clone())
+                .collect()
+        }
+        other => panic!("expected the move-to-list picker, got {other:?}"),
+    }
+}
+
+fn picker_state(m: &Model) -> (String, usize) {
+    match m.overlay.as_ref() {
+        Some(Overlay::MoveToList {
+            query, selected, ..
+        }) => (query.clone(), *selected),
         other => panic!("expected the move-to-list picker, got {other:?}"),
     }
 }
@@ -638,10 +677,11 @@ fn a_parent_coming_home_from_a_flat_pane_still_frees_its_subtasks() {
     update(&mut m, Message::MovedToList(task("p1", "b")));
     assert!(m.tasks.is_empty(), "parent and child both left the pane");
 
-    // B→C. The picker offers `a` then `c`, so step past `a`.
+    // B→C. The picker offers `a` then `c`, so step past `a` — with `Down`, since
+    // `j` types into the type-ahead query rather than moving.
     today_showing(&mut m, task("p1", "b"));
     update(&mut m, press('M'));
-    update(&mut m, press('j'));
+    update(&mut m, key(KeyCode::Down));
     assert_eq!(
         update(&mut m, key(KeyCode::Enter)),
         vec![Command::MoveToList {
@@ -795,4 +835,205 @@ fn the_omnibox_band_refuses_what_m_refuses() {
     // Nowhere to go: the Task is movable, the destinations are not there.
     let mut m = list_model(&["a"], vec![task("t1", "a")]);
     assert_both_refuse(&mut m);
+}
+
+// ---- The type-ahead ----
+//
+// Every printable key narrows the candidates rather than moving the cursor, so
+// these cover what the query does to the rows, and what `Enter` resolves against
+// once it has.
+
+#[test]
+fn a_fresh_picker_offers_every_candidate() {
+    let mut m = list_model(&["a", "b", "c"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    assert_eq!(picker_state(&m), (String::new(), 0));
+    assert_eq!(rows(&m), ["b", "c"], "an empty query narrows nothing");
+}
+
+#[test]
+fn typing_narrows_the_candidates_by_fuzzy_subsequence() {
+    let mut m = base(&[]);
+    m.lists = vec![
+        named_list("i", "Inbox"),
+        named_list("w", "Work"),
+        named_list("h", "Homework"),
+        named_list("g", "Groceries"),
+    ];
+    m.selected = Selection::List(0);
+    m.sort = SortView::Manual;
+    update(
+        &mut m,
+        Message::TasksLoaded(ListId("i".into()), vec![task("t1", "i")]),
+    );
+    m.focus = Focus::Tasks;
+
+    update(&mut m, press('M'));
+    assert_eq!(rows(&m), ["w", "h", "g"], "every List but the Task's own");
+
+    // `wk` is a subsequence of both "Work" and "Homework" — and of neither
+    // "Groceries" nor the excluded "Inbox".
+    type_query(&mut m, "wk");
+    assert_eq!(picker_state(&m).0, "wk");
+    assert_eq!(rows(&m), ["w", "h"]);
+
+    // Case-insensitive both ways, and the surviving rows keep candidate order —
+    // "Work" stays ahead of "Homework" though the match starts later in it.
+    update(&mut m, chord('u'));
+    type_query(&mut m, "WO");
+    assert_eq!(rows(&m), ["w", "h"]);
+
+    // Subsequence, not substring, with everything that implies: `oe` matches
+    // "Homework" (h-**o**-m-**e**) and "Groceries" (Gr-**o**-c-**e**) alike,
+    // where a substring rule would have matched neither.
+    update(&mut m, chord('u'));
+    type_query(&mut m, "oe");
+    assert_eq!(rows(&m), ["h", "g"]);
+}
+
+#[test]
+fn a_space_is_a_query_character_not_a_trimmed_one() {
+    // Titles have spaces in them, so `wk o` is a query the user can mean — and
+    // a leading space is honestly nobody's title.
+    let mut m = list_model(&["a"], vec![task("t1", "a")]);
+    m.lists.push(named_list("w", "Work Orders"));
+    m.lists.push(named_list("h", "Homework"));
+    update(&mut m, press('M'));
+    type_query(&mut m, "wk o");
+    assert_eq!(rows(&m), ["w"]);
+}
+
+#[test]
+fn enter_moves_to_the_matched_row_not_the_candidate_at_that_index() {
+    // `c` is the *second* candidate, so an `Enter` resolved against `targets`
+    // would move to `b` instead — the bug the narrowed lookup rules out.
+    let mut m = list_model(&["a", "b", "c"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    type_query(&mut m, "c");
+    assert_eq!(rows(&m), ["c"]);
+    assert_eq!(
+        update(&mut m, key(KeyCode::Enter)),
+        vec![Command::MoveToList {
+            source: ListId("a".into()),
+            task: TaskId("t1".into()),
+            destination: ListId("c".into()),
+        }]
+    );
+}
+
+#[test]
+fn a_query_matching_nothing_leaves_the_picker_up_and_moves_nothing() {
+    let mut m = list_model(&["a", "b", "c"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    type_query(&mut m, "zz");
+    assert!(rows(&m).is_empty());
+
+    let cmds = update(&mut m, key(KeyCode::Enter));
+    assert!(cmds.is_empty(), "there is nowhere to move to");
+    assert_eq!(ids(&m), ["t1"], "and the row stays in its pane");
+    assert_eq!(
+        picker_state(&m),
+        ("zz".to_string(), 0),
+        "the picker is still up, query intact, so a typo can be fixed"
+    );
+
+    // Fixing it re-offers the candidates.
+    update(&mut m, key(KeyCode::Backspace));
+    update(&mut m, key(KeyCode::Backspace));
+    assert_eq!(rows(&m), ["b", "c"]);
+}
+
+#[test]
+fn the_cursor_moves_with_the_arrows_and_the_readline_chords() {
+    let mut m = list_model(&["a", "b", "c", "d"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    update(&mut m, key(KeyCode::Down));
+    assert_eq!(picker_state(&m).1, 1);
+    update(&mut m, chord('n'));
+    assert_eq!(picker_state(&m).1, 2);
+    // Clamped at the far end, not wrapped, as the panes are.
+    update(&mut m, chord('n'));
+    assert_eq!(picker_state(&m).1, 2, "three candidates, so 2 is the last");
+    update(&mut m, chord('p'));
+    assert_eq!(picker_state(&m).1, 1);
+    update(&mut m, key(KeyCode::Up));
+    update(&mut m, key(KeyCode::Up));
+    assert_eq!(picker_state(&m).1, 0, "clamped at the top too");
+}
+
+#[test]
+fn the_cursor_is_clamped_to_the_rows_the_query_left() {
+    let mut m = list_model(&["a", "b", "c", "d"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    update(&mut m, chord('n'));
+    update(&mut m, chord('n'));
+    assert_eq!(picker_state(&m).1, 2);
+
+    // The query resets it to 0 — but a step afterwards may not walk off the two
+    // rows now on screen.
+    type_query(&mut m, "b");
+    assert_eq!(rows(&m), ["b"]);
+    update(&mut m, key(KeyCode::Down));
+    assert_eq!(
+        picker_state(&m).1,
+        0,
+        "one row, so the cursor cannot leave it"
+    );
+}
+
+#[test]
+fn editing_the_query_returns_the_cursor_to_the_top() {
+    let mut m = list_model(&["a", "b", "c", "d"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    update(&mut m, key(KeyCode::Down));
+    type_query(&mut m, "d");
+    assert_eq!(
+        picker_state(&m),
+        ("d".to_string(), 0),
+        "the row under the cursor is not the row it was"
+    );
+
+    // A `Backspace` that changes nothing leaves the cursor alone — the query is
+    // what resets it, not the keystroke.
+    update(&mut m, chord('u'));
+    update(&mut m, key(KeyCode::Down));
+    let before = picker_state(&m);
+    update(&mut m, key(KeyCode::Backspace));
+    assert_eq!(picker_state(&m), before, "an empty query cannot shrink");
+}
+
+#[test]
+fn the_query_takes_the_omnibox_editing_chords() {
+    let mut m = list_model(&["a", "b"], vec![task("t1", "a")]);
+    m.lists.push(named_list("w", "Work Orders"));
+    update(&mut m, press('M'));
+
+    type_query(&mut m, "work or");
+    update(&mut m, chord('w'));
+    assert_eq!(picker_state(&m).0, "work ", "^W kills the last word");
+    update(&mut m, chord('u'));
+    assert_eq!(picker_state(&m).0, "", "^U clears the query whole");
+    assert_eq!(rows(&m), ["b", "w"], "and the candidates are all back");
+}
+
+#[test]
+fn esc_cancels_the_move_whatever_the_query_holds() {
+    let mut m = list_model(&["a", "b"], vec![task("t1", "a")]);
+    update(&mut m, press('M'));
+    type_query(&mut m, "zz");
+    update(&mut m, key(KeyCode::Esc));
+    assert!(m.overlay.is_none(), "one Esc closes, matched or not");
+    assert_eq!(ids(&m), ["t1"]);
+}
+
+#[test]
+fn a_vim_movement_key_types_instead_of_moving() {
+    // `j` used to step the picker. It now narrows — which is also what keeps
+    // `J`/`K`/`>`/`<` away from `move_preconditions` while the picker is up.
+    let mut m = list_model(&["a", "b"], vec![task("t1", "a")]);
+    m.lists.push(named_list("j", "Journal"));
+    update(&mut m, press('M'));
+    update(&mut m, press('j'));
+    assert_eq!(picker_state(&m), ("j".to_string(), 0));
+    assert_eq!(rows(&m), ["j"], "the query, not a cursor step");
 }

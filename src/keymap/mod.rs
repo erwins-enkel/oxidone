@@ -827,10 +827,22 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         },
     ];
 
-    // Same shape as the link picker, but `Enter` performs the Move.
+    // Not the link picker's shape: this picker type-aheads, so every printable
+    // key narrows the candidates and the cursor keys are `Up`/`Down` — with
+    // `^N`/`^P` advertised alongside, unlike `CARET`'s silent synonyms, because
+    // the `?` cheatsheet covers pane keys only and would leave them undiscoverable.
+    // Both pairs share one cell rather than repeating the label "move" twice.
+    //
+    // `^N`/`^P` are bound here where the Omnibox refuses them, and the reason the
+    // Omnibox gives still stands: `resolve` is modifier-blind, so a `^N` landing
+    // just outside the overlay reaches `n` → `EditNotes` and suspends the TUI into
+    // `$EDITOR`. That is a hazard of the pane rather than of this picker — a `^N`
+    // with no overlay up does it today — and this picker is the one place a
+    // home-row cursor pair is worth the exposure, its `j`/`k` having gone to the
+    // query.
     const LIST_PICKER: &[LegendEntry] = &[
         LegendEntry {
-            keys: LegendKeys::Literal("j/k"),
+            keys: LegendKeys::Literal("Up/Down ^N/^P"),
             label: "move",
         },
         LegendEntry {
@@ -841,6 +853,8 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
             keys: LegendKeys::Literal("Esc"),
             label: "cancel",
         },
+        KILL_LINE,
+        KILL_WORD,
     ];
 
     // The filter narrows live as you type; `Enter` keeps it applied and `Esc`

@@ -624,10 +624,17 @@ pub enum Overlay {
     /// from `selected_task` at `Enter`: the picker is modal to *input* but not to
     /// *messages*, so an async `TasksLoaded`/`TodayLoaded` can replace
     /// `model.tasks` underneath it and shift every index.
+    ///
+    /// `targets` is likewise the candidate set as captured — the whole of it, in
+    /// sidebar order. `query` is the type-ahead: [`move_target_rows`] narrows
+    /// `targets` by it, and `selected` indexes **that narrowed sequence**, never
+    /// `targets` itself. The pair is kept in step by [`list_picker_key`], the
+    /// only thing that edits either.
     MoveToList {
         task: TaskId,
         source: ListId,
         targets: Vec<List>,
+        query: String,
         selected: usize,
     },
 }
@@ -656,6 +663,9 @@ impl Overlay {
             // route is not a build error, and the fall-through would silently
             // hand the Omnibox this arm's `Enter` → `submit_input`. `None` makes
             // that fall-through inert instead, which is visible at once.
+            //
+            // `MoveToList` reads the same way: its type-ahead query is not a
+            // `TextInput` either, and `list_picker_key` owns every key it takes.
             Overlay::Filter
             | Overlay::EditDue { .. }
             | Overlay::Omnibox { .. }
@@ -3461,8 +3471,47 @@ fn open_move_to_list(model: &mut Model) {
         task: id,
         source,
         targets,
+        query: String::new(),
         selected: 0,
     });
+}
+
+/// The picker's rows for `query`: every captured candidate whose title the query
+/// is a fuzzy subsequence of, in the order `targets` holds them.
+///
+/// A pure function of the captured candidate set and the query — no `Overlay` in
+/// sight, as `omnibox_rows` is — so every row-level property is assertable
+/// without a terminal, and the reducer and the renderer narrow by one rule
+/// rather than each keeping a copy of it.
+///
+/// **Order is the candidate order, never a match score.** A keystroke therefore
+/// only ever removes rows; the ones it leaves keep their positions, so the
+/// cursor is not chased down a re-ranked list. The candidate order is the
+/// sidebar's, `open_move_to_list` having filtered `model.lists` in place.
+pub fn move_target_rows<'a>(targets: &'a [List], query: &str) -> Vec<&'a List> {
+    targets
+        .iter()
+        .filter(|list| fuzzy_match(&list.title, query))
+        .collect()
+}
+
+/// Whether `query`'s characters occur in `haystack` in order, ignoring case and
+/// whatever sits between them — `wk` matches "Work" and "Homework".
+///
+/// An **empty query matches everything**, which is what makes the freshly-opened
+/// picker offer the whole candidate set. Not trimmed: a space is a legitimate
+/// character of a List title, so `wk o` is a query the user can mean.
+///
+/// The `any` inside `all` is the subsequence walk, not a nested scan: `any`
+/// consumes `haystack` up to the character it matched and leaves the rest, so
+/// each needle resumes where the last one stopped.
+fn fuzzy_match(haystack: &str, query: &str) -> bool {
+    let haystack = haystack.to_lowercase();
+    let mut rest = haystack.chars();
+    query
+        .to_lowercase()
+        .chars()
+        .all(|needle| rest.any(|c| c == needle))
 }
 
 /// Perform the Move the picker has selected: remove the row optimistically and
@@ -4615,10 +4664,11 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // buffer, and `j`/`k` must type rather than move.
         Some(Overlay::Omnibox { .. }) => return omnibox_key(model, key),
         // Both pickers, routed before the `Confirm` and text-buffer arms below:
-        // falling through would let `y` dismiss one, or swallow its keys.
-        Some(Overlay::OpenLink { .. } | Overlay::MoveToList { .. }) => {
-            return picker_key(model, key)
-        }
+        // falling through would let `y` dismiss one, or swallow its keys. One
+        // handler each, not one shared: the list picker's printable keys type
+        // into its type-ahead query, where the link picker's `j`/`k` move.
+        Some(Overlay::OpenLink { .. }) => return link_picker_key(model, key),
+        Some(Overlay::MoveToList { .. }) => return list_picker_key(model, key),
         Some(Overlay::Confirm(_)) => {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
@@ -5105,26 +5155,24 @@ fn due_editor_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Com
     Vec::new()
 }
 
-/// Keys shared by both pickers: `j`/`k` move the cursor, `Esc` cancels, and
-/// `Enter` acts on the selected row — opening a link, or performing a Move.
+/// The link picker's keys: `j`/`k` move the cursor, `Esc` cancels, and `Enter`
+/// opens the selected link.
 ///
 /// Everything else is swallowed, as every other overlay already does — `q` must
-/// not quit with a modal up, and in particular `J`/`K`/`>`/`<` must not reach
-/// `move_preconditions`: `open_move_to_list` checks `pending_move` when the
-/// picker opens, and relies on no in-list Move being able to start before
-/// `Enter` lands.
-fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+/// not quit with a modal up.
+///
+/// The move-to-List picker has its own handler, [`list_picker_key`]: there every
+/// printable key types into a type-ahead query, so `j`/`k` cannot also move. The
+/// link picker keeps them, having nothing to narrow.
+fn link_picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
     use crossterm::event::KeyCode;
-    let (len, selected) = match model.overlay.as_mut() {
-        Some(Overlay::OpenLink { links, selected }) => (links.len(), selected),
-        Some(Overlay::MoveToList {
-            targets, selected, ..
-        }) => (targets.len(), selected),
-        _ => return Vec::new(),
+    let Some(Overlay::OpenLink { links, selected }) = model.overlay.as_mut() else {
+        return Vec::new();
     };
+    let len = links.len();
     match key.code {
         // Clamped rather than wrapping, matching pane selection. `saturating_sub`
-        // because `len - 1` would underflow on an empty picker — neither is raised
+        // because `len - 1` would underflow on an empty picker — it is never raised
         // empty today, but a panic is not the way to find out if that changes.
         KeyCode::Char('j') | KeyCode::Down => {
             *selected = (*selected + 1).min(len.saturating_sub(1))
@@ -5133,6 +5181,75 @@ fn picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
         KeyCode::Enter => return submit_picker(model),
         KeyCode::Esc => model.overlay = None,
         _ => {}
+    }
+    Vec::new()
+}
+
+/// The move-to-List picker's keys: a **type-ahead query** that narrows the
+/// candidates, over a cursor on the rows that survive it.
+///
+/// Every printable key types, so `j`/`k` cannot also move: the cursor takes
+/// `Up`/`Down` and `^N`/`^P`, and the query edits are the Omnibox's
+/// (`Backspace`, `^U`, `^W`). `Esc` cancels the Move whatever the query holds —
+/// a second meaning for it would make the escape hatch depend on what was typed.
+///
+/// Everything else is swallowed, as every other overlay already does — `q` must
+/// not quit with a modal up, and in particular `J`/`K`/`>`/`<` must not reach
+/// `move_preconditions`: `open_move_to_list` checks `pending_move` when the
+/// picker opens, and relies on no in-list Move being able to start before
+/// `Enter` lands. Those four now land in the query rather than nowhere, which
+/// holds them just as firmly.
+///
+/// `selected` indexes the narrowed rows and is left in range on every path: a
+/// query edit resets it to 0 — the Omnibox's rule, since the row under the cursor
+/// is no longer the row it was — and a cursor step clamps to the current row
+/// count. Nothing else can move it: `targets` is the set captured at open, so no
+/// async message can shrink the rows underneath it.
+fn list_picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    // The two keys that leave: dispatched before the overlay is borrowed to edit,
+    // and `Enter` before anything is edited at all — `submit_picker` resolves
+    // against the query and selection this picker already holds.
+    match key.code {
+        KeyCode::Enter => return submit_picker(model),
+        KeyCode::Esc => {
+            model.overlay = None;
+            return Vec::new();
+        }
+        _ => {}
+    }
+    let Some(Overlay::MoveToList {
+        targets,
+        query,
+        selected,
+        ..
+    }) = model.overlay.as_mut()
+    else {
+        return Vec::new();
+    };
+    // Taken before the edit, because the reset rule is "the *query string*
+    // changed", not "an editing key was pressed" — a `Backspace` on an empty
+    // query leaves the buffer byte-identical and must leave the highlight alone,
+    // the same distinction the Omnibox draws.
+    let before = query.clone();
+    let len = move_target_rows(targets, query).len();
+    let chord = keymap::is_control_chord(key.modifiers);
+    match key.code {
+        KeyCode::Char('u') if chord => query.clear(),
+        KeyCode::Char('w') if chord => kill_word(query),
+        // Clamped rather than wrapping, as the link picker and the panes are.
+        KeyCode::Char('n') if chord => *selected = (*selected + 1).min(len.saturating_sub(1)),
+        KeyCode::Char('p') if chord => *selected = selected.saturating_sub(1),
+        KeyCode::Char(c) if !chord => query.push(c),
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Down => *selected = (*selected + 1).min(len.saturating_sub(1)),
+        KeyCode::Up => *selected = selected.saturating_sub(1),
+        _ => {}
+    }
+    if *query != before {
+        *selected = 0;
     }
     Vec::new()
 }
@@ -5148,11 +5265,35 @@ fn submit_picker(model: &mut Model) -> Vec<Command> {
             task,
             source,
             targets,
+            query,
             selected,
-        }) => finish_move_to_list(model, task, source, targets[selected].id.clone()),
-        // Unreachable: `picker_key` is the only caller and it has already matched
-        // one of the two above. Restoring the overlay keeps a future third caller
-        // from silently dismissing it.
+        }) => {
+            // Resolved against the *narrowed* rows, `get` rather than an index:
+            // `selected` is in range for `query` by construction, and a query
+            // that narrows to nothing simply has no row to fire.
+            let destination = move_target_rows(&targets, &query)
+                .get(selected)
+                .map(|list| list.id.clone());
+            match destination {
+                Some(destination) => finish_move_to_list(model, task, source, destination),
+                // Nothing matches, so there is nowhere to move to. The picker goes
+                // back up untouched: closing would discard the Move over a typo,
+                // and the popup's own "no list matches" row is already the reason.
+                None => {
+                    model.overlay = Some(Overlay::MoveToList {
+                        task,
+                        source,
+                        targets,
+                        query,
+                        selected,
+                    });
+                    Vec::new()
+                }
+            }
+        }
+        // Unreachable: the two picker handlers are the only callers and each has
+        // already matched its own arm above. Restoring the overlay keeps a future
+        // third caller from silently dismissing it.
         other => {
             model.overlay = other;
             Vec::new()

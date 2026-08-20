@@ -3411,9 +3411,11 @@ fn move_refusal(model: &Model, task: &Task) -> Option<&'static str> {
     //
     // Note this is checked when the destination is *offered*, while the removal
     // happens at `Enter`. Nothing can start an in-list Move in between: while an
-    // overlay is set, `overlay_key` routes keys to `picker_key` or `omnibox_key`
-    // and returns, so `J`/`K`/`>`/`<` never reach `move_preconditions`.
-    // `an_in_list_move_key_does_nothing_while_the_picker_is_open` pins that.
+    // overlay is set, `overlay_key` routes keys to `list_picker_key` or
+    // `omnibox_key` and returns, so `J`/`K`/`>`/`<` never reach
+    // `move_preconditions` — in the picker they land in its type-ahead query
+    // instead. `an_in_list_move_key_does_nothing_while_the_picker_is_open` pins
+    // that.
     if model.pending_move.is_some() || model.pending_list_moves.contains_key(&task.id) {
         return Some("a move is already in progress");
     }
@@ -4744,8 +4746,9 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
 /// enacting the keystroke, which is why the unfireable rows promise "nothing
 /// beyond the clamp".
 ///
-/// **(c) the key match.** `j`/`k` **type**, as in every other overlay with a
-/// buffer (`picker_key` moves on them only because its overlays have none).
+/// **(c) the key match.** `j`/`k` **type**, as they do in every other overlay
+/// that has something to type into — the move-to-List picker included. Only the
+/// link picker still moves on them (`link_picker_key`), having no query.
 /// Movement is `Up`/`Down`; `^N`/`^P` are deliberately unbound, because
 /// `resolve` is modifier-blind and a `^N` landing a beat after the overlay
 /// closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.

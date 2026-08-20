@@ -385,8 +385,9 @@ fn every_setting_effect_reads_old_to_new() {
 
 // ─── keys ───────────────────────────────────────────────────────────────────
 
-/// `j` and `k` **type**, as in every other overlay with a buffer. `picker_key`
-/// moves on them only because `OpenLink`/`MoveToList` have none.
+/// `j` and `k` **type**, as in every other overlay with something to type into —
+/// the move-to-List picker included. Only `link_picker_key` still moves on them,
+/// `OpenLink` having no query.
 #[test]
 fn j_and_k_type_into_the_query() {
     let mut model = open_with(&["work"]);

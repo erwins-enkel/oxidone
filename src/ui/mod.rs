@@ -697,6 +697,8 @@ fn render_list_picker(
     theme: &Theme,
 ) {
     /// What the popup says in place of rows, when the query matches no candidate.
+    /// Word for word the Omnibox MOVE band's refusal for the same condition
+    /// (`move_rows`): one sentence for one meaning, whichever surface asked.
     const NO_MATCH: &str = "no list matches";
 
     // Same reasoning as the link picker: keep it clear of the status line and the

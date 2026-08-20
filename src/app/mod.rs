@@ -4044,8 +4044,14 @@ fn move_rows(model: &Model, verb: &str, arg: Option<&str>) -> Vec<OmniRow> {
     }
 
     // Filtered on the argument by the same case-insensitive substring rule the
-    // JUMP band uses on the whole query — these rows name the same Lists, so
-    // they answer to the same typing.
+    // JUMP band uses on the whole query — these rows name the same Lists as those,
+    // so they answer to the same typing.
+    //
+    // `M`'s picker narrows the *same destination set* by a different rule —
+    // fuzzy subsequence, `move_target_rows` — so the two Move surfaces do not
+    // answer to identical typing, deliberately: a band shares its query with
+    // three other bands, where the picker's query is its own. Only the refusal
+    // sentence below is shared, and that on purpose.
     let needle = arg.unwrap_or_default().to_lowercase();
     let rows: Vec<OmniRow> = destinations
         .into_iter()

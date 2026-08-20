@@ -4749,9 +4749,10 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
 /// **(c) the key match.** `j`/`k` **type**, as they do in every other overlay
 /// that has something to type into — the move-to-List picker included. Only the
 /// link picker still moves on them (`link_picker_key`), having no query.
-/// Movement is `Up`/`Down`; `^N`/`^P` are deliberately unbound, because
-/// `resolve` is modifier-blind and a `^N` landing a beat after the overlay
-/// closes would reach `n` → `EditNotes` and suspend the TUI into `$EDITOR`.
+/// Movement is `Up`/`Down`; `^N`/`^P` are unbound here. The `$EDITOR` hazard
+/// that first argued against them is closed — `resolve` gates `^N` now, for the
+/// move-to-List picker that does teach it — so this is no longer a refusal on
+/// safety grounds, just a surface left as it was.
 /// `Backspace`/`^W`/`^U` all edit, as the three existing text paths do — a
 /// surface where a typo cost the whole query would be quoting the text-overlay
 /// rule, not following it.

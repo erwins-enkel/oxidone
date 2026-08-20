@@ -356,9 +356,10 @@ pub fn bindings() -> &'static [Binding] {
 /// Resolve a key press to its bound `Action`, if any.
 ///
 /// The verbs are plain keys, so modifiers are ignored — with one exception: the
-/// four text-editing chords this app advertises resolve to nothing, because
-/// `a`/`e`/`u`/`w` are all bound to verbs, one of which opens a browser. Every
-/// other Ctrl chord still resolves as if unmodified (see the body).
+/// chords an overlay legend advertises resolve to nothing, because
+/// `a`/`e`/`n`/`u`/`w` are all bound to verbs, one of which opens a browser and
+/// one of which suspends the TUI into `$EDITOR`. Every other Ctrl chord still
+/// resolves as if unmodified (see the body).
 pub fn resolve(key: KeyEvent) -> Option<Action> {
     // `^A`/`^E`/`^U`/`^W` are advertised in the overlay legends, so they become
     // muscle memory — and a press landing just outside an overlay (a beat before
@@ -368,14 +369,30 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
     // pane, `^A` to `a` → `AddTask` and `^E` to `e` → `EditTitle`, each springing
     // the very overlay the user just left.
     //
-    // Scoped to those four keys rather than to every Ctrl chord, deliberately.
+    // `^N` joined them with the move-to-List picker's type-ahead, whose legend
+    // teaches `^N`/`^P` as its cursor: ungated, a late `^N` resolved to `n` →
+    // `EditNotes` and suspended the whole TUI into `$EDITOR` — the worst
+    // fall-through of the set, since it takes the terminal away rather than
+    // springing an overlay `Esc` closes.
+    //
+    // `^P` is *not* gated with it, though the same legend teaches it. `Ctrl-P`
+    // opens the Omnibox — documented in the README, and pinned by
+    // `ctrl_p_opens_the_omnibox_like_p` — so gating it would retire a documented
+    // binding as a side effect of a picker change. Its fall-through is also the
+    // benign one: an overlay the user can `Esc`, not an editor the terminal
+    // disappears into.
+    //
+    // Scoped to those five keys rather than to every Ctrl chord, deliberately.
     // This table is modifier-blind throughout — `Ctrl-Q` quits, `Ctrl-C` toggles
     // Completed — and that is left exactly as it was: gating the lot would
-    // silently change two more keys in a change that neither introduced nor
+    // silently change more keys in a change that neither introduced nor
     // advertised them. Making the whole table modifier-aware is a decision of its
     // own, with its own tests, tracked in #105. What is gated here is only what
-    // this app now *teaches* the user to press.
-    if is_control_chord(key.modifiers) && matches!(key.code, KeyCode::Char('a' | 'e' | 'u' | 'w')) {
+    // this app now *teaches* the user to press **and** cannot afford to have
+    // fired by accident.
+    if is_control_chord(key.modifiers)
+        && matches!(key.code, KeyCode::Char('a' | 'e' | 'n' | 'u' | 'w'))
+    {
         return None;
     }
     bindings()
@@ -475,7 +492,10 @@ pub enum LegendContext {
     Confirm,
     /// The link picker: j/k move, Enter opens, Esc cancels.
     LinkPicker,
-    /// The move-to-List picker: j/k move, Enter moves, Esc cancels.
+    /// The move-to-List picker: a type-ahead query over the candidate Lists.
+    /// `j`/`k` **type**, as they do in the Omnibox — movement is `Up`/`Down` or
+    /// `^N`/`^P`, `^U`/`^W` edit the query, `Enter` performs the Move and `Esc`
+    /// cancels it.
     ListPicker,
     /// The title/notes filter input: characters narrow the pane live, `Enter`
     /// keeps the filter applied, `Esc` drops it entirely, and `^U` clears just
@@ -833,13 +853,11 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     // the `?` cheatsheet covers pane keys only and would leave them undiscoverable.
     // Both pairs share one cell rather than repeating the label "move" twice.
     //
-    // `^N`/`^P` are bound here where the Omnibox refuses them, and the reason the
-    // Omnibox gives still stands: `resolve` is modifier-blind, so a `^N` landing
-    // just outside the overlay reaches `n` → `EditNotes` and suspends the TUI into
-    // `$EDITOR`. That is a hazard of the pane rather than of this picker — a `^N`
-    // with no overlay up does it today — and this picker is the one place a
-    // home-row cursor pair is worth the exposure, its `j`/`k` having gone to the
-    // query.
+    // `^N`/`^P` are bound here where the Omnibox refuses them — and advertising
+    // them is what put `n` behind `resolve`'s chord gate: a `^N` landing a beat
+    // after this picker closes used to reach `n` → `EditNotes` and suspend the
+    // TUI into `$EDITOR`. Teaching a key is what obliges the gate to cover it,
+    // so the two changes belong together.
     const LIST_PICKER: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("Up/Down ^N/^P"),
@@ -907,10 +925,11 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     // `ascii` flag, so a cell has no way to degrade.
     //
     // `Enter` reads "run", not "save": the highlighted row may jump, search,
-    // move or capture, and only two of those write anything. No cell for `^N`/`^P` —
-    // they are not bound, deliberately: `resolve` is modifier-blind, so a `^N`
-    // landing just outside the overlay would reach `n` → `EditNotes` and suspend
-    // the TUI into `$EDITOR`.
+    // move or capture, and only two of those write anything. No cell for
+    // `^N`/`^P` — they are not bound here. The hazard that first argued against
+    // them is closed (`resolve` now gates `^N`, for the move-to-List picker that
+    // does teach it), so this is no longer a refusal on safety grounds; binding
+    // them in the Omnibox too is a change of its own, and not this one.
     const OMNIBOX: &[LegendEntry] = &[
         LegendEntry {
             keys: LegendKeys::Literal("Enter"),

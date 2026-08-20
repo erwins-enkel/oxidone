@@ -4,7 +4,9 @@
 
 use chrono::{Local, NaiveDate, TimeZone};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use oxidone::app::{update, Command, Focus, Message, Model, Overlay};
+use oxidone::app::{
+    omnibox_rows, update, Command, Focus, Message, Model, MoveRow, OmniRow, Overlay,
+};
 use oxidone::domain::{List, ListId, Selection, SortView, Status, Task, TaskId};
 
 fn press(c: char) -> Message {
@@ -738,4 +740,59 @@ fn a_failure_for_a_move_we_never_made_changes_nothing_but_the_status_line() {
     );
     assert_eq!(ids(&m), ["t1"]);
     assert_eq!(m.status_line.as_deref(), Some("stray"));
+}
+
+// ---- Parity with the Omnibox's MOVE band ----
+
+/// The refusals the Omnibox's MOVE band draws for `q`.
+fn band_refusals(m: &Model) -> Vec<String> {
+    omnibox_rows(m, "move")
+        .into_iter()
+        .filter_map(|row| match row {
+            OmniRow::Move(MoveRow::Refused { reason }) => Some(reason.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The band says exactly what `M` says, and says it once. Read before `M` runs,
+/// so the picker's status line cannot be what the band is echoing.
+fn assert_both_refuse(m: &mut Model) {
+    let band = band_refusals(m);
+    m.status_line = None;
+
+    update(m, press('M'));
+
+    assert!(m.overlay.is_none(), "the picker opened on a refused Move");
+    let picker = m.status_line.clone().expect("M refused in silence");
+    assert_eq!(band, [picker], "the band and the picker disagree");
+}
+
+/// Both surfaces read one `move_refusal`, so the band must refuse exactly what
+/// `M` refuses, in the same words — the whole point of extracting that rule when
+/// the band arrived. Driven through the same four setups as the refusal tests
+/// above.
+#[test]
+fn the_omnibox_band_refuses_what_m_refuses() {
+    // A placeholder Task, mid-insert.
+    let mut m = list_model(&["a", "b"], Vec::new());
+    update(&mut m, press('a'));
+    update(&mut m, press('x'));
+    update(&mut m, key(KeyCode::Enter));
+    assert_both_refuse(&mut m);
+
+    // An in-list Move in flight, whose rollback snapshot must not predate ours.
+    let mut m = list_model(&["a", "b"], vec![task("t1", "a"), task("t2", "a")]);
+    update(&mut m, press('J'));
+    assert_both_refuse(&mut m);
+
+    // A field write in flight on the same Task.
+    let mut m = list_model(&["a", "b"], vec![task("t1", "a")]);
+    m.show_completed = true;
+    update(&mut m, press(' '));
+    assert_both_refuse(&mut m);
+
+    // Nowhere to go: the Task is movable, the destinations are not there.
+    let mut m = list_model(&["a"], vec![task("t1", "a")]);
+    assert_both_refuse(&mut m);
 }

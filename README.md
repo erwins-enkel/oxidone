@@ -24,7 +24,8 @@ a Tasks costume.
 - Create / complete / edit / delete tasks; un-complete; clear completed
 - Subtasks (one level, matching Google), indent/outdent, manual reorder
   (from a sort view, the first reorder key switches back to "my order")
-- Move a task to another list (`M`), from a list or from Today
+- Move a task to another list (`M`, or `:move` in the Omnibox), from a list or
+  from Today
 - Natural-language due dates (`tomorrow`, `mon`, `+3d`) with ISO fallback, shown
   relative to today (`tomorrow`, `in 3d`, `2d ago`) until a week out
 - The due editor (`d`) opens with the current date selected, so the first
@@ -48,7 +49,8 @@ a Tasks costume.
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
   due → title → "my order" (Google's), the only view a reorder writes to
 - An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a command
-  (`:refresh`, `:week`, `:horizon`, `:flavor`, `:ascii`), search every List, or capture
+  (`:refresh`, `:week`, `:horizon`, `:flavor`, `:ascii`), search every List, move
+  the selected task to another list (`:move`, filtered by name), or capture
   the query as a Task — `Enter` runs the highlighted row
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*

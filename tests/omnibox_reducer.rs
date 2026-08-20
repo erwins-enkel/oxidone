@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use oxidone::app::{
     omnibox_rows, update, CaptureRow, Command, CommandState, Focus, Group, JumpTarget, Message,
-    Model, OmniCommand, OmniRow, Overlay, OFFLINE,
+    Model, MoveRow, OmniCommand, OmniRow, Overlay, OFFLINE,
 };
 use oxidone::config::Flavor;
 use oxidone::domain::{List, ListId, Selection};
@@ -143,6 +143,7 @@ fn the_empty_query_lists_the_pinned_rows_then_lists_then_commands() {
                 OmniRow::Jump(JumpTarget::List { title, .. }) => title,
                 OmniRow::Command(c) => format!(":{}", c.command.verb()),
                 OmniRow::Search { .. } => "SEARCH".to_string(),
+                OmniRow::Move(_) => "MOVE".to_string(),
                 OmniRow::Capture(_) => "CAPTURE".to_string(),
             })
             .collect::<Vec<_>>(),
@@ -1104,4 +1105,293 @@ fn dated_task(id: &str, days_out: i64) -> oxidone::domain::Task {
         etag: String::new(),
         updated: Utc.timestamp_opt(0, 0).unwrap(),
     }
+}
+
+// ─── the MOVE band ──────────────────────────────────────────────────────────
+
+/// A `needsAction` Task in `list`. Undated and untyped: the MOVE band reads only
+/// its id and its List, so anything else here would be scenery.
+fn task(id: &str, list: &str) -> oxidone::domain::Task {
+    oxidone::domain::Task {
+        list: ListId(list.into()),
+        ..dated_task(id, 0)
+    }
+}
+
+/// A model on `titles[0]`'s pane with `tasks` loaded, the cursor on the first row
+/// and the Omnibox open. Online, because offline is not a MOVE refusal and the
+/// one test that says so flips it back.
+fn open_on_task(titles: &[&str], tasks: Vec<oxidone::domain::Task>) -> Model {
+    let mut model = Model::new();
+    update(
+        &mut model,
+        Message::ListsLoaded(titles.iter().map(|t| list(t)).collect()),
+    );
+    model.api_available = true;
+    model.selected = Selection::List(0);
+    update(
+        &mut model,
+        Message::TasksLoaded(ListId(titles[0].into()), tasks),
+    );
+    model.focus = Focus::Tasks;
+    update(&mut model, ch('p'));
+    model
+}
+
+/// The MOVE rows for `q`, in row order.
+fn moves(model: &Model, q: &str) -> Vec<MoveRow> {
+    omnibox_rows(model, q)
+        .into_iter()
+        .filter_map(|row| match row {
+            OmniRow::Move(row) => Some(row),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The destination titles the band offers for `q`, which is what a `Refused` band
+/// has none of.
+fn destinations(model: &Model, q: &str) -> Vec<String> {
+    moves(model, q)
+        .into_iter()
+        .map(|row| match row {
+            MoveRow::Ready { title, .. } => title,
+            MoveRow::Refused { reason } => panic!("refused: {reason}"),
+        })
+        .collect()
+}
+
+/// Type `q`, walk to the first MOVE row and press Enter there.
+fn fire_move(model: &mut Model, q: &str) -> Vec<Command> {
+    for c in q.chars() {
+        update(model, ch(c));
+    }
+    let at = rows(model)
+        .iter()
+        .position(|r| matches!(r, OmniRow::Move(_)))
+        .expect("a MOVE row");
+    for _ in 0..at {
+        update(model, key(KeyCode::Down));
+    }
+    update(model, key(KeyCode::Enter))
+}
+
+/// Gated on the verb, and on a **non-empty** prefix of it — unlike the COMMAND
+/// band, where the empty verb matching everything is what lists the whole table.
+/// The two queries that would exercise that rule here are the two where nothing
+/// has been asked for yet: a bare `p`, and a lone `:`, which strips to an empty
+/// verb.
+#[test]
+fn the_move_band_needs_a_non_empty_prefix_of_its_verb() {
+    let model = open_on_task(&["work", "home"], vec![task("t1", "work")]);
+
+    for q in ["m", "mo", "mov", "move", ":move", "MOVE", "move home"] {
+        assert!(!moves(&model, q).is_empty(), "{q:?} drew no MOVE band");
+    }
+    // `milk` shares a first letter and nothing else; `home` names a List, which
+    // is a JUMP row's business.
+    for q in ["", "   ", ":", "milk", "home"] {
+        assert!(moves(&model, q).is_empty(), "{q:?} drew a MOVE band");
+    }
+}
+
+/// Every List but the Task's own, in `model.lists` order — the same set the
+/// picker offers, because both read `move_destinations`.
+#[test]
+fn the_move_band_offers_every_list_but_the_tasks_own() {
+    let model = open_on_task(&["work", "home", "errands"], vec![task("t1", "work")]);
+    assert_eq!(destinations(&model, "move"), ["home", "errands"]);
+}
+
+/// A List with no id on Google yet is never a destination — the same exclusion
+/// the picker makes, for the same reason: the Move would name a List that does
+/// not exist.
+#[test]
+fn a_placeholder_list_is_never_a_move_destination() {
+    let model = open_on_task(&["work", "temp-list-0"], vec![task("t1", "work")]);
+    assert_eq!(
+        moves(&model, "move"),
+        [MoveRow::Refused {
+            reason: "no other list to move to"
+        }]
+    );
+}
+
+/// The argument filters the destinations on the same case-insensitive substring
+/// rule the JUMP band uses on the whole query — so `:move ho` reaches `home`
+/// without typing it out.
+#[test]
+fn the_argument_filters_the_destinations() {
+    let model = open_on_task(&["work", "home", "errands"], vec![task("t1", "work")]);
+
+    assert_eq!(destinations(&model, "move ho"), ["home"]);
+    assert_eq!(destinations(&model, "move RAN"), ["errands"]);
+    assert_eq!(destinations(&model, "move   ho"), ["home"]);
+}
+
+/// A filter that matches nothing **refuses** rather than dropping the band:
+/// silence there would read as "this Task cannot move", which is the one thing
+/// that is not true — the destinations exist, the argument excluded them.
+#[test]
+fn an_argument_matching_no_list_refuses_with_a_reason() {
+    let model = open_on_task(&["work", "home"], vec![task("t1", "work")]);
+    assert_eq!(
+        moves(&model, "move zzz"),
+        [MoveRow::Refused {
+            reason: "no list matches"
+        }]
+    );
+}
+
+/// A movable Task with nowhere to go says so, rather than vanishing: the refusal
+/// is about the destinations, not about the Task.
+#[test]
+fn a_lone_list_refuses_with_a_reason() {
+    let model = open_on_task(&["work"], vec![task("t1", "work")]);
+    assert_eq!(
+        moves(&model, "move"),
+        [MoveRow::Refused {
+            reason: "no other list to move to"
+        }]
+    );
+}
+
+/// MOVE sits after SEARCH and before CAPTURE. CAPTURE keeps the pinned tail it
+/// has always had, and the SEARCH row above both is what makes the next test
+/// true.
+#[test]
+fn the_move_band_sits_between_search_and_capture() {
+    let model = open_on_task(&["work", "home"], vec![task("t1", "work")]);
+    // `mo` prefixes no command verb and matches no List title, so these three
+    // bands are the whole result.
+    assert_eq!(
+        omnibox_rows(&model, "mo")
+            .iter()
+            .map(OmniRow::group)
+            .collect::<Vec<_>>(),
+        [Group::Search, Group::Move, Group::Capture]
+    );
+}
+
+/// A MOVE row writes, so it must never be the row a stray `Enter` lands on. The
+/// SEARCH row guarantees it: the band needs a non-empty query, and every
+/// non-empty query has one. Pinned against Lists *named* like the verb, which is
+/// where a JUMP row could otherwise be crowded out of first place.
+#[test]
+fn a_move_row_is_never_the_first_row() {
+    let model = open_on_task(&["move", "movies"], vec![task("t1", "move")]);
+
+    for q in ["m", "mo", "mov", "move", ":move", "move mov"] {
+        assert!(
+            !matches!(omnibox_rows(&model, q).first(), Some(OmniRow::Move(_))),
+            "{q:?} put a write at row 0"
+        );
+    }
+}
+
+/// Nothing focused, no band — `M`'s own behaviour on the sidebar, and
+/// `capture_row`'s rule for a row it cannot name: with no Task there is no Move
+/// to describe, and a refusal would be drawn under every `:move` typed from
+/// there.
+#[test]
+fn the_move_band_is_absent_with_nothing_focused() {
+    let mut model = open_on_task(&["work", "home"], vec![task("t1", "work")]);
+    model.focus = Focus::Sidebar;
+    assert!(moves(&model, "move").is_empty());
+}
+
+/// Offline is **not** a refusal here, unlike `:refresh`. A Move is a write, and
+/// ADR-0001 rolls a write back through `offline_failure_for` rather than refusing
+/// it up front — a band that refused offline would disagree with the `M` sitting
+/// behind it.
+#[test]
+fn the_move_band_does_not_refuse_offline() {
+    let mut model = open_on_task(&["work", "home"], vec![task("t1", "work")]);
+    model.api_available = false;
+    assert_eq!(destinations(&model, "move"), ["home"]);
+}
+
+/// `Enter` on a MOVE row performs the Move: the Command names the row's own List
+/// as the source, the row leaves the pane optimistically, and the Omnibox closes
+/// because there is nothing left to type.
+#[test]
+fn enter_on_a_move_row_relocates_the_task() {
+    let mut model = open_on_task(
+        &["work", "home"],
+        vec![task("t1", "work"), task("t2", "work")],
+    );
+
+    let commands = fire_move(&mut model, "move ho");
+
+    match commands.as_slice() {
+        [Command::MoveToList {
+            source,
+            task,
+            destination,
+        }] => {
+            assert_eq!((source.0.as_str(), task.0.as_str()), ("work", "t1"));
+            assert_eq!(destination.0, "home");
+        }
+        other => panic!("expected one MoveToList, got {other:?}"),
+    }
+    assert!(model.overlay.is_none(), "the Omnibox outlived the Move");
+    assert_eq!(
+        model
+            .tasks
+            .iter()
+            .map(|t| t.id.0.clone())
+            .collect::<Vec<_>>(),
+        ["t2"],
+        "the moved row is gone from the pane"
+    );
+}
+
+/// In Today the source is the row's **own** List, not the selected one: Today is
+/// not a List, and the band offers everywhere the row is not.
+#[test]
+fn in_today_the_band_moves_out_of_the_rows_own_list() {
+    let mut model = open_on_task(&["work", "home", "errands"], Vec::new());
+    update(&mut model, key(KeyCode::Esc));
+    // `Model::new` clocks in at the epoch, and Today's membership is `due <=
+    // now` — a row dated *today* is in the future there, and an unselectable row
+    // is no test of the source List.
+    model.now = chrono::Local::now();
+    model.selected = Selection::Today;
+    update(
+        &mut model,
+        Message::TodayLoaded {
+            tasks: vec![task("t1", "home")],
+            failed: Vec::new(),
+        },
+    );
+    model.focus = Focus::Tasks;
+    update(&mut model, ch('p'));
+
+    assert_eq!(destinations(&model, "move"), ["work", "errands"]);
+
+    let commands = fire_move(&mut model, "move work");
+    match commands.as_slice() {
+        [Command::MoveToList { source, .. }] => assert_eq!(source.0, "home"),
+        other => panic!("expected one MoveToList, got {other:?}"),
+    }
+}
+
+/// A refused MOVE row fires nothing, keeps the query and keeps the overlay — the
+/// reason is already on the row, so writing it to the status line too would say
+/// it twice.
+#[test]
+fn a_refused_move_row_is_inert() {
+    let mut model = open_on_task(&["work"], vec![task("t1", "work")]);
+    model.status_line = Some("kept".into());
+
+    let commands = fire_move(&mut model, "move");
+
+    assert!(commands.is_empty(), "nothing was written");
+    assert_eq!(query(&model), "move", "the query survived");
+    assert!(
+        matches!(model.overlay, Some(Overlay::Omnibox { .. })),
+        "an unfireable row keeps the overlay"
+    );
+    assert_eq!(model.status_line.as_deref(), Some("kept"));
+    assert_eq!(model.tasks.len(), 1, "the row stayed in the pane");
 }

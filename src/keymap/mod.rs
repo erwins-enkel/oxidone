@@ -892,8 +892,8 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
     // is what `key_label` prints for those codes, and `render_legend` takes no
     // `ascii` flag, so a cell has no way to degrade.
     //
-    // `Enter` reads "run", not "save": the highlighted row may jump, search or
-    // capture, and only one of those saves anything. No cell for `^N`/`^P` —
+    // `Enter` reads "run", not "save": the highlighted row may jump, search,
+    // move or capture, and only two of those write anything. No cell for `^N`/`^P` —
     // they are not bound, deliberately: `resolve` is modifier-blind, so a `^N`
     // landing just outside the overlay would reach `n` → `EditNotes` and suspend
     // the TUI into `$EDITOR`.

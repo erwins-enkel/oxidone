@@ -33,8 +33,8 @@ impl TextInput {
         Self { text, caret }
     }
 
-    /// The caret's byte offset, for the view: the point the caret bar is drawn
-    /// at, and the only reason anything outside this module needs the number.
+    /// The caret's byte offset, for the view: the point it puts the terminal's
+    /// cursor, and the only reason anything outside this module needs the number.
     pub fn caret(&self) -> usize {
         self.caret
     }

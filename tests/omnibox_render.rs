@@ -506,3 +506,82 @@ fn a_long_title_with_no_room_drops_whole_rather_than_eliding() {
         "the destination must survive at its floor: {capture:?}"
     );
 }
+
+// ─── the MOVE band ──────────────────────────────────────────────────────────
+
+/// A model on List `titles[0]`'s pane with one Task selected and the Omnibox
+/// open — the state the MOVE band needs, which `open_with` (no Tasks) is not.
+fn open_on_a_task(titles: &[&str]) -> Model {
+    let mut model = Model::new();
+    update(
+        &mut model,
+        Message::ListsLoaded(titles.iter().map(|t| list(t)).collect()),
+    );
+    model.selected = Selection::List(0);
+    update(
+        &mut model,
+        Message::TasksLoaded(
+            ListId(titles[0].to_string()),
+            vec![oxidone::domain::Task {
+                id: oxidone::domain::TaskId("t1".into()),
+                list: ListId(titles[0].to_string()),
+                parent: None,
+                title: "buy milk".into(),
+                notes: None,
+                status: oxidone::domain::Status::NeedsAction,
+                due: None,
+                completed_at: None,
+                links: Vec::new(),
+                position: "0".into(),
+                etag: String::new(),
+                updated: Utc.timestamp_opt(0, 0).unwrap(),
+            }],
+        ),
+    );
+    model.focus = oxidone::app::Focus::Tasks;
+    update(&mut model, ch('p'));
+    model
+}
+
+/// The band names whose destinations these are — a MOVE row draws a List title
+/// just as a JUMP row does, and the header is what tells them apart. The `→`
+/// carries that distinction down each row, for the case where a long result list
+/// has scrolled the header out of view.
+#[test]
+fn a_move_row_leads_with_an_arrow_under_its_own_header() {
+    let mut model = open_on_a_task(&["work", "home"]);
+    typed(&mut model, "move");
+
+    assert!(
+        shows(&model, "MOVE"),
+        "no MOVE header: {:#?}",
+        popup_rows(&model)
+    );
+    assert!(
+        shows(&model, "→ home"),
+        "no destination row: {:#?}",
+        popup_rows(&model)
+    );
+    // The JUMP row for the same List is the bare title, so the two never read
+    // alike.
+    assert!(!shows(&model, "→ work"), "the Task's own List was offered");
+}
+
+/// A refused band names the verb it is refusing and carries the reason in the
+/// trail, exactly as a refused CAPTURE row does — the popup is wide enough to
+/// reserve that trail before the label gives way.
+#[test]
+fn a_refused_move_row_carries_its_reason() {
+    let mut model = open_on_a_task(&["work"]);
+    typed(&mut model, "move");
+
+    let drawn = popup_rows(&model);
+    let row = drawn
+        .iter()
+        .find(|r| r.contains("Move to list"))
+        .unwrap_or_else(|| panic!("no refused MOVE row: {drawn:#?}"));
+    assert!(
+        row.contains("no other list to move to"),
+        "the reason is missing: {row:?}"
+    );
+}

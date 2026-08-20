@@ -67,7 +67,7 @@ _Avoid_: sort order.
 **Move**:
 Repositioning, reparenting, or **relocating** a Task (Google's `move` operation). The only action that writes Manual order or changes an existing Task's `parent`. Moves compute against stored order, so a Move pressed from a Sort view switches the pane back to Manual and stops — the next press performs the Move, against the adjacency now on screen.
 
-Relocating (`M`, "move to list") is the third axis: the same operation with a `destinationTasklist`, sending a Task to another List. It writes no Manual order in the pane it leaves, so unlike the other Moves it neither needs nor switches the Sort lens, and it works in **Today** — where the source is the row's own List, not the selected one. The Task lands at the **top** of the destination, the one position Google permits for every Task including a Cleared one, and a Subtask arrives **top-level**: its parent stays behind and cannot follow.
+Relocating (`M`, or the **Omnibox**'s MOVE band, "move to list") is the third axis: the same operation with a `destinationTasklist`, sending a Task to another List. The picker and the band offer the same destinations and refuse the same Tasks in the same words — one definition of each, so the two surfaces cannot drift into disagreeing about what is movable. It writes no Manual order in the pane it leaves, so unlike the other Moves it neither needs nor switches the Sort lens, and it works in **Today** — where the source is the row's own List, not the selected one. The Task lands at the **top** of the destination, the one position Google permits for every Task including a Cleared one, and a Subtask arrives **top-level**: its parent stays behind and cannot follow.
 
 A Task that still *has* Subtasks goes too, and takes them with it. **Google moves the subtree intact**: the children follow their parent into the destination, still naming it, and every `id` survives the move (verified 2026-07-21 — one account, two runs of two fixtures each; see #86). oxidone used to refuse such a Task, on the reasoning that a half-moved subtree could not be undone; nothing is half-moved, so the rule and the live query that decided it are gone (#93) — a relocation is now one request.
 
@@ -174,14 +174,23 @@ _Avoid_: selection, caret (that is the text inputs'), cell cursor.
 The modal surface `p` opens: one query over a grouped result list, offering the
 two pinned rows and the Lists to **jump** to, the **commands** (keyless, bar
 `:refresh` and `:week`, which `r` and `W` also fire), a hand-off to **Search**,
-and — pinned last — **capturing** the query as
-a Task. `Enter` runs whichever row is highlighted, so what it will do is legible
-before it is pressed, and a write is never what happens by default.
+**moving** the selected Task to another List, and — pinned last — **capturing**
+the query as a Task. `Enter` runs whichever row is highlighted, so what it will do
+is legible before it is pressed, and a write is never what happens by default.
 
-Its four bands are **groups**, in the **Journal spread**'s sense — a labelled run
+Its five bands are **groups**, in the **Journal spread**'s sense — a labelled run
 of rows under a group header, exactly as **Overdue** and **Today** are there.
 Not the sense the **List** entry avoids: a List is never called a group, and the
 JUMP group is a grouping of *rows* that happen to name Lists.
+
+MOVE is the one band a query has to *ask* for: it draws only where the query's
+first word is a non-empty prefix of `move`, one row per destination the **Move**
+entry admits, filtered by whatever follows the verb (`:move ho` → `→ home`). A
+band drawn on every query would put a write in the middle of the list — and
+`move` is not an **Omnibox** command in the `:refresh` sense: it names a band of
+rows rather than one row with an argument. The two write bands, MOVE and CAPTURE,
+come last for the same reason, and the SEARCH row above them — offered for every
+non-empty query — is what keeps either off the row `Enter` starts on.
 
 The *setting* commands are **session-only** — they change the running app, never
 `config.toml` — which the COMMAND group header says once rather than every row

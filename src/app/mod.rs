@@ -309,6 +309,11 @@ pub enum Group {
     Jump,
     Command,
     Search,
+    /// Destinations the selected Task may be relocated to — the same cross-List
+    /// Move `M` performs, reached by name. Drawn **after** `Search` and before
+    /// `Capture`: its rows write, and a non-write row must precede them (see
+    /// [`omnibox_rows`]).
+    Move,
     Capture,
 }
 
@@ -325,6 +330,10 @@ impl Group {
             Group::Jump => "JUMP",
             Group::Command => "COMMAND · settings are session only",
             Group::Search => "SEARCH",
+            // Says whose destinations these are: a MOVE row draws a List title,
+            // exactly as a JUMP row does, and only the band tells them apart
+            // once the header has scrolled off a long result list.
+            Group::Move => "MOVE · this task to another list",
             Group::Capture => "CAPTURE",
         }
     }
@@ -478,6 +487,29 @@ pub enum CaptureRow {
     },
 }
 
+/// One MOVE row: a destination the selected Task may go to, or why it may go
+/// nowhere.
+///
+/// Validity-or-reason like [`CaptureRow`], and for the same reason — a refused
+/// band has no destination to name — with one difference: the refusal is the
+/// *whole band*, so exactly one such row is ever drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoveRow {
+    Ready {
+        /// The destination List's id. Stored as the id, never as an index into
+        /// `model.lists`, for the reason [`JumpTarget::List`] gives: a
+        /// `ListsLoaded` between the render and the press would silently move
+        /// the Task to a *different* List.
+        destination: ListId,
+        title: String,
+    },
+    Refused {
+        /// Straight from [`move_refusal`] — the same sentence `M` writes to the
+        /// status line, read here *before* Enter rather than after.
+        reason: &'static str,
+    },
+}
+
 /// Where a JUMP row goes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JumpTarget {
@@ -509,6 +541,7 @@ pub enum OmniRow {
     Search {
         query: String,
     },
+    Move(MoveRow),
     Capture(CaptureRow),
 }
 
@@ -518,6 +551,7 @@ impl OmniRow {
             OmniRow::Jump(_) => Group::Jump,
             OmniRow::Command(_) => Group::Command,
             OmniRow::Search { .. } => Group::Search,
+            OmniRow::Move(_) => Group::Move,
             OmniRow::Capture(_) => Group::Capture,
         }
     }
@@ -3335,6 +3369,67 @@ fn pane_key(model: &Model) -> Option<PaneKey> {
     model.selected_list_id().cloned().map(PaneKey::List)
 }
 
+/// The refusal when a Task is movable but has nowhere to go. Its own constant
+/// because it is decided from [`move_destinations`]'s result rather than inside
+/// [`move_refusal`], which never builds that list.
+const NO_DESTINATION: &str = "no other list to move to";
+
+/// Why `task` cannot be relocated right now, or `None` when it can.
+///
+/// The one definition of "is this Task movable", shared by the two surfaces that
+/// ask: `M`'s picker writes the sentence to the status line, the Omnibox's MOVE
+/// band draws it on a row. Two copies of these three guards would be free to
+/// drift into disagreeing about what is movable.
+///
+/// Offline is deliberately **not** here. A cross-List Move is a write, and
+/// ADR-0001's rule for a write with no client is optimistic-then-rolled-back by
+/// [`offline_failure_for`], not refused up front — `:refresh` refuses because it
+/// has no rollback path to fall back on, and a MOVE row that refused offline
+/// would disagree with the `M` sitting behind it.
+fn move_refusal(model: &Model, task: &Task) -> Option<&'static str> {
+    // A placeholder has no id on Google yet; moving it would 404 into a rollback
+    // instead of refusing. This also covers a Task sitting in a not-yet-created
+    // List: its own insert cannot have been confirmed either, so it is a
+    // placeholder too and never reaches the destination checks.
+    if is_placeholder(&task.id.0) {
+        return Some("still saving — try again in a moment");
+    }
+    // An in-list Move must not be in flight. `MoveFailed` restores `model.tasks`
+    // wholesale from a snapshot taken when that Move started, bypassing every
+    // filter including the provisional tombstone — so refusing here is what
+    // guarantees no such snapshot can predate our optimistic removal.
+    //
+    // Note this is checked when the destination is *offered*, while the removal
+    // happens at `Enter`. Nothing can start an in-list Move in between: while an
+    // overlay is set, `overlay_key` routes keys to `picker_key` or `omnibox_key`
+    // and returns, so `J`/`K`/`>`/`<` never reach `move_preconditions`.
+    // `an_in_list_move_key_does_nothing_while_the_picker_is_open` pins that.
+    if model.pending_move.is_some() || model.pending_list_moves.contains_key(&task.id) {
+        return Some("a move is already in progress");
+    }
+    // A field write to this Task would `PATCH /lists/{source}/…` and 404 once
+    // Google applies the move, rejecting an edit the user made in good faith.
+    if model.pending_writes.contains_key(&task.id) {
+        return Some("a write is already in progress for this task");
+    }
+    None
+}
+
+/// Every List a Task in `source` may be relocated to: all but its own, and never
+/// a placeholder List, whose id does not exist on Google yet.
+///
+/// Shared with [`move_rows`] for the same reason as [`move_refusal`] — one
+/// definition of which destinations exist, so the picker and the band cannot
+/// offer different ones.
+fn move_destinations(model: &Model, source: &ListId) -> Vec<List> {
+    model
+        .lists
+        .iter()
+        .filter(|l| l.id != *source && !is_placeholder(&l.id.0))
+        .cloned()
+        .collect()
+}
+
 /// Open the move-to-List picker for the selected Task.
 ///
 /// Deliberately does **not** call `move_preconditions`: a cross-List Move writes
@@ -3346,47 +3441,19 @@ fn open_move_to_list(model: &mut Model) {
     let Some(task) = focused_task(model) else {
         return;
     };
-    let (id, source) = (task.id.clone(), task.list.clone());
-
-    // A placeholder has no id on Google yet; moving it would 404 into a rollback
-    // instead of refusing. This also covers a Task sitting in a not-yet-created
-    // List: its own insert cannot have been confirmed either, so it is a
-    // placeholder too and never reaches the destination checks below.
-    if is_placeholder(&id.0) {
-        model.status_line = Some("still saving — try again in a moment".to_string());
-        return;
-    }
-    // An in-list Move must not be in flight. `MoveFailed` restores `model.tasks`
-    // wholesale from a snapshot taken when that Move started, bypassing every
-    // filter including the provisional tombstone — so refusing here is what
-    // guarantees no such snapshot can predate our optimistic removal.
-    //
-    // Note this is checked at `M`, while the removal happens at `Enter`. Nothing
-    // can start an in-list Move in between: while an overlay is set, `overlay_key`
-    // routes keys to `picker_key` and returns, so `J`/`K`/`>`/`<` never reach
-    // `move_preconditions`. `an_in_list_move_key_does_nothing_while_the_picker_is_open`
-    // pins that.
-    if model.pending_move.is_some() || model.pending_list_moves.contains_key(&id) {
-        model.status_line = Some("a move is already in progress".to_string());
-        return;
-    }
-    // A field write to this Task would `PATCH /lists/{source}/…` and 404 once
-    // Google applies the move, rejecting an edit the user made in good faith.
-    if model.pending_writes.contains_key(&id) {
-        model.status_line = Some("a write is already in progress for this task".to_string());
+    let (id, source, refusal) = (
+        task.id.clone(),
+        task.list.clone(),
+        move_refusal(model, task),
+    );
+    if let Some(reason) = refusal {
+        model.status_line = Some(reason.to_string());
         return;
     }
 
-    // Every List but the Task's own — and never a placeholder List, whose id
-    // does not exist on Google yet.
-    let targets: Vec<List> = model
-        .lists
-        .iter()
-        .filter(|l| l.id != source && !is_placeholder(&l.id.0))
-        .cloned()
-        .collect();
+    let targets = move_destinations(model, &source);
     if targets.is_empty() {
-        model.status_line = Some("no other list to move to".to_string());
+        model.status_line = Some(NO_DESTINATION.to_string());
         return;
     }
 
@@ -3803,9 +3870,14 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
-/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH,
-/// CAPTURE — the four [`Group::header`] names, and the order `selected == 0`
+/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH, MOVE,
+/// CAPTURE — the five [`Group::header`] names, and the order `selected == 0`
 /// resolves against, so a write is always the last thing `Enter` can reach.
+///
+/// The two **write** bands come last for that reason. MOVE precedes CAPTURE
+/// rather than replacing it as the pinned tail: CAPTURE is offered for every
+/// non-empty query, MOVE only for one that names its verb, and the SEARCH row
+/// above them both is what guarantees neither can land at `selected == 0`.
 ///
 /// A pure function of the `Model` and the query — no `Overlay` in sight — so
 /// every row-level property is assertable without a terminal and without driving
@@ -3856,18 +3928,92 @@ pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
         rows.push(OmniRow::Command(command_row(model, command, query, arg)));
     }
 
-    // SEARCH and CAPTURE need something to act on; CAPTURE lands with
+    // SEARCH, MOVE and CAPTURE need something to act on; CAPTURE lands with
     // `capture_target`. An empty query matches every JUMP candidate, which is
     // right there and wrong here.
     if !trimmed.is_empty() {
         rows.push(OmniRow::Search {
             query: trimmed.to_string(),
         });
+        // Pushed after that SEARCH row, which is what keeps a write off
+        // `selected == 0`: this band is reached only by a non-empty query, and
+        // every non-empty query has a SEARCH row above it.
+        rows.extend(move_rows(model, verb, arg));
         if let Some(capture) = capture_row(model, query) {
             rows.push(OmniRow::Capture(capture));
         }
     }
 
+    rows
+}
+
+/// The verb that reaches the MOVE band. Not an [`OmniCommand`]: `move` names a
+/// *band* of destination rows rather than one row with an argument, and putting
+/// it in that table would give it a `CommandState` it has no use for.
+const MOVE_VERB: &str = "move";
+
+/// Whether `typed` reaches the MOVE band: a **non-empty** prefix of
+/// [`MOVE_VERB`], matched case-insensitively.
+///
+/// Non-empty, unlike [`OmniCommand::matches_verb`], where the empty verb
+/// prefix-matching every command is exactly what makes an empty query list the
+/// whole table. The same rule here would draw a *write* row per List under a
+/// bare `p` — or under a lone `:`, which strips to an empty verb — and those are
+/// the two queries where nothing has been asked for yet.
+fn matches_move_verb(typed: &str) -> bool {
+    !typed.is_empty() && MOVE_VERB.starts_with(&typed.to_lowercase())
+}
+
+/// The MOVE band: one row per destination the selected Task may go to, or the
+/// single row saying why it may go nowhere.
+///
+/// Empty — no band, no header — when the verb does not match or nothing is
+/// focused. The second case is `M`'s own behaviour there (`open_move_to_list`
+/// returns silently) and [`capture_row`]'s rule for a row it cannot name: with
+/// no Task there is no Move to describe, and "no task selected" would be a
+/// refusal drawn under every `:move` typed from the sidebar.
+fn move_rows(model: &Model, verb: &str, arg: Option<&str>) -> Vec<OmniRow> {
+    if !matches_move_verb(verb) {
+        return Vec::new();
+    }
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    // Read before the destinations are built, in the order `M` checks them: a
+    // Task that cannot move at all must say so rather than list places it cannot
+    // go to.
+    if let Some(reason) = move_refusal(model, task) {
+        return vec![OmniRow::Move(MoveRow::Refused { reason })];
+    }
+    let destinations = move_destinations(model, &task.list);
+    if destinations.is_empty() {
+        return vec![OmniRow::Move(MoveRow::Refused {
+            reason: NO_DESTINATION,
+        })];
+    }
+
+    // Filtered on the argument by the same case-insensitive substring rule the
+    // JUMP band uses on the whole query — these rows name the same Lists, so
+    // they answer to the same typing.
+    let needle = arg.unwrap_or_default().to_lowercase();
+    let rows: Vec<OmniRow> = destinations
+        .into_iter()
+        .filter(|l| l.title.to_lowercase().contains(&needle))
+        .map(|l| {
+            OmniRow::Move(MoveRow::Ready {
+                destination: l.id,
+                title: l.title,
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        // A refusal, not an absent band: the destinations exist and the argument
+        // is what excluded them, so silence would read as "this Task cannot
+        // move" — the one thing that is not true here.
+        return vec![OmniRow::Move(MoveRow::Refused {
+            reason: "no list matches",
+        })];
+    }
     rows
 }
 
@@ -4610,6 +4756,13 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
             match row {
                 OmniRow::Jump(target) => return jump_to(model, target),
                 OmniRow::Search { query } => return omnibox_search(model, query),
+                // Inert for the reason the CAPTURE arms below give: the refusal
+                // is already drawn on the row, so delegating would write it to
+                // the status line as well.
+                OmniRow::Move(MoveRow::Refused { .. }) => {}
+                OmniRow::Move(MoveRow::Ready { destination, .. }) => {
+                    return omnibox_move(model, destination)
+                }
                 // Reads the refusal and returns *before* delegating: letting
                 // `finish_add_task` discover it would write `model.status_line`,
                 // which breaks the rule that an unfireable row changes nothing —
@@ -4646,6 +4799,31 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
     // (d)
     model.overlay = Some(Overlay::Omnibox { query, selected });
     Vec::new()
+}
+
+/// Relocate the selected Task to the List its MOVE row names.
+///
+/// Re-reads the Task through the same guards the row was built from rather than
+/// carrying it on the row: `omnibox_key` rebuilt the rows from the live `Model`
+/// a few lines above, so a refusal here is unreachable by construction — and it
+/// fires nothing rather than writing a status line, which is what an unfireable
+/// row promises either way.
+///
+/// The source List is the row's *own* `list`, as `open_move_to_list` takes it,
+/// so this works in Today where the pane spans Lists.
+fn omnibox_move(model: &mut Model, destination: ListId) -> Vec<Command> {
+    let Some(task) = focused_task(model) else {
+        return Vec::new();
+    };
+    let (id, source, refusal) = (
+        task.id.clone(),
+        task.list.clone(),
+        move_refusal(model, task),
+    );
+    if refusal.is_some() {
+        return Vec::new();
+    }
+    finish_move_to_list(model, id, source, destination)
 }
 
 /// Apply a `Valid` COMMAND row.

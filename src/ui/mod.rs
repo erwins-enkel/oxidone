@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use crate::app::text_input::TextInput;
 use crate::app::{
     omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow, CommandState, Focus,
-    JumpTarget, Model, OmniCommand, OmniRow, Overlay,
+    JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
@@ -524,6 +524,17 @@ fn omnibox_line(
             )
         }
         OmniRow::Search { query } => (format!("Search all Lists for \"{query}\""), String::new()),
+        // `→` for the destination, as the CAPTURE row uses it for what it will
+        // create: a bare title would be indistinguishable from the JUMP row of
+        // the same List once the band header has scrolled out of view. No trail —
+        // the destination is the whole of what this row says, and a meter here
+        // would decorate a question ("where does it go?") it cannot answer.
+        OmniRow::Move(MoveRow::Ready { title, .. }) => (format!("→ {title}"), String::new()),
+        // Named as the picker `M` opens is named, so the refused row says which
+        // verb it is refusing.
+        OmniRow::Move(MoveRow::Refused { reason }) => {
+            ("Move to list".to_string(), (*reason).to_string())
+        }
         OmniRow::Capture(CaptureRow::Refused { reason }) => {
             ("Create task".to_string(), (*reason).to_string())
         }

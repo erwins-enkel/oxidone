@@ -14,10 +14,11 @@
 //!   (ADR-0001) survives a second process only because that process never writes
 //!   the cache; a caller that wants an offline answer keeps its own last-known-good
 //!   copy.
-//! - **No new domain logic.** Today membership is [`crate::domain::due_on_or_before`],
-//!   Migrate is [`crate::domain::migrated_due`], the **Entry type** is
-//!   `EntryType::parse`, and a date phrase is [`crate::dateparse`]. A second
-//!   definition here would be a way for the bar and the TUI to disagree.
+//! - **No new domain logic.** Today membership is [`crate::domain::due_on_or_before`]
+//!   narrowed by [`crate::domain::within_completion_day`], Migrate is
+//!   [`crate::domain::migrated_due`], the **Entry type** is `EntryType::parse`, and
+//!   a date phrase is [`crate::dateparse`]. A second definition here would be a way
+//!   for the bar and the TUI to disagree — and was, until #135.
 
 mod apply;
 mod read;
@@ -29,7 +30,7 @@ pub use wire::{Entry, EntryKind, EntryStatus, ErrorBody, ErrorEnvelope, ListRow}
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, TimeZone};
 use serde_json::Value;
 
 use crate::api::{ApiError, RestClient, TasksApi};
@@ -43,6 +44,7 @@ oxidone json — machine-readable Google Tasks, for scripts and plugins
 
 Usage:
   oxidone json today             entries due on or before today, across every List
+                                 (a Completed one only if it was completed today)
   oxidone json lists             the Lists, and which one is the default
   oxidone json tasks --list ID   one List's entries, in Manual order
   oxidone json due EXPR          resolve a due-date phrase (tomorrow, mon, +3d, ISO)
@@ -311,11 +313,21 @@ pub fn run_due<Tz: TimeZone>(expr: &str, now: DateTime<Tz>) -> Result<Value, Cli
 
 /// Run a job against Google.
 ///
-/// `today` is injected rather than read from the clock, so Today membership and
+/// `now` is injected rather than read from the clock, so Today membership and
 /// Migrate's arithmetic are deterministic without touching the machine clock.
-pub async fn run_remote(api: &dyn TasksApi, job: Job, today: NaiveDate) -> Result<Value, CliError> {
+///
+/// A zone-aware instant, not a bare date, for one reason: Today's
+/// completion-recency rule compares a UTC `completed_at` against the *user's*
+/// day, and a `NaiveDate` carries no zone to do that in. Generic over the zone
+/// like [`run_due`] — `main` passes `Local::now()`, tests a fixed instant.
+pub async fn run_remote<Tz: TimeZone>(
+    api: &dyn TasksApi,
+    job: Job,
+    now: DateTime<Tz>,
+) -> Result<Value, CliError> {
+    let today = now.date_naive();
     match job {
-        Job::Today => read::today(api, today).await,
+        Job::Today => read::today(api, &now).await,
         Job::Lists => read::lists(api).await,
         Job::Tasks { list } => read::tasks(api, &list).await,
         Job::Apply(command) => apply::run(api, command, today).await,
@@ -389,7 +401,7 @@ pub async fn main(args: Vec<String>) -> ExitCode {
             // a machine that has never been authorized at all.
             match resolve(command, &stdin) {
                 Ok(job) => match google_client().await {
-                    Ok(api) => run_remote(&api, job, Local::now().date_naive()).await,
+                    Ok(api) => run_remote(&api, job, Local::now()).await,
                     Err(e) => Err(e),
                 },
                 Err(e) => Err(e),

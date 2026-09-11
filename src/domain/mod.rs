@@ -1,7 +1,7 @@
 //! The ubiquitous language, as Rust types. Mirrors Google's model exactly
 //! (ADR-0003: pure mirror). See `CONTEXT.md` for definitions.
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 
 /// A Google TaskList — a named container of Tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +298,40 @@ pub fn due_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
     due.is_some_and(|d| d < today)
 }
 
+/// Whether an entry is recent enough for **Today**: an entry that is not
+/// Completed always is, and a Completed one only if it was completed *today*. The
+/// second half of Today's membership, applied on top of [`due_on_or_before`], so
+/// Today answers "among what was due, what got done" rather than accumulating
+/// every completion whose due date happens to be in the past.
+///
+/// Narrows; never widens. Membership still gates on `due <= today`, so a
+/// future-due Task ticked off today is not in the set for this to admit.
+///
+/// The single definition, shared by the TUI's Today pane
+/// (`Model::within_completion_day`) and the JSON CLI's `today` (ADR-0010). The two
+/// surfaces once disagreed about exactly this: a caller rendering `oxidone json
+/// today` verbatim listed completions the pane had dropped the day after they were
+/// ticked off (#135).
+///
+/// **`completed_at: None` passes.** Completing is optimistic — `app::set_completed`
+/// deliberately leaves `completed_at` for the server response to fill — so hiding
+/// on `None` would blink a row off screen the instant `Space` is pressed and back
+/// on at the next refresh. A cache row with a NULL `completed_at`, and a Completed
+/// entry Google never stamped, take the same benefit of the doubt.
+///
+/// Compared in `tz`, not in UTC: `completed_at` is UTC, but "today" is the user's
+/// day. A caller passes the zone its `today` was derived in, or the two disagree
+/// around midnight.
+pub fn within_completion_day<Tz: TimeZone>(task: &Task, today: NaiveDate, tz: &Tz) -> bool {
+    if task.status != Status::Completed {
+        return true;
+    }
+    match task.completed_at {
+        None => true,
+        Some(at) => at.with_timezone(tz).date_naive() == today,
+    }
+}
+
 /// The due date a **Migrate** produces: one day past whichever is later, `today`
 /// or the entry's current due date. Bullet Journal's `>` (see CONTEXT.md).
 ///
@@ -375,8 +409,28 @@ pub struct TaskId(pub String);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::FixedOffset;
 
     const ALL: [EntryType; 3] = [EntryType::Task, EntryType::Event, EntryType::Note];
+
+    /// A minimal `needsAction` Task, for the predicates that read two of its
+    /// fields and nothing else.
+    fn sample_task() -> Task {
+        Task {
+            id: TaskId("t".into()),
+            list: ListId("l".into()),
+            parent: None,
+            title: "Standup".into(),
+            notes: None,
+            status: Status::NeedsAction,
+            due: None,
+            completed_at: None,
+            links: Vec::new(),
+            position: "0".into(),
+            etag: String::new(),
+            updated: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+        }
+    }
 
     #[test]
     fn a_canonical_title_round_trips_through_apply_and_parse() {
@@ -525,6 +579,81 @@ mod tests {
             assert!(!due_before(due, today), "{due:?} is not overdue");
             assert!(!due_on_or_before(due, today), "{due:?} is not in Today");
         }
+    }
+
+    /// The completion-recency half of Today: it touches Completed entries only,
+    /// and among those keeps the day's own work. `None` passes, so an optimistic
+    /// `Space` — which leaves `completed_at` for the server — never blinks a row
+    /// off screen.
+    #[test]
+    fn completion_recency_narrows_completed_entries_to_the_day_itself() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let at = |d: u32, h: u32| {
+            Some(
+                Utc.with_ymd_and_hms(2026, 7, d, h, 0, 0)
+                    .single()
+                    .expect("valid instant"),
+            )
+        };
+        let entry = |status, completed_at| Task {
+            status,
+            completed_at,
+            ..sample_task()
+        };
+
+        assert!(within_completion_day(
+            &entry(Status::Completed, at(20, 9)),
+            today,
+            &Utc
+        ));
+        assert!(!within_completion_day(
+            &entry(Status::Completed, at(19, 9)),
+            today,
+            &Utc
+        ));
+        assert!(!within_completion_day(
+            &entry(Status::Completed, at(21, 9)),
+            today,
+            &Utc
+        ));
+        assert!(within_completion_day(
+            &entry(Status::Completed, None),
+            today,
+            &Utc
+        ));
+        // Untouched for a `needsAction` entry, whatever stale timestamp it carries
+        // — this narrows Completed rows, it is not a second due-date filter.
+        for completed_at in [None, at(19, 9), at(21, 9)] {
+            assert!(within_completion_day(
+                &entry(Status::NeedsAction, completed_at),
+                today,
+                &Utc
+            ));
+        }
+    }
+
+    /// "Today" is the user's day, not UTC's. One instant, two zones, two answers
+    /// — which is why the zone is a parameter rather than an assumption.
+    #[test]
+    fn completion_recency_resolves_the_day_in_the_zone_it_is_given() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        // 23:30 UTC on the 20th: still the 20th in UTC, already the 21st in a
+        // zone an hour ahead.
+        let task = Task {
+            status: Status::Completed,
+            completed_at: Some(
+                Utc.with_ymd_and_hms(2026, 7, 20, 23, 30, 0)
+                    .single()
+                    .expect("valid instant"),
+            ),
+            ..sample_task()
+        };
+        let ahead = FixedOffset::east_opt(3600).expect("valid offset");
+        let behind = FixedOffset::west_opt(3600).expect("valid offset");
+
+        assert!(within_completion_day(&task, today, &Utc));
+        assert!(!within_completion_day(&task, today, &ahead));
+        assert!(within_completion_day(&task, today, &behind));
     }
 
     /// The three cases Migrate composes over, and the one it declines. An

@@ -4,7 +4,7 @@
 //! The command arrives as a `&str` exactly as it would off stdin, so the parsing
 //! and the write are covered together without spawning a process.
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
 
 use oxidone::api::{FakeTasksApi, NewTask, TaskPatch, TasksApi};
@@ -15,8 +15,19 @@ fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
 }
 
+/// The reference instant every command resolves against — `run_remote` takes an
+/// instant, not a date, so Today's completion-recency rule has a zone to compare
+/// `completed_at` in.
+fn now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 20, 9, 0, 0)
+        .single()
+        .expect("valid instant")
+}
+
+/// The reference day, for seeding and asserting due dates. Derived from [`now`]
+/// so the two cannot drift apart.
 fn today() -> NaiveDate {
-    ymd(2026, 7, 20)
+    now().date_naive()
 }
 
 async fn seed_list(api: &FakeTasksApi) -> ListId {
@@ -45,7 +56,7 @@ async fn apply(api: &FakeTasksApi, command: Value) -> Result<Value, CliError> {
 
 async fn run(api: &FakeTasksApi, stdin: &str) -> Result<Value, CliError> {
     let job = resolve(Remote::Apply, stdin)?;
-    run_remote(api, job, today()).await
+    run_remote(api, job, now()).await
 }
 
 async fn ok(api: &FakeTasksApi, command: Value) -> Value {

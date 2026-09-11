@@ -6,14 +6,19 @@
 //! no wildcard arm — the only one on `ApiError` in the codebase — so a new
 //! variant breaks the build there; this fixes what the existing ones mean.
 
-use chrono::NaiveDate;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use oxidone::api::{ApiError, FakeTasksApi, TasksApi};
 use oxidone::cli::{run_remote, CliError, ErrorKind, Job};
 
-fn today() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date")
+/// The reference instant these calls resolve against. `run_remote` takes an
+/// instant rather than a date: Today's completion-recency rule compares a UTC
+/// `completed_at` against the caller's own day.
+fn now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 20, 9, 0, 0)
+        .single()
+        .expect("valid instant")
 }
 
 /// Inject `error` at the API seam and report what the CLI makes of it.
@@ -21,7 +26,7 @@ async fn surfaced(error: ApiError) -> CliError {
     let api = FakeTasksApi::new();
     api.insert_list("Work").await.expect("seeding a List");
     api.fail_next(error);
-    run_remote(&api, Job::Lists, today())
+    run_remote(&api, Job::Lists, now())
         .await
         .expect_err("the injected failure")
 }

@@ -129,6 +129,20 @@ impl FakeTasksApi {
             entry.task.links = links;
         }
     }
+
+    /// Seed *when* a Completed Task was completed (#135). Completing through
+    /// `patch_task` stamps this from the deterministic clock, which sits at
+    /// `CLOCK_BASE` and is therefore never the reference day a test injects — so
+    /// this is the only way to write the case that matters: a Task completed on
+    /// some other day. Leaves `status` alone, so a test can also produce the
+    /// Completed-but-unstamped row Google is not supposed to send. A no-op if
+    /// `id` is unknown.
+    pub fn set_completed_at(&self, id: &TaskId, at: Option<DateTime<Utc>>) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.tasks.iter_mut().find(|e| &e.task.id == id) {
+            entry.task.completed_at = at;
+        }
+    }
 }
 
 fn rejected(message: &str) -> ApiError {

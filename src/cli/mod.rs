@@ -223,6 +223,10 @@ impl From<ApiError> for CliError {
             ApiError::Network(_) => ErrorKind::Network,
             ApiError::AuthExpired => ErrorKind::AuthExpired,
             ApiError::TokenStoreFailed(_) => ErrorKind::TokenStoreFailed,
+            // Structurally unreachable here — `oxidone json` builds no consent
+            // flow to fail (ADR-0010) — but mapped rather than wildcarded, so
+            // this match keeps breaking the build on a variant nobody placed.
+            ApiError::ConsentFailed(_) => ErrorKind::Internal,
             ApiError::NotFound => ErrorKind::NotFound,
             ApiError::Rejected { .. } => ErrorKind::Rejected,
             ApiError::Pagination(_) => ErrorKind::Pagination,

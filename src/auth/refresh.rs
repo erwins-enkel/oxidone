@@ -130,7 +130,7 @@ pub async fn cached_or_refreshed(
         return Err(refused(classify(status, &body), store));
     }
 
-    let refreshed: RefreshResponse = serde_json::from_str(&body).map_err(|e| {
+    let refreshed: TokenResponse = serde_json::from_str(&body).map_err(|e| {
         // A 200 that does not carry a token is a protocol violation, not a
         // transient fault: backing off and retrying would be the wrong advice.
         ApiError::Rejected {
@@ -139,29 +139,144 @@ pub async fn cached_or_refreshed(
         }
     })?;
 
-    let bearer = refreshed.access_token;
-    let token = TokenInfo {
-        access_token: Some(bearer.clone()),
-        // Google omits `refresh_token` from a refresh response in the normal
-        // case, and the grant it belongs to is still ours — so the stored one is
-        // carried forward rather than dropped.
-        refresh_token: Some(
-            refreshed
-                .refresh_token
-                .unwrap_or_else(|| refresh_token.to_owned()),
-        ),
+    // Google omits `refresh_token` from a refresh response in the normal case,
+    // and the grant it belongs to is still ours — so the stored one is carried
+    // forward rather than dropped.
+    let token = token_info(refreshed, Some(refresh_token));
+    let bearer = token
+        .access_token
+        .clone()
+        .expect("token_info always sets the access token");
+    persist(store, &token).map_err(ApiError::TokenStoreFailed)?;
+    Ok(bearer)
+}
+
+/// Exchange a fresh authorization code for a grant, store it, and hand back its
+/// access token.
+///
+/// The other half of what ADR-0009 moved in-house, and here for the same
+/// reasons: it is the same endpoint, the same response shape, and the same
+/// [`classify`] rules as the refresh above, so there is one place that knows
+/// what Google's token endpoint says and one place that writes what it returns.
+///
+/// `redirect_uri` must be byte-identical to the one in the authorization URL —
+/// Google compares them — and `verifier` is the PKCE secret that never left this
+/// process.
+///
+/// The *write* is taken under the store's cross-process lock, so a consent
+/// finishing while a peer refreshes cannot interleave two writes of the grant.
+/// Only the write: unlike a refresh, this exchange is not a read-modify-write of
+/// what is stored — the grant it brings back replaces whatever was there — so
+/// there is nothing to re-read under the lock and no reason to hold it across
+/// the round trip.
+///
+/// A grant with no refresh token in it is refused rather than stored: it would
+/// work until its access token expired and then send the user back to the
+/// browser, which is exactly the "it asks me to authorize every day" failure
+/// this module exists to make impossible.
+pub(super) async fn exchange_code(
+    http: &reqwest::Client,
+    secret: &ApplicationSecret,
+    store: &dyn TokenStore,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<String, ApiError> {
+    let response = http
+        .post(&secret.token_uri)
+        .form(&[
+            ("client_id", secret.client_id.as_str()),
+            ("client_secret", secret.client_secret.as_str()),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+
+    if !status.is_success() {
+        return Err(code_refused(classify(status, &body), status.as_u16()));
+    }
+
+    let granted: TokenResponse = serde_json::from_str(&body).map_err(|e| ApiError::Rejected {
+        status: status.as_u16(),
+        message: format!("malformed token response: {e}"),
+    })?;
+    if granted.refresh_token.is_none() {
+        return Err(ApiError::Rejected {
+            status: status.as_u16(),
+            message: "google granted no refresh token; oxidone would have to ask again tomorrow"
+                .to_string(),
+        });
+    }
+
+    let token = token_info(granted, None);
+    let bearer = token
+        .access_token
+        .clone()
+        .expect("token_info always sets the access token");
+
+    let _guard = lock(store).await?;
+    persist(store, &token).map_err(ApiError::TokenStoreFailed)?;
+    Ok(bearer)
+}
+
+/// What a refused *code* exchange means. Deliberately not [`refused`]: nothing
+/// here says anything about a stored grant — there is none yet — so none is
+/// cleared, and `invalid_grant` means the code itself was spent or stale rather
+/// than that an authorization died.
+fn code_refused(refusal: Refusal, status: u16) -> ApiError {
+    match refusal {
+        Refusal::GrantDead { description, .. } => {
+            tracing::error!(
+                error = "invalid_grant",
+                description = description.as_deref().unwrap_or("<none>"),
+                "google refused the authorization code"
+            );
+            ApiError::Rejected {
+                status,
+                message: "the authorization code was refused; it may already have been used — \
+                          authorize again"
+                    .to_string(),
+            }
+        }
+        Refusal::Refused { status, message } => {
+            tracing::error!(status, message = %message, "google refused the authorization code");
+            ApiError::Rejected { status, message }
+        }
+        Refusal::Transient(message) => ApiError::Network(message),
+    }
+}
+
+/// Build the `TokenInfo` to store from what Google answered.
+///
+/// `carried_refresh` is the refresh token already held, used only when the
+/// response omits one — which a refresh normally does and a code exchange never
+/// may.
+fn token_info(granted: TokenResponse, carried_refresh: Option<&str>) -> TokenInfo {
+    TokenInfo {
+        access_token: Some(granted.access_token),
+        refresh_token: granted
+            .refresh_token
+            .or_else(|| carried_refresh.map(str::to_owned)),
         // `checked_add`, because `expires_in` comes off the wire and adding an
         // absurd one to `now` panics. `None` there means "no expiry known", the
         // same as an answer that omitted it: the token is used until a 401 forces
         // a refresh, which is a worse deal than a real expiry and better than a
         // crash.
-        expires_at: refreshed
+        expires_at: granted
             .expires_in
             .and_then(|seconds| OffsetDateTime::now_utc().checked_add(Duration::seconds(seconds))),
-        id_token: refreshed.id_token,
-    };
-    persist(store, &token).map_err(ApiError::TokenStoreFailed)?;
-    Ok(bearer)
+        id_token: granted.id_token,
+    }
 }
 
 /// The access token to answer with, or `None` when one has to be fetched.
@@ -376,11 +491,12 @@ struct TokenErrorBody {
     error_subtype: Option<String>,
 }
 
-/// The fields of a successful refresh oxidone uses. `refresh_token` is normally
-/// absent; `expires_in` is documented as always present, and `None` is carried as
-/// "no expiry known", exactly as `yup-oauth2` does.
+/// The fields of a successful token response oxidone uses, from either exchange.
+/// `refresh_token` is normally absent from a *refresh* and always present on a
+/// code exchange; `expires_in` is documented as always present, and `None` is
+/// carried as "no expiry known", exactly as `yup-oauth2` does.
 #[derive(Deserialize)]
-struct RefreshResponse {
+struct TokenResponse {
     access_token: String,
     expires_in: Option<i64>,
     refresh_token: Option<String>,

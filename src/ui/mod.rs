@@ -22,8 +22,8 @@ use std::collections::HashMap;
 
 use crate::app::text_input::TextInput;
 use crate::app::{
-    move_target_rows, omnibox_rows, on_off, renders_as_subtask, split_command, CaptureRow,
-    CommandState, Focus, JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
+    move_target_rows, omnibox_rows, on_off, renders_as_subtask, split_command, AuthPrompt,
+    CaptureRow, CommandState, Focus, JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
@@ -103,8 +103,10 @@ pub fn view(model: &Model, theme: &Theme, ascii: bool, frame: &mut Frame) {
     }
     // Last, and so over everything: an authorization the user has to act on is the
     // one thing that must not end up underneath a popup.
-    if let Some(url) = &model.auth_prompt {
-        render_auth_prompt(frame, area, url, theme);
+    if let Some(prompt) = &model.auth_prompt {
+        // The caret goes where the keys go: an open overlay keeps them (see
+        // `app::update`), so the prompt's field is unfocused while one is up.
+        render_auth_prompt(frame, area, prompt, model.overlay.is_none(), theme);
     }
 }
 
@@ -2445,24 +2447,50 @@ const AUTH_PROMPT_WIDTH: u16 = 72;
 
 /// The fallback instruction under the URL. Says "if", not "we opened it": the
 /// browser hand-off is best effort, and the URL on screen is what makes a failed
-/// one recoverable.
-const AUTH_PROMPT_HINT: &str = "Waiting for your browser. If it did not open, visit the URL above.";
+/// one recoverable — including by copying it to a machine that has a browser.
+const AUTH_PROMPT_HINT: &str =
+    "Waiting for your browser. If it did not open, or cannot reach this machine, \
+     visit the URL above and paste the address it lands on:";
 
-/// The consent prompt for an interactive Google authorization: the URL, wrapped,
-/// with the copy-it-yourself fallback beneath it.
-fn render_auth_prompt(frame: &mut Frame, area: Rect, url: &str, theme: &Theme) {
+/// The key line under the field. `Ctrl-Q` is advertised because this popup can
+/// stand for `auth::CONSENT_TIMEOUT` and takes every other key itself.
+const AUTH_PROMPT_KEYS: &str = "Enter submits · Esc clears · Ctrl-Q quits";
+
+/// The consent prompt for an interactive Google authorization: the URL, the
+/// field the callback is pasted into, and whatever the last paste was refused
+/// for.
+///
+/// `focused` says whether the field currently owns the keys — it does not while
+/// an overlay is open — and so whether the caret belongs on it.
+fn render_auth_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &AuthPrompt,
+    focused: bool,
+    theme: &Theme,
+) {
     let width = AUTH_PROMPT_WIDTH.min(area.width);
     let text_width = width.saturating_sub(OVERLAY_BORDERS) as usize;
-
-    let mut lines: Vec<Line> = hard_wrap(url, text_width)
-        .into_iter()
-        .map(|part| Line::from(Span::styled(part, Style::new().fg(theme.text))))
-        .collect();
-    lines.extend(
-        hard_wrap(AUTH_PROMPT_HINT, text_width)
+    let wrapped = |text: &str, color| -> Vec<Line<'static>> {
+        hard_wrap(text, text_width)
             .into_iter()
-            .map(|part| Line::from(Span::styled(part, Style::new().fg(theme.subtext)))),
-    );
+            .map(|part| Line::from(Span::styled(part, Style::new().fg(color))))
+            .collect()
+    };
+
+    let mut lines = wrapped(&prompt.url, theme.text);
+    lines.extend(wrapped(AUTH_PROMPT_HINT, theme.subtext));
+
+    // The field's row, remembered before the lines below it are pushed: the
+    // caret is the terminal's own cursor and has to be placed at it.
+    let field_row = lines.len();
+    let (field, caret_col) = input_line(&prompt.input, text_width);
+    lines.push(field.patch_style(Style::new().fg(theme.text)));
+
+    if let Some(rejected) = &prompt.rejected {
+        lines.extend(wrapped(rejected, theme.overdue));
+    }
+    lines.extend(wrapped(AUTH_PROMPT_KEYS, theme.subtext));
 
     let height = u16::try_from(lines.len()).unwrap_or(1).max(1);
     let popup = centered(area, width, height + OVERLAY_BORDERS);
@@ -2471,6 +2499,16 @@ fn render_auth_prompt(frame: &mut Frame, area: Rect, url: &str, theme: &Theme) {
         Paragraph::new(lines).block(panel("Authorize with Google", true, theme)),
         popup,
     );
+    if focused {
+        // `+ 1` for the border on each axis; `field_row` counts from the first
+        // line inside it. Clamped into the popup, which a terminal too short for
+        // the whole prompt has already been shrunk under — a cursor parked past
+        // the frame is not a place the user can be shown.
+        let row = u16::try_from(field_row).unwrap_or(0);
+        let x = (popup.x + 1 + caret_col as u16).min(popup.right().saturating_sub(1));
+        let y = (popup.y + 1 + row).min(popup.bottom().saturating_sub(1));
+        frame.set_cursor_position((x, y));
+    }
 }
 
 /// Break `text` into lines of at most `width` cells, splitting mid-token.

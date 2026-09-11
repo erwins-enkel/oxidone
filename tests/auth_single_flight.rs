@@ -135,6 +135,11 @@ struct RecordingSink {
 }
 
 impl ConsentSink for RecordingSink {
+    fn reject(&self, _reason: &str) {
+        // Nothing this suite asserts on: a rejected paste leaves the prompt
+        // open, and what `SingleFlight` bounds is the acquisition around it.
+    }
+
     fn present(&self, url: &str) {
         self.log(format!("present {url}"));
     }

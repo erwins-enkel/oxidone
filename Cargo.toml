@@ -34,15 +34,22 @@ catppuccin = { version = "2", features = ["ratatui"] }  # palette -> ratatui Col
 # Async runtime — scoped features only
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process"] }
 
-# HTTP + auth (hand-rolled REST *and* refresh exchange; yup-oauth2 for the
-# interactive consent flow only — see ADR-0004, narrowed by ADR-0009).
-# `form` is what posts `grant_type=refresh_token` to Google's token endpoint.
+# HTTP + auth. The REST client, both token-endpoint exchanges and the interactive
+# consent flow are all oxidone's own (ADR-0004, ADR-0009, ADR-0011); yup-oauth2 is
+# left holding the `client_secret.json` reader and the stored `TokenInfo` shape.
+# `form` is what posts to Google's token endpoint.
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls"] }
 yup-oauth2 = "12"
 # Only to build `yup_oauth2::storage::TokenInfo::expires_at`, which is a
 # `time::OffsetDateTime` that yup-oauth2 does not re-export.
 time = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"       # object-safe async TasksApi trait (or drop for RPITIT)
+
+# PKCE (RFC 7636) and the `state` nonce for the consent flow (ADR-0011): a
+# SHA-256 challenge, base64url-unpadded, over 32 bytes of system randomness.
+sha2 = "0.11"
+base64 = "0.23"
+getrandom = "0.4"
 
 # Local cache (see ADR-0001) + completion log (ADR-0007)
 rusqlite = { version = "0.40", features = ["bundled"] }

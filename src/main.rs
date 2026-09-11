@@ -7,7 +7,7 @@
 //! feed the results back as `Message`s. With no credentials the app runs purely
 //! against the cache.
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::NaiveDate;
-use crossterm::event;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -26,8 +26,8 @@ use tracing_subscriber::EnvFilter;
 use oxidone::api::{RestClient, TasksApi};
 use oxidone::app::{classify_event, offline_failure_for, update, Command, Message, Model};
 use oxidone::auth::{
-    self, ConsentPrompt, ConsentSink, FileTokenStore, SingleFlight, TokenStore, YupTokenProvider,
-    CONSENT_TIMEOUT,
+    self, CallbackInput, ConsentPrompt, ConsentSink, FileTokenStore, GoogleTokenProvider,
+    NoCallbackInput, SingleFlight, StdoutConsentSink, TokenStore, CONSENT_TIMEOUT,
 };
 use oxidone::cache::Cache;
 use oxidone::cli;
@@ -121,9 +121,15 @@ async fn main_inner() -> Result<()> {
     // to the terminal `ratatui` owns.
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
 
+    // The paste path for a consent that fires with the TUI already up: the
+    // reducer's field on one end, the waiting flow on the other. Made here for
+    // the same reason as the channel above — `build_api` needs one half before
+    // the TUI exists, and `run` needs the other.
+    let (paste_tx, paste_input) = auth::callback_channel();
+
     // Build the live client (and run first-run auth) BEFORE entering the TUI, so
     // the consent browser flow isn't hidden behind the alternate screen.
-    let api = build_api(&config, tx.clone()).await;
+    let api = build_api(&config, tx.clone(), Arc::new(paste_input)).await;
 
     let cache: SharedCache = Arc::new(Mutex::new(open_cache()));
     let (initial_lists, load_error) = {
@@ -150,7 +156,11 @@ async fn main_inner() -> Result<()> {
         cache,
         initial_lists,
         load_error,
-        (tx, rx),
+        Channels {
+            tx,
+            rx,
+            paste: paste_tx,
+        },
     )
     .await;
     ratatui::restore();
@@ -164,12 +174,12 @@ async fn run(
     cache: SharedCache,
     initial_lists: Vec<List>,
     load_error: Option<String>,
-    channel: (UnboundedSender<Message>, UnboundedReceiver<Message>),
+    channels: Channels,
 ) -> Result<()> {
-    // The reducer's channel, made in `main_inner` because `build_api` needs the
-    // sender before the TUI exists. Passed as one value: the two halves are one
-    // channel, and splitting them would be two more parameters saying so.
-    let (tx, mut rx) = channel;
+    // The reducer's channels, made in `main_inner` because `build_api` needs two
+    // of their ends before the TUI exists. Passed as one value: they are one
+    // bundle, and splitting them would be three more parameters saying so.
+    let Channels { tx, mut rx, paste } = channels;
 
     // Editor for the notes feature (`$VISUAL`/`$EDITOR`). Resolved once: its
     // presence decides the reducer's notes path, and the tokens drive the spawn.
@@ -313,7 +323,7 @@ async fn run(
                         other => deferred.push(other),
                     }
                 }
-                dispatch(deferred, &api, &cache, &tx);
+                dispatch(deferred, &api, &cache, &tx, &paste);
                 if model.should_quit {
                     break;
                 }
@@ -349,7 +359,13 @@ fn live_client(api: &Api) -> Arc<dyn TasksApi> {
 /// background worker that refreshes from Google and mirrors into the cache;
 /// offline, writes roll back via [`offline_failure_for`] and reads serve from
 /// the cache (ADR-0001).
-fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &UnboundedSender<Message>) {
+fn dispatch(
+    commands: Vec<Command>,
+    api: &Api,
+    cache: &SharedCache,
+    tx: &UnboundedSender<Message>,
+    paste: &UnboundedSender<String>,
+) {
     for command in commands {
         // Offline (no live Google client): writes roll their optimistic change
         // back with the matching `*Failed` message (ADR-0001).
@@ -456,6 +472,17 @@ fn dispatch(commands: Vec<Command>, api: &Api, cache: &SharedCache, tx: &Unbound
                 notes,
             ),
             Command::OpenUrl(url) => spawn_open_url(tx.clone(), url),
+            // Straight to the consent flow waiting on it. Not a worker: there is
+            // no request to make here — the flow already has one in the air, and
+            // this is the answer arriving by the other road.
+            Command::SubmitAuthCallback(pasted) => {
+                if paste.send(pasted).is_err() {
+                    // The flow that opened the prompt is gone, so the prompt is
+                    // about to be dismissed by its own `AuthPromptClosed`. Say so
+                    // rather than swallowing the send.
+                    tracing::debug!("no consent flow is waiting; dropping the pasted callback");
+                }
+            }
             // `SpawnEditor` never reaches here: it owns the terminal and is
             // handled synchronously in the run loop, not by a background worker.
             Command::SpawnEditor { .. } => {
@@ -1253,6 +1280,11 @@ struct TuiConsentSink {
 impl ConsentSink for TuiConsentSink {
     fn present(&self, url: &str) {
         emit(&self.tx, Message::AuthPromptOpened(url.to_string()));
+        auth::open_in_browser(url);
+    }
+
+    fn reject(&self, reason: &str) {
+        emit(&self.tx, Message::AuthPasteRejected(reason.to_string()));
     }
 
     fn dismiss(&self, reason: Option<&str>) {
@@ -1263,6 +1295,129 @@ impl ConsentSink for TuiConsentSink {
             },
         );
     }
+}
+
+/// How long the pre-TUI paste reader waits on the terminal before looking at its
+/// stop flag again. Short enough that stopping is imperceptible, long enough that
+/// the thread sleeps rather than spins.
+const PASTE_POLL: Duration = Duration::from_millis(100);
+
+/// The pre-TUI paste reader: the terminal, read as whole lines, on its own
+/// thread.
+///
+/// `crossterm` is the **only** reader, and the line is assembled from the
+/// `KeyEvent`s it hands back. `event::poll` drains the terminal's fd into
+/// crossterm's own parsed-event buffer, so a `read_line` beside it would find
+/// the pasted bytes already gone and then block for ever on a paste that no
+/// longer exists.
+///
+/// No raw mode is entered: the terminal keeps doing its own echo and line
+/// editing, so a pasted URL arrives as one burst of already-edited `Char` events
+/// followed by `Enter`, and there is nothing to restore afterwards.
+///
+/// Dropping this stops the thread and **joins** it, which is the whole reason it
+/// is a guard: a reader still sitting on the terminal when `ratatui::init()` runs
+/// would compete with the TUI's own for the first keystrokes, and the input lost
+/// that way is lost silently.
+struct PasteReader {
+    stop: Arc<AtomicBool>,
+    /// `Option` only so `Drop` can take the handle to join it.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PasteReader {
+    /// Start reading pasted callback URLs, if this terminal can be read at all,
+    /// alongside the `CallbackInput` the consent flow waits on.
+    ///
+    /// With stdin redirected there is nothing to read and no line a human could
+    /// type: the loopback redirect is then the only road in, and the flow is told
+    /// so rather than left waiting on a reader that will never speak.
+    fn start() -> (Option<Self>, Arc<dyn CallbackInput>) {
+        if !io::stdin().is_terminal() {
+            return (None, Arc::new(NoCallbackInput));
+        }
+        let (tx, input) = auth::callback_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || read_pasted_lines(&tx, &thread_stop));
+        (
+            Some(Self {
+                stop,
+                thread: Some(thread),
+            }),
+            Arc::new(input),
+        )
+    }
+}
+
+impl Drop for PasteReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("the paste reader panicked; the terminal may still be watched");
+            }
+        }
+    }
+}
+
+/// Assemble whole lines from terminal key presses and send each one on, until
+/// `stop` is raised or the terminal stops answering.
+///
+/// Everything that is not a character or `Enter` is dropped: in cooked mode the
+/// terminal has already applied its own editing before delivering anything here,
+/// so there is no cursor to move and no backspace left to apply.
+fn read_pasted_lines(tx: &UnboundedSender<String>, stop: &AtomicBool) {
+    let mut line = String::new();
+    while !stop.load(Ordering::Acquire) {
+        match event::poll(PASTE_POLL) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot watch the terminal for a pasted callback");
+                return;
+            }
+        }
+        let pressed = match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => key.code,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the terminal for a pasted callback");
+                return;
+            }
+        };
+        let submitted = match pressed {
+            KeyCode::Char(c) => {
+                line.push(c);
+                continue;
+            }
+            // A bare `Enter` is not an answer, so it is not offered as one — the
+            // same rule the TUI's field follows, and it keeps a stray newline
+            // from earning the user a telling-off.
+            KeyCode::Enter if !line.trim().is_empty() => std::mem::take(&mut line),
+            KeyCode::Enter => {
+                line.clear();
+                continue;
+            }
+            _ => continue,
+        };
+        if tx.send(submitted).is_err() {
+            // The flow settled while the line was being typed.
+            return;
+        }
+    }
+}
+
+/// The ends of the reducer's two channels, handed to [`run`] as one value.
+///
+/// Both are made before the TUI exists, because [`build_api`] needs an end of
+/// each: a consent that fires later reaches the user as a `Message`, and the
+/// callback URL answering it comes back the other way.
+struct Channels {
+    tx: UnboundedSender<Message>,
+    rx: UnboundedReceiver<Message>,
+    /// Pasted callback URLs, on their way to whichever consent flow is waiting.
+    paste: UnboundedSender<String>,
 }
 
 /// What the pre-TUI gate should do with whatever the token store said.
@@ -1300,7 +1455,11 @@ fn token_gate(stored: anyhow::Result<Option<String>>) -> TokenGate {
 /// token first. An *unreadable* cache takes that same road on purpose — as
 /// `ApiError::TokenStoreFailed`, which reaches the frame where the user is looking,
 /// rather than a browser window here and a stderr line the alternate screen eats.
-async fn build_api(config: &Config, tx: UnboundedSender<Message>) -> Api {
+async fn build_api(
+    config: &Config,
+    tx: UnboundedSender<Message>,
+    paste: Arc<dyn CallbackInput>,
+) -> Api {
     let secret = config.client_secret_path.as_ref()?;
     let store = FileTokenStore::in_config_dir()?;
     let gate = token_gate(store.load());
@@ -1316,7 +1475,16 @@ async fn build_api(config: &Config, tx: UnboundedSender<Message>) -> Api {
         }
         TokenGate::Consent => {
             eprintln!("oxidone: authorizing with Google — a browser window will open…");
-            if let Err(e) = auth::login(secret, store.clone()).await {
+            let (reader, input) = PasteReader::start();
+            let prompt = Arc::new(ConsentPrompt::new(Box::new(StdoutConsentSink {
+                paste_offered: reader.is_some(),
+            })));
+            let outcome = auth::login(secret, store.clone(), prompt, input).await;
+            // Before the TUI, always: dropping the guard joins the reader, and
+            // nothing may still be holding the terminal when `ratatui::init()`
+            // takes it.
+            drop(reader);
+            if let Err(e) = outcome {
                 tracing::error!(error = %e, "google authorization failed");
                 eprintln!("oxidone: authorization failed ({e}); starting offline.");
                 return None;
@@ -1324,12 +1492,13 @@ async fn build_api(config: &Config, tx: UnboundedSender<Message>) -> Api {
         }
     }
 
-    // This provider outlives the TUI's startup, so its prompt goes to the frame.
+    // This provider outlives the TUI's startup, so its prompt goes to the frame —
+    // and so does the paste that answers it, through the reducer.
     // `SingleFlight` is what keeps a cache miss to one consent flow: the startup
-    // workers ask for a token concurrently, and `yup-oauth2` would otherwise run
-    // the whole interactive flow once per caller, on a loopback port each.
+    // workers ask for a token concurrently, and each would otherwise run the whole
+    // interactive flow itself, on a loopback port of its own.
     let prompt = Arc::new(ConsentPrompt::new(Box::new(TuiConsentSink { tx })));
-    match YupTokenProvider::new(secret, store, Arc::clone(&prompt)).await {
+    match GoogleTokenProvider::new(secret, store, Arc::clone(&prompt), paste).await {
         Ok(provider) => {
             let provider = SingleFlight::new(provider, prompt, CONSENT_TIMEOUT);
             Some(Arc::new(RestClient::new(Arc::new(provider))))

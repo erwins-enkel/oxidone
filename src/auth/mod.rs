@@ -1,18 +1,24 @@
-//! OAuth: BYO credentials + loopback consent flow via `yup-oauth2` (ADR-0002),
-//! with the refresh exchange oxidone's own (ADR-0009).
+//! OAuth: BYO credentials (ADR-0002), with both token-endpoint exchanges and the
+//! interactive consent flow oxidone's own (ADR-0009, ADR-0011).
 //! Token persistence is behind `TokenStore` so a keychain backend can replace
 //! the plaintext-600 file later without touching call sites.
 
+mod callback;
 mod consent;
+mod flow;
 mod headless;
 mod oauth;
+mod pkce;
 mod refresh;
 mod single_flight;
 mod store;
 
-pub use consent::{ConsentPrompt, ConsentSink};
+pub use consent::{
+    callback_channel, open_in_browser, CallbackInput, ChannelCallbackInput, ConsentPrompt,
+    ConsentSink, NoCallbackInput, StdoutConsentSink,
+};
 pub use headless::RefreshOnlyProvider;
-pub use oauth::{login, YupTokenProvider};
+pub use oauth::{login, GoogleTokenProvider};
 pub use refresh::cached_or_refreshed;
 pub use single_flight::{SingleFlight, CONSENT_TIMEOUT};
 pub use store::FileTokenStore;

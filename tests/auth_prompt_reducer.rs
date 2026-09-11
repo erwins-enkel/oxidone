@@ -21,7 +21,7 @@ fn closed(reason: Option<&str>) -> Message {
 fn opening_holds_the_url_for_the_view() {
     let mut model = Model::new();
     assert_eq!(update(&mut model, opened()), Vec::new());
-    assert_eq!(model.auth_prompt.as_deref(), Some(URL));
+    assert_eq!(prompted_url(&model), Some(URL));
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn closing_clears_it() {
     let mut model = Model::new();
     update(&mut model, opened());
     update(&mut model, closed(None));
-    assert_eq!(model.auth_prompt, None);
+    assert!(model.auth_prompt.is_none());
     assert_eq!(
         model.status_line, None,
         "an authorization that worked has nothing to report"
@@ -43,12 +43,12 @@ fn closing_with_a_reason_reports_it() {
     update(&mut model, opened());
     update(
         &mut model,
-        closed(Some("authorization was not completed within 180s")),
+        closed(Some("authorization was not completed within 600s")),
     );
-    assert_eq!(model.auth_prompt, None);
+    assert!(model.auth_prompt.is_none());
     assert_eq!(
         model.status_line.as_deref(),
-        Some("authorization was not completed within 180s")
+        Some("authorization was not completed within 600s")
     );
 }
 
@@ -70,7 +70,7 @@ fn opening_leaves_a_half_typed_capture_alone() {
         Some(Overlay::AddList { buffer }) => assert_eq!(buffer, "groceries"),
         other => panic!("the capture was destroyed: {other:?}"),
     }
-    assert_eq!(model.auth_prompt.as_deref(), Some(URL));
+    assert_eq!(prompted_url(&model), Some(URL));
 }
 
 /// And closing it does not close the capture either.
@@ -82,6 +82,11 @@ fn closing_leaves_a_half_typed_capture_alone() {
     update(&mut model, closed(None));
 
     assert!(matches!(model.overlay, Some(Overlay::AddList { .. })));
+}
+
+/// The URL the prompt is holding, if one is up.
+fn prompted_url(model: &Model) -> Option<&str> {
+    model.auth_prompt.as_ref().map(|prompt| prompt.url.as_str())
 }
 
 fn key(code: KeyCode) -> Message {

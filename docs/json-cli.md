@@ -12,8 +12,11 @@ Why it exists, and what was rejected on the way, is
 The shapes below are versioned by oxidone's own release number. Gate on it:
 
 ```sh
-oxidone --version        # oxidone 1.0.0
+oxidone --version        # oxidone 1.1.0
 ```
+
+`oxidone json` first shipped in **1.1.0**. A caller's floor is that release, not
+1.0.0 — which prints a version and has no such subcommand.
 
 Changing a field name, a value spelling or an exit code is a **breaking change**
 and ships as one. Fields are only ever added, so a caller that ignores unknown

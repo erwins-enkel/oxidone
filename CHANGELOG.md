@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/erwins-enkel/oxidone/compare/v1.0.0...v1.1.0) (2026-09-11)
+
+
+### Features
+
+* **cli:** machine-readable JSON entry point (`oxidone json`) ([#133](https://github.com/erwins-enkel/oxidone/issues/133)) ([eb31c11](https://github.com/erwins-enkel/oxidone/commit/eb31c11071e5e6d4a9ff2e336a139e87cb706e4f))
+
 ## [1.0.0](https://github.com/erwins-enkel/oxidone/compare/v0.1.0...v1.0.0) (2026-09-08)
 
 

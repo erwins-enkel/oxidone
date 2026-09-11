@@ -41,8 +41,8 @@ wait for a redirect nobody is there to complete.
 
 ### `oxidone json today`
 
-The **Today** set: what is due on or before today, across every List, plus what
-got done today.
+The **Today** set: every entry due on or before today, across every List — a
+Completed one only if it was completed today.
 
 ```json
 {

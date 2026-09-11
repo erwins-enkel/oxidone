@@ -116,15 +116,34 @@ control of your credentials. It's a one-time, ~10-minute setup.
    - Download the JSON (`client_secret_*.json`).
 5. **Point oxidone at it** — set the path in the config file (see below).
 6. **Run `oxidone`**. It opens your browser to Google's consent screen; because the app is
-   unverified and you're a test user, choose *Advanced → proceed*. A local `localhost`
+   unverified and you're a test user, choose *Advanced → proceed*. A local loopback
    listener catches the redirect, and the refresh token is saved to your config dir.
 
 If that grant later goes stale — you revoke it, or Google refuses the refresh outright —
 oxidone re-authorizes from inside the TUI: a panel shows the consent URL and your
 browser opens on it. One panel and one browser window, however many background reads
-were waiting on a token. Leave it unanswered for three minutes and oxidone gives up
+were waiting on a token. Leave it unanswered for ten minutes and oxidone gives up
 and carries on from the cache — all of them, together — so a walked-away-from prompt
 never wedges the app. Whatever asks for a token next prompts again.
+
+### Authorizing over SSH
+
+On a machine you are SSH'd into, the loopback listener binds fine but the redirect never
+arrives: the browser is on *your* machine, where `localhost` means something else. You do
+not need a port forward.
+
+Copy the consent URL into a browser wherever you have one. Google will send it to a
+`http://127.0.0.1:<port>/…` address that fails to load — **that failed page's address is
+the answer**. Copy it out of the address bar and paste it back:
+
+- **before the TUI starts** (a first run), at the prompt on your terminal, then Enter;
+- **inside the TUI** (a re-authorization), into the field on the consent panel — `Enter`
+  submits, `Esc` clears it, and `Ctrl-Q` still quits.
+
+The loopback listener keeps running the whole time, so on a local machine nothing changes
+and nothing has to be typed. Paste something that is not this attempt's callback and the
+panel says why and waits for another; the flow is only settled by a code Google accepts.
+The reasoning is [ADR-0011](docs/adr/0011-own-the-consent-flow.md).
 
 Only a refresh Google itself refused as `invalid_grant` does that. A timeout, a 5xx, or
 a token file oxidone could not read or write keep their own error and never open a
@@ -182,7 +201,9 @@ horizon_days = 14
 ```
 
 The refresh token is stored `chmod 600` in the config dir. See
-[ADR-0002](docs/adr/0002-byo-oauth-plaintext-token.md) for the security rationale.
+[ADR-0002](docs/adr/0002-byo-oauth-plaintext-token.md) for the security rationale, and
+[ADR-0011](docs/adr/0011-own-the-consent-flow.md) for the consent flow itself — PKCE,
+`state`, and the pasted-callback road.
 
 ## Scripting it — `oxidone json`
 

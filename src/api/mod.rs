@@ -101,6 +101,15 @@ pub enum ApiError {
     Network(String),
     #[error("auth expired")]
     AuthExpired,
+    /// The interactive consent flow could not be *run*, locally: the loopback
+    /// listener would not bind, or the system refused the randomness `state` and
+    /// the PKCE verifier are built from. Neither is Google's word on the grant,
+    /// and neither is a transient fault a retry clears — so it borrows neither
+    /// [`ApiError::AuthExpired`], which would answer a broken machine with
+    /// another browser window, nor [`ApiError::Network`], whose "try again
+    /// shortly" would be wrong advice.
+    #[error("the consent flow could not start: {0}")]
+    ConsentFailed(String),
     /// The `TokenStore` itself failed: the stored grant could not be read, or a
     /// freshly acquired token could not be written. One class for both directions
     /// because the remedy is the same — fix the file — and deliberately neither of

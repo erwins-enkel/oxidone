@@ -1,12 +1,12 @@
 //! Serializes token acquisition, so a cache miss can drive at most **one**
 //! interactive consent flow.
 //!
-//! `yup_oauth2::Authenticator` deduplicates nothing: every concurrent `token()`
-//! that misses its storage runs the whole installed flow itself, on a loopback
-//! listener of its own. oxidone fires two API calls the moment it starts, and one
-//! per List in the startup fan-out, so an unusable cached token produced a consent
-//! URL per caller on a port per caller — and the browser's redirect can only ever
-//! reach one of them.
+//! Nothing below this deduplicates: every concurrent acquisition that misses the
+//! store runs the whole consent flow itself, on a loopback listener of its own.
+//! oxidone fires two API calls the moment it starts, and one per List in the
+//! startup fan-out, so an unusable cached token produces a consent URL per caller
+//! on a port per caller — and the browser's redirect can only ever reach one of
+//! them.
 //!
 //! Serializing them is necessary but not sufficient: a failure has to be *shared*
 //! with everyone already queued, or they take their turns at the same unusable
@@ -26,7 +26,12 @@ use crate::api::ApiError;
 /// How long one acquisition may run before it is abandoned. Sized for a real
 /// consent flow — an account chooser, a password, a 2FA prompt on a second
 /// device — not for a token refresh, which takes a fraction of a second.
-pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(180);
+///
+/// Ten minutes rather than three because the consent may now be answered by
+/// copying a callback URL between machines: unlocking a laptop, finding the
+/// right terminal, and pasting outlasts a browser flow on the same desk, and a
+/// timeout that lands mid-paste throws the whole attempt away.
+pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Wraps a [`TokenProvider`] so at most one acquisition runs at a time, bounded
 /// by a timeout, retracting the [`ConsentPrompt`] whichever way it ends.

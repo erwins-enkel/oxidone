@@ -2,7 +2,7 @@
 //! (ADR-0010).
 //!
 //! It answers from the stored grant, refreshing it against Google when the cached
-//! access token is spent, and stops there. Where [`super::YupTokenProvider`]
+//! access token is spent, and stops there. Where [`super::GoogleTokenProvider`]
 //! answers [`ApiError::AuthExpired`] by opening a browser, this returns it.
 //!
 //! That difference is the whole type. `oxidone json` is what a bar plugin runs

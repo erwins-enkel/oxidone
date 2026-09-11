@@ -150,14 +150,14 @@ pub struct Model {
     pub should_quit: bool,
     /// Transient one-line message (load errors now; toasts later).
     pub status_line: Option<String>,
-    /// The consent URL an interactive Google authorization is waiting on, drawn
+    /// The interactive Google authorization currently waiting on the user, drawn
     /// over the frame until the flow settles.
     ///
     /// A field of its own rather than an [`Overlay`] variant, because it arrives
     /// asynchronously: `overlay` is the *user's* input state, and setting it from
-    /// a worker would destroy a half-typed capture. This is drawn on top and
-    /// routes no keys, so an open overlay keeps them.
-    pub auth_prompt: Option<String>,
+    /// a worker would destroy a half-typed capture. It is drawn on top, and it
+    /// takes keys only when no overlay has them (see [`auth_prompt_key`]).
+    pub auth_prompt: Option<AuthPrompt>,
     /// The active modal overlay (text input or confirmation), if any. While set,
     /// keys route to the overlay instead of the normal keymap.
     pub overlay: Option<Overlay>,
@@ -555,6 +555,24 @@ impl OmniRow {
             OmniRow::Capture(_) => Group::Capture,
         }
     }
+}
+
+/// An interactive Google authorization the user has to answer.
+///
+/// Carries a text field because the browser's redirect may be unable to reach
+/// this machine at all — over SSH, `localhost` in the browser is a different
+/// machine's `localhost` — and the callback URL pasted back is then the only
+/// road in. The loopback listener is still running the whole time; whichever
+/// arrives first settles the flow.
+#[derive(Debug, Clone, Default)]
+pub struct AuthPrompt {
+    /// Google's consent URL, shown whole so it can be copied to another machine.
+    pub url: String,
+    /// The callback URL being pasted back.
+    pub input: TextInput,
+    /// Why the last thing submitted was not a callback. Cleared by the next
+    /// submission, because it describes that one and not this one.
+    pub rejected: Option<String>,
 }
 
 /// A modal overlay drawn over the panes.
@@ -1569,8 +1587,11 @@ pub enum Message {
     LoadFailed(String),
     /// An interactive Google authorization needs the user to visit the consent URL
     /// this carries — held rather than merely announced, so it is still readable
-    /// when the browser did not start.
+    /// when the browser did not start, and copyable to the machine that has one.
     AuthPromptOpened(String),
+    /// What the user submitted was not this authorization's callback. The flow is
+    /// still waiting, so the prompt stays up carrying the reason.
+    AuthPasteRejected(String),
     /// That authorization settled. `reason` is `Some` when it failed, and goes to
     /// the status line — a flow that ends badly must not just vanish.
     AuthPromptClosed {
@@ -1682,6 +1703,10 @@ pub enum Command {
     /// Command refreshes both halves, at the cost of coupling their failures
     /// (a failed `list_lists` emits `LoadFailed` and the cascade never starts).
     RefreshLists,
+    /// Hand a pasted callback URL to the consent flow waiting on one. Carries
+    /// the text verbatim: what is and is not a callback is the flow's judgement,
+    /// and the reducer duplicating it would be a second, drifting copy.
+    SubmitAuthCallback(String),
 }
 
 /// The ADR-0001 write-through rule, as a single decision: with no live Google
@@ -1749,12 +1774,16 @@ pub fn offline_failure_for(command: &Command) -> Option<Message> {
         // id-less `LoadFailed` — the same surface a failed `list_lists` uses.
         Command::RefreshLists => Message::LoadFailed(reason),
         // Reads serve from the cache whether online or not; URL open and the
-        // external editor need no Google client. None of these fail offline.
+        // external editor need no Google client. Nor does a pasted callback: it
+        // answers the consent flow that is running *because* there is no usable
+        // grant, so failing it offline would refuse the one thing that ends the
+        // offline state. None of these fail offline.
         Command::LoadTasks(_)
         | Command::LoadToday { .. }
         | Command::LoadSearch { .. }
         | Command::LoadWeek { .. }
         | Command::OpenUrl(_)
+        | Command::SubmitAuthCallback(_)
         | Command::SpawnEditor { .. } => return None,
     };
     Some(failed)
@@ -1784,6 +1813,12 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         Message::Key(key) => {
             if model.overlay.is_some() {
                 return overlay_key(model, key);
+            }
+            // After the overlay, before everything else: the prompt is a focused
+            // text field, and a keymap that ran first would spend `a`, `q` and
+            // `w` on verbs instead of typing them into a URL.
+            if model.auth_prompt.is_some() {
+                return auth_prompt_key(model, key);
             }
             // The Weekly spread's grid keys, routed ahead of the global keymap the
             // way an overlay's are — they are the only bindings in oxidone that
@@ -2284,7 +2319,19 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
         // Deliberately leaves `overlay` alone: this arrives from a worker, and the
         // overlay may hold a half-typed capture the user is still in.
         Message::AuthPromptOpened(url) => {
-            model.auth_prompt = Some(url);
+            model.auth_prompt = Some(AuthPrompt {
+                url,
+                ..AuthPrompt::default()
+            });
+            Vec::new()
+        }
+        // Only decorates a prompt that is still up: the flow that would have
+        // sent this is the one holding the prompt open, so a rejection arriving
+        // after it settled has nothing to annotate.
+        Message::AuthPasteRejected(reason) => {
+            if let Some(prompt) = model.auth_prompt.as_mut() {
+                prompt.rejected = Some(reason);
+            }
             Vec::new()
         }
         Message::AuthPromptClosed { reason } => {
@@ -4636,6 +4683,66 @@ fn filter_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command
     // visible: keep the cursor on a row that still shows. `Enter`, `Esc` and the
     // swallowed keys all return before this.
     reselect_visible(model);
+    Vec::new()
+}
+
+/// Keys for the consent prompt's paste field.
+///
+/// Reached only when no overlay has the keys, so an authorization arriving from
+/// a worker cannot eat a half-typed capture — the reason `auth_prompt` is not an
+/// [`Overlay`] in the first place.
+///
+/// The field takes everything except `Ctrl-Q`. That exception is not a
+/// convenience: a consent may stand for [`crate::auth::CONSENT_TIMEOUT`], `q`
+/// cannot be passed through because a callback URL is full of letters, and a
+/// pane with no way out of it for ten minutes is worse than any shortcut this
+/// would cost. `Ctrl-Q` already quits everywhere else — `keymap::resolve` is
+/// modifier-blind — so nothing new is taught here, only kept reachable.
+fn auth_prompt_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    let chord = keymap::is_control_chord(key.modifiers);
+    if chord && key.code == KeyCode::Char('q') {
+        model.should_quit = true;
+        return Vec::new();
+    }
+    let Some(prompt) = model.auth_prompt.as_mut() else {
+        return Vec::new();
+    };
+    let buffer = &mut prompt.input;
+    match key.code {
+        // The same editing surface as every other text field in oxidone, so the
+        // chords their legends teach do not misfire here.
+        KeyCode::Char('u') if chord => buffer.clear(),
+        KeyCode::Char('w') if chord => buffer.kill_word(),
+        KeyCode::Char('a') if chord => buffer.home(),
+        KeyCode::Char('e') if chord => buffer.end(),
+        KeyCode::Left => buffer.left(),
+        KeyCode::Right => buffer.right(),
+        KeyCode::Home => buffer.home(),
+        KeyCode::End => buffer.end(),
+        KeyCode::Delete => buffer.delete(),
+        KeyCode::Char(c) if !chord => buffer.insert(c),
+        KeyCode::Backspace => buffer.backspace(),
+        KeyCode::Enter => {
+            let pasted = std::mem::take(buffer).into_text();
+            // An empty submission is not an answer; sending it would earn a
+            // rejection the user did not ask a question to get.
+            if pasted.trim().is_empty() {
+                return Vec::new();
+            }
+            // The verdict on *this* paste has not arrived yet, so the previous
+            // one stops standing under it.
+            prompt.rejected = None;
+            return vec![Command::SubmitAuthCallback(pasted)];
+        }
+        // Clears the field rather than the prompt: the flow owns the prompt's
+        // lifetime and is still waiting, so there is nothing here to dismiss.
+        KeyCode::Esc => {
+            buffer.clear();
+            prompt.rejected = None;
+        }
+        _ => {}
+    }
     Vec::new()
 }
 

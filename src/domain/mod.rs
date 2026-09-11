@@ -298,6 +298,30 @@ pub fn due_before(due: Option<NaiveDate>, today: NaiveDate) -> bool {
     due.is_some_and(|d| d < today)
 }
 
+/// The due date a **Migrate** produces: one day past whichever is later, `today`
+/// or the entry's current due date. Bullet Journal's `>` (see CONTEXT.md).
+///
+/// `max(today, due) + 1` rather than a flat "tomorrow" so the verb composes: an
+/// overdue entry lands on tomorrow, a future one shifts a day, and repeated
+/// migrations defer repeatedly. An undated entry gets tomorrow — `max` has
+/// nothing to compare against.
+///
+/// The single definition, shared by the `m` key (`app::migrate`) and the
+/// `migrate` op of the JSON CLI (ADR-0010), so the two surfaces cannot drift into
+/// deferring by different amounts.
+///
+/// `None` at the end of the calendar, via the checked [`crate::dateparse::shift_days`]:
+/// `due` comes from outside this crate — a date Google sent us — and `NaiveDate`'s
+/// `Add` panics on overflow. A caller that cannot defer simply does not defer;
+/// neither a keystroke nor a CLI invocation may take the process down.
+///
+/// Says nothing about *whether* to migrate. Migration is refused on a Completed
+/// entry, and that rule belongs to each caller's own refusal path — this is the
+/// arithmetic.
+pub fn migrated_due(current: Option<NaiveDate>, today: NaiveDate) -> Option<NaiveDate> {
+    crate::dateparse::shift_days(current.map_or(today, |due| due.max(today)), 1)
+}
+
 /// How many day columns the **Weekly spread** draws: Monday through Friday.
 /// Every width, index bound and column lookup derives from this — the grid never
 /// hardcodes a `5`.
@@ -501,6 +525,40 @@ mod tests {
             assert!(!due_before(due, today), "{due:?} is not overdue");
             assert!(!due_on_or_before(due, today), "{due:?} is not in Today");
         }
+    }
+
+    /// The three cases Migrate composes over, and the one it declines. An
+    /// overdue entry lands on tomorrow rather than on the day after the date it
+    /// missed — which is what `max` is for, and what makes repeated presses walk
+    /// forward a day at a time from *today*.
+    #[test]
+    fn migrate_defers_to_one_day_past_the_later_of_today_and_the_due_date() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 7, d).expect("valid date");
+
+        // Overdue, today itself, and undated all land on tomorrow.
+        for current in [Some(day(1)), Some(day(19)), Some(day(20)), None] {
+            assert_eq!(migrated_due(current, today), Some(day(21)), "{current:?}");
+        }
+        // A future date shifts by a day from itself, not from today.
+        assert_eq!(migrated_due(Some(day(25)), today), Some(day(26)));
+
+        // Repeated migrations compose.
+        let mut due = Some(day(19));
+        for expected in [21, 22, 23] {
+            due = migrated_due(due, today);
+            assert_eq!(due, Some(day(expected)));
+        }
+    }
+
+    /// The end of the calendar is a refusal, not a panic. `due` comes from
+    /// Google, so the input is not ours to bound — and both callers (a keystroke
+    /// and a CLI invocation) must survive it.
+    #[test]
+    fn migrate_declines_at_the_end_of_the_calendar() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        assert_eq!(migrated_due(Some(NaiveDate::MAX), today), None);
+        assert_eq!(migrated_due(None, NaiveDate::MAX), None);
     }
 
     /// Every day of a week names the same Monday, so which day you open the

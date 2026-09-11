@@ -829,6 +829,12 @@ impl TasksApi for RestClient {
             .collect())
     }
 
+    async fn get_task(&self, list: &ListId, id: &TaskId) -> Result<Task, ApiError> {
+        let url = format!("{}/lists/{}/tasks/{}", self.base, list.0, id.0);
+        let wire: WireTask = self.send_json(self.http.get(url)).await?;
+        Ok(wire.into_domain(list.clone()))
+    }
+
     async fn insert_task(&self, list: &ListId, task: NewTask) -> Result<Task, ApiError> {
         let url = format!("{}/lists/{}/tasks", self.base, list.0);
         let body = NewTaskBody {

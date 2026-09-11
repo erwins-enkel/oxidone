@@ -34,6 +34,12 @@ pub trait TasksApi: Send + Sync {
         show_hidden: bool,
         updated_min: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<Task>, ApiError>;
+    /// One Task by id. The read a write needs when its rule is a function of the
+    /// entry's current state: Migrate reads `due` and `status`, and a retitle that
+    /// preserves the **Entry type** reads the raw title (ADR-0008). Cheaper and
+    /// more correct than filtering [`TasksApi::list_tasks`], which fetches a whole
+    /// List to find one row and cannot see a **Cleared** Task at all.
+    async fn get_task(&self, list: &ListId, id: &TaskId) -> Result<Task, ApiError>;
     async fn insert_task(&self, list: &ListId, task: NewTask) -> Result<Task, ApiError>;
     async fn patch_task(
         &self,

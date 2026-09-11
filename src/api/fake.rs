@@ -221,6 +221,16 @@ impl TasksApi for FakeTasksApi {
         Ok(out)
     }
 
+    async fn get_task(&self, list: &ListId, id: &TaskId) -> Result<Task, ApiError> {
+        let mut st = self.state.lock().unwrap();
+        st.take_error()?;
+        // `entry_pos` excludes Deleted but not Hidden, matching Google: a
+        // **Cleared** Task is swept out of the active view and still readable by
+        // id, a Deleted one is gone.
+        let pos = st.entry_pos(list, id).ok_or(ApiError::NotFound)?;
+        Ok(st.tasks[pos].task.clone())
+    }
+
     async fn insert_task(&self, list: &ListId, task: NewTask) -> Result<Task, ApiError> {
         let mut st = self.state.lock().unwrap();
         st.take_error()?;

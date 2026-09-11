@@ -8,6 +8,7 @@
 //! against the cache.
 
 use std::io;
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +30,7 @@ use oxidone::auth::{
     CONSENT_TIMEOUT,
 };
 use oxidone::cache::Cache;
+use oxidone::cli;
 use oxidone::config::{self, Config, Flavor};
 use oxidone::domain::{List, ListId, Task, TaskId};
 use oxidone::links::OpenableUrl;
@@ -47,6 +49,8 @@ oxidone — a single-user TUI for Google Tasks
 
 Usage:
   oxidone                    launch the TUI
+  oxidone json ...           machine-readable output for scripts and plugins
+                             (`oxidone json --help`)
   oxidone --version          print the version and exit
   oxidone --help, -h         print this help and exit
   oxidone --print-config-path print the config file path and exit";
@@ -55,32 +59,55 @@ Usage:
 /// print and exit without `init_tracing` creating a log dir, and without
 /// spinning up the tokio runtime. An unrecognized argument fails closed
 /// (exit 2 with usage) rather than falling through to the TUI.
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("--version") => {
             println!("oxidone {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            ExitCode::SUCCESS
         }
         Some("--help" | "-h") => {
             println!("{USAGE}");
-            Ok(())
+            ExitCode::SUCCESS
         }
         Some("--print-config-path") => match config::config_file() {
             Some(path) => {
                 println!("{}", path.display());
-                Ok(())
+                ExitCode::SUCCESS
             }
             None => {
                 eprintln!("oxidone: no config directory (is a home dir set?)");
-                std::process::exit(1);
+                ExitCode::FAILURE
             }
         },
+        // The machine-readable entry point (ADR-0010). Everything it does lives
+        // in the library — `tests/*.rs` cannot link this crate — so all that
+        // happens here is handing over the arguments after `json`.
+        Some("json") => json_main(std::env::args().skip(2).collect()),
         Some(other) => {
             eprintln!("oxidone: unrecognized argument '{other}'\n\n{USAGE}");
-            std::process::exit(2);
+            ExitCode::from(2)
         }
-        None => main_inner(),
+        None => match main_inner() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("oxidone: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
     }
+}
+
+/// The `oxidone json` runtime. Its own `#[tokio::main]`, not `main_inner`'s: the
+/// JSON CLI never enters the alternate screen, never opens the cache, and never
+/// runs the consent flow, so it shares none of the TUI's startup.
+///
+/// Tracing goes to the same daily log the TUI writes. Its failures are otherwise
+/// invisible — nobody is watching a five-minute poll — and stdout belongs to the
+/// payload.
+#[tokio::main]
+async fn json_main(args: Vec<String>) -> ExitCode {
+    init_tracing();
+    cli::main(args).await
 }
 
 #[tokio::main]

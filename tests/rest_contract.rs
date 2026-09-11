@@ -221,7 +221,10 @@ async fn get_task_reads_one_task_by_id_and_carries_its_list() {
     assert_eq!(task.list, ListId("L1".into()));
     assert_eq!(task.title, "○ Standup");
     assert_eq!(task.notes.as_deref(), Some("daily"));
-    assert_eq!(task.due, Some(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap()));
+    assert_eq!(
+        task.due,
+        Some(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap())
+    );
     assert_eq!(task.status, Status::NeedsAction);
 }
 

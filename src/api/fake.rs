@@ -214,7 +214,7 @@ impl TasksApi for FakeTasksApi {
             .filter(|e| &e.task.list == list && !e.deleted)
             .filter(|e| show_hidden || !e.hidden)
             .filter(|e| show_completed || e.task.status != Status::Completed)
-            .filter(|e| updated_min.map_or(true, |min| e.task.updated >= min))
+            .filter(|e| updated_min.is_none_or(|min| e.task.updated >= min))
             .map(|e| e.task.clone())
             .collect();
         out.sort_by(|a, b| a.position.cmp(&b.position));

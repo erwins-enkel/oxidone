@@ -1231,9 +1231,7 @@ impl Model {
             && task.status != Status::Completed
             && self.week_pool_list() == Some(&task.list);
         let scheduled = crate::domain::in_week(task.due, self.week_start())
-            // `map_or(true, …)` rather than `is_none_or`, which postdates the
-            // crate's `rust-version`.
-            && self.week_scope().map_or(true, |id| id == &task.list);
+            && self.week_scope().is_none_or(|id| id == &task.list);
         pool || scheduled
     }
 
@@ -2807,7 +2805,7 @@ fn open_edit_title(model: &mut Model) {
 /// Migrate the selected Task: push its due date one day past whichever is later,
 /// today or its current due date. Bullet Journal's `>` disposition.
 ///
-/// The arithmetic is [`domain::migrated_due`], shared with the JSON CLI's
+/// The arithmetic is [`crate::domain::migrated_due`], shared with the JSON CLI's
 /// `migrate` op (ADR-0010) so the two surfaces cannot defer by different amounts.
 /// It declines at the end of the calendar, and so does this.
 ///

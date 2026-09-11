@@ -136,10 +136,8 @@ async fn two_callers_sharing_one_token_file_produce_exactly_one_refresh() {
         async move { cached_or_refreshed(&http, &secret, &store_at(&dir), false).await }
     };
 
-    let (first, second) = tokio::join!(
-        run(dir.path().to_path_buf()),
-        run(dir.path().to_path_buf())
-    );
+    let (first, second) =
+        tokio::join!(run(dir.path().to_path_buf()), run(dir.path().to_path_buf()));
 
     assert_eq!(first.expect("a bearer"), "fresh-access-token");
     // The queued caller re-read the store under the lock and answered from what
@@ -180,10 +178,8 @@ async fn a_queued_caller_inherits_a_dead_grant_instead_of_posting_again() {
         async move { cached_or_refreshed(&http, &secret, &store_at(&dir), false).await }
     };
 
-    let (first, second) = tokio::join!(
-        run(dir.path().to_path_buf()),
-        run(dir.path().to_path_buf())
-    );
+    let (first, second) =
+        tokio::join!(run(dir.path().to_path_buf()), run(dir.path().to_path_buf()));
 
     // The first call classifies the grant as dead and clears the store. The
     // second finds nothing left to exchange and says so — one refusal, not two.

@@ -4,12 +4,14 @@
 //! the plaintext-600 file later without touching call sites.
 
 mod consent;
+mod headless;
 mod oauth;
 mod refresh;
 mod single_flight;
 mod store;
 
 pub use consent::{ConsentPrompt, ConsentSink};
+pub use headless::RefreshOnlyProvider;
 pub use oauth::{login, YupTokenProvider};
 pub use refresh::cached_or_refreshed;
 pub use single_flight::{SingleFlight, CONSENT_TIMEOUT};

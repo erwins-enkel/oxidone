@@ -184,6 +184,25 @@ horizon_days = 14
 The refresh token is stored `chmod 600` in the config dir. See
 [ADR-0002](docs/adr/0002-byo-oauth-plaintext-token.md) for the security rationale.
 
+## Scripting it — `oxidone json`
+
+Beside the TUI there is a machine-readable interface, for bar plugins, status
+lines and scripts:
+
+```console
+$ oxidone json today | jq '[.entries[] | select(.status == "needsAction")] | length'
+4
+$ echo '{"op":"complete","list":"MTIzNDU2","task":"cUhIcWNPYWxfaVJI"}' | oxidone json apply
+```
+
+Reads print JSON to stdout; every write takes its command on stdin (argv is not
+private). Failures print JSON to stderr with an exit code you can branch on, and
+it never opens a browser — authorizing stays the TUI's job.
+
+The full contract — every subcommand, every field, every operation and the
+exit-code table — is in **[docs/json-cli.md](docs/json-cli.md)**; the reasoning is
+[ADR-0010](docs/adr/0010-machine-readable-json-cli.md).
+
 ## Development
 
 Once per clone, point Git at the committed hooks:

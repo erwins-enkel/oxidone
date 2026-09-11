@@ -39,8 +39,9 @@ impl FileTokenStore {
         &self.path
     }
 
-    /// The sibling lock file: the token path with [`LOCK_EXTENSION`] appended.
-    /// Derived rather than stored so it cannot drift from `path`.
+    /// The sibling lock file — the token path with its extension replaced by
+    /// [`LOCK_EXTENSION`], so `token.json` is guarded by `token.lock`. Derived
+    /// rather than stored, so it cannot drift from `path`.
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension(LOCK_EXTENSION)
     }

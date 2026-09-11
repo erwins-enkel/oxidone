@@ -5,7 +5,7 @@
 //! depends on these field names and this ordering, so a change that breaks one
 //! of these tests is a breaking change and should read like one.
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
 
 use oxidone::api::{FakeTasksApi, NewTask, TaskPatch, TasksApi};
@@ -16,15 +16,35 @@ fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
 }
 
-/// The reference day every test resolves against. Fixed, so Today membership and
-/// relative date phrases are the same in July as in December.
-fn today() -> NaiveDate {
-    ymd(2026, 7, 20)
+/// The reference **instant** every test resolves against. Fixed, so Today
+/// membership and relative date phrases are the same in July as in December —
+/// and zone-aware, because Today's completion-recency rule compares a UTC
+/// `completed_at` against the caller's own day, not UTC's.
+fn now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 20, 9, 0, 0).unwrap()
 }
 
-/// `today()` as an instant, for the phrase parser (which needs a zone).
-fn now() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 7, 20, 9, 0, 0).unwrap()
+/// The reference day, for seeding due dates. Derived from [`now`] so the two
+/// cannot drift apart.
+fn today() -> NaiveDate {
+    now().date_naive()
+}
+
+/// Seed a Completed Task completed at a particular instant — or, with `None`, one
+/// Google never stamped. Completing alone is not enough: the fake stamps
+/// `completed_at` from its own fixed clock, which is never the reference day.
+async fn complete_at(api: &FakeTasksApi, list: &ListId, id: &TaskId, at: Option<DateTime<Utc>>) {
+    api.patch_task(
+        list,
+        id,
+        TaskPatch {
+            completed: Some(true),
+            ..TaskPatch::default()
+        },
+    )
+    .await
+    .expect("completing a seeded Task");
+    api.set_completed_at(id, at);
 }
 
 async fn seed_list(api: &FakeTasksApi, title: &str) -> ListId {
@@ -46,7 +66,7 @@ async fn seed(api: &FakeTasksApi, list: &ListId, title: &str, due: Option<NaiveD
 }
 
 async fn run(api: &FakeTasksApi, job: Job) -> Value {
-    run_remote(api, job, today())
+    run_remote(api, job, now())
         .await
         .expect("a successful read")
 }
@@ -83,24 +103,15 @@ async fn today_is_due_on_or_before_today_across_every_list() {
 }
 
 #[tokio::test]
-async fn today_is_status_blind_so_the_caller_owns_the_bar_count() {
+async fn today_carries_completed_rows_and_leaves_the_bar_count_to_the_caller() {
     // The plugin's bar count is this set filtered to `needsAction`. Completing an
-    // entry must therefore change the count without changing the set — filtering
-    // here instead would put a second definition of Today in the codebase.
+    // entry must therefore change the count without dropping the row: what got
+    // done today is part of the answer to "what was due today".
     let api = FakeTasksApi::new();
     let list = seed_list(&api, "Work").await;
     let open = seed(&api, &list, "open", Some(today())).await;
     let done = seed(&api, &list, "done", Some(today())).await;
-    api.patch_task(
-        &list,
-        &done,
-        TaskPatch {
-            completed: Some(true),
-            ..TaskPatch::default()
-        },
-    )
-    .await
-    .unwrap();
+    complete_at(&api, &list, &done, Some(now())).await;
 
     let payload = run(&api, Job::Today).await;
     // Both are in the set; only their status differs. (They share a due date, so
@@ -125,6 +136,89 @@ async fn today_is_status_blind_so_the_caller_owns_the_bar_count() {
         .filter(|e| e["status"] == json!("needsAction"))
         .count();
     assert_eq!(needs_action, 1, "the bar count is the caller's own filter");
+}
+
+#[tokio::test]
+async fn today_drops_a_completed_entry_completed_on_an_earlier_day() {
+    // #135, the regression this closes: an entry due in the past and completed the
+    // day after stayed in `json today` forever, because membership was
+    // `due <= today` and nothing else — while the TUI's pane had not shown it since
+    // the day it was ticked off. The glossary's rule is the shared one: a Completed
+    // row belongs to Today only if it was completed today.
+    let api = FakeTasksApi::new();
+    let list = seed_list(&api, "Work").await;
+    let stale = seed(&api, &list, "stale", Some(ymd(2026, 7, 1))).await;
+    let fresh = seed(&api, &list, "fresh", Some(ymd(2026, 7, 2))).await;
+    let open = seed(&api, &list, "open", Some(ymd(2026, 7, 3))).await;
+    complete_at(
+        &api,
+        &list,
+        &stale,
+        Some(Utc.with_ymd_and_hms(2026, 7, 2, 8, 0, 0).unwrap()),
+    )
+    .await;
+    complete_at(&api, &list, &fresh, Some(now())).await;
+
+    // The stale one is gone; the one completed today is not. Both are still `due
+    // <= today` — it is recency, not membership, that separates them.
+    assert_eq!(ids(&run(&api, Job::Today).await), [fresh.0, open.0]);
+}
+
+#[tokio::test]
+async fn today_keeps_a_completed_entry_with_no_completion_timestamp() {
+    // Benefit of the doubt, shared with the TUI: there, completing is optimistic
+    // and leaves `completed_at` for the server to fill, so hiding on `None` would
+    // blink a row off screen mid-keystroke. A Completed entry Google never stamped
+    // takes the same treatment rather than a second rule.
+    let api = FakeTasksApi::new();
+    let list = seed_list(&api, "Work").await;
+    let unstamped = seed(&api, &list, "unstamped", Some(today())).await;
+    complete_at(&api, &list, &unstamped, None).await;
+
+    let payload = run(&api, Job::Today).await;
+    assert_eq!(ids(&payload), [unstamped.0]);
+    assert_eq!(payload["entries"][0]["completed_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn today_resolves_the_completion_day_in_the_callers_timezone() {
+    // `completed_at` is UTC; "today" is the user's day. One instant, two zones,
+    // two answers — and deliberately an instant whose *date* is the same in both,
+    // so this fails if the zone is dropped anywhere between `run_remote` and the
+    // predicate, rather than passing on a coincidence of the reference day.
+    let api = FakeTasksApi::new();
+    let list = seed_list(&api, "Work").await;
+    let done = seed(&api, &list, "done", Some(ymd(2026, 7, 20))).await;
+    complete_at(
+        &api,
+        &list,
+        &done,
+        Some(Utc.with_ymd_and_hms(2026, 7, 20, 1, 0, 0).unwrap()),
+    )
+    .await;
+
+    // 23:00 UTC on the 20th. Two hours west it is 21:00 on the same day, so both
+    // callers are asking about 2026-07-20 — but the completion at 01:00 UTC was
+    // still the 19th there.
+    let evening = Utc.with_ymd_and_hms(2026, 7, 20, 23, 0, 0).unwrap();
+    let west = FixedOffset::west_opt(2 * 3600).expect("valid offset");
+
+    let in_utc = run_remote(&api, Job::Today, evening)
+        .await
+        .expect("a successful read");
+    let in_west = run_remote(&api, Job::Today, evening.with_timezone(&west))
+        .await
+        .expect("a successful read");
+
+    assert_eq!(
+        in_utc["today"], in_west["today"],
+        "the same day, either way"
+    );
+    assert_eq!(ids(&in_utc), [done.0]);
+    assert!(
+        ids(&in_west).is_empty(),
+        "completed the previous day in the caller's zone"
+    );
 }
 
 #[tokio::test]
@@ -153,7 +247,7 @@ async fn today_fails_closed_when_a_list_will_not_load() {
     seed(&api, &list, "due today", Some(today())).await;
     api.fail_next(oxidone::api::ApiError::RateLimited);
 
-    let error = run_remote(&api, Job::Today, today())
+    let error = run_remote(&api, Job::Today, now())
         .await
         .expect_err("a failed read");
     assert_eq!(error.kind, ErrorKind::RateLimited);
@@ -240,7 +334,7 @@ async fn an_unknown_list_is_not_found() {
         Job::Tasks {
             list: ListId("nope".into()),
         },
-        today(),
+        now(),
     )
     .await
     .expect_err("a missing List");

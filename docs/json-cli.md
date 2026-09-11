@@ -44,7 +44,8 @@ wait for a redirect nobody is there to complete.
 
 ### `oxidone json today`
 
-The **Today** set: every entry due on or before today, across every List.
+The **Today** set: every entry due on or before today, across every List — a
+Completed one only if it was completed today.
 
 ```json
 {
@@ -53,16 +54,29 @@ The **Today** set: every entry due on or before today, across every List.
 }
 ```
 
-Membership is `due <= today` and nothing else — the same definition the TUI's
-Today pane uses, so a bar and the pane can never name different sets. An
-**undated** entry is therefore never in it.
+Membership is `due <= today`, narrowed by one rule for Completed entries: one is
+in Today only if it was **completed today**. An **undated** entry is never in it.
+Both "today"s are the machine's local day — `completed_at` is UTC on the wire, but
+it is compared in your zone, not UTC's.
 
-It is **status-blind**: Completed entries due on or before today are included, so
-a caller that wants a count filters to `status == "needsAction"` itself.
+Both halves are the TUI's, so a bar and the Today pane can never name different
+sets — render this verbatim and you are showing what the pane shows. (Until #135
+this set was status-blind: it kept every past completion whose due date had passed,
+so it and the pane disagreed from the day after a Task was ticked off.)
 
-> The TUI's Today *pane* additionally hides a Completed entry that was not
-> completed today. That is a display rule of the pane, not a second definition of
-> Today — the `needsAction` count is identical either way.
+A Completed entry with a null `completed_at` is kept. Google always stamps one;
+the TUI does not, briefly, because completing there is optimistic — so the rule
+gives an unstamped completion the benefit of the doubt rather than blinking it out
+of view.
+
+Completed entries are still **in** the payload — the ones completed today — so a
+caller that wants a count filters to `status == "needsAction"` itself. That count
+is unaffected by the recency rule: nothing it removes was `needsAction`.
+
+> If you compute a completion *ratio* rather than a count, note that the TUI's
+> Today header meter divides by the whole `due <= today` set, stale completions
+> included. This payload is the pane's visible set, so a ratio derived from it has
+> the smaller denominator. The `needsAction` count is the same in both.
 
 Ordered by due date (overdue first), then display title, then id. The tail of that
 is only there to make the order total, so two entries on one day do not swap

@@ -1282,35 +1282,21 @@ impl Model {
         !self.today_active() || due_on_or_before(task.due, self.now.date_naive())
     }
 
-    /// The Today completion-recency filter: outside Today, and for any row that is
-    /// not Completed, a no-op. In Today a Completed row passes only if it was
-    /// completed today — the pane answers "among what was due, what got done
-    /// today", so a row completed on an earlier day leaves it even though its due
-    /// date keeps it in the `due <= today` set.
-    ///
-    /// Not a log of the day's completions: membership still gates on
-    /// `due <= today`, so a future-due Task ticked off today is never in the
-    /// aggregate to begin with. Recency narrows the Completed rows *within* that
-    /// set; it does not widen it.
-    ///
-    /// `completed_at: None` passes. Completing is optimistic — [`set_completed`]
-    /// deliberately leaves `completed_at` for the server response to fill — so
-    /// hiding on `None` would blink a row off screen the instant Space is pressed
-    /// and back on at the next refresh. A cache row with a NULL `completed_at`
-    /// takes the same benefit of the doubt.
+    /// The Today completion-recency filter: outside Today a no-op, and inside it
+    /// [`crate::domain::within_completion_day`]. The rule itself lives there,
+    /// shared with the JSON CLI's `today` so the pane and a bar cannot disagree
+    /// about which completions belong to the day (#135). What is this pane's own,
+    /// and stays here, is the `today_active()` gate.
     ///
     /// Compared in `now`'s timezone: `completed_at` is UTC, but "today" is the
     /// user's day, not UTC's.
     fn within_completion_day(&self, task: &Task) -> bool {
-        if !self.today_active() || task.status != Status::Completed {
-            return true;
-        }
-        match task.completed_at {
-            None => true,
-            Some(at) => {
-                at.with_timezone(&self.now.timezone()).date_naive() == self.now.date_naive()
-            }
-        }
+        !self.today_active()
+            || crate::domain::within_completion_day(
+                task,
+                self.now.date_naive(),
+                &self.now.timezone(),
+            )
     }
 
     /// The distant-due filter: with `hide_distant` on, an entry is hidden only if

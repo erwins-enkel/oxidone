@@ -3,22 +3,31 @@
 //! All three are network reads that never touch `oxidone.db` — ADR-0010 keeps
 //! the cache single-writer (ADR-0001) by keeping this process out of it entirely.
 
-use chrono::NaiveDate;
+use chrono::{DateTime, TimeZone};
 use serde_json::{json, Value};
 
 use super::wire::{Entry, ListRow};
 use super::CliError;
 use crate::api::TasksApi;
-use crate::domain::{due_on_or_before, ListId, Task};
+use crate::domain::{due_on_or_before, within_completion_day, ListId, Task};
 
-/// The **Today** set: every entry due on or before `today`, across every List.
+/// The **Today** set: every entry due on or before `today`, across every List,
+/// minus the completions that belong to an earlier day.
 ///
-/// Membership is [`due_on_or_before`] and nothing else, so an undated entry is
-/// never in it and the bar can never name a different set than the TUI's. It is
-/// **status-blind**: a caller filters to `needsAction` for a count, and gets the
-/// Completed rows for free if it wants to show what was done. (The TUI's Today
-/// pane additionally hides a Completed row that was not completed today — a
-/// display rule of that pane, not a second definition of Today.)
+/// Both halves of the rule come from `domain`, so this names exactly the set the
+/// TUI's Today pane draws (#135): [`due_on_or_before`] decides membership — an
+/// undated entry is never in it — and [`within_completion_day`] narrows the
+/// Completed rows to those completed *today*, so the set answers "among what was
+/// due, what got done" rather than accumulating every completion whose due date
+/// is in the past.
+///
+/// Still carries its Completed rows, so a caller that wants a count filters to
+/// `needsAction` itself — that count is unaffected by the recency rule, since
+/// nothing it removes was `needsAction` to begin with.
+///
+/// Takes the caller's *instant*, not a date: `completed_at` is UTC while "today" is
+/// the user's day, so the comparison needs a zone — and deriving both the day and
+/// the zone from one `now` is what stops them being passed in disagreeing.
 ///
 /// The fan-out is sequential. It is one request per List, which is what makes it
 /// N+1 — acceptable for a caller that polls every few minutes, and the honest
@@ -27,16 +36,19 @@ use crate::domain::{due_on_or_before, ListId, Task};
 ///
 /// Fails closed: one List that will not load fails the call rather than returning
 /// a short set, which is indistinguishable from a light day.
-pub(super) async fn today(api: &dyn TasksApi, today: NaiveDate) -> Result<Value, CliError> {
+pub(super) async fn today<Tz: TimeZone>(
+    api: &dyn TasksApi,
+    now: &DateTime<Tz>,
+) -> Result<Value, CliError> {
+    let today = now.date_naive();
+    let tz = now.timezone();
     let lists = api.list_lists().await?;
     let mut entries: Vec<Task> = Vec::new();
     for list in &lists {
         let tasks = api.list_tasks(&list.id, true, false, None).await?;
-        entries.extend(
-            tasks
-                .into_iter()
-                .filter(|task| due_on_or_before(task.due, today)),
-        );
+        entries.extend(tasks.into_iter().filter(|task| {
+            due_on_or_before(task.due, today) && within_completion_day(task, today, &tz)
+        }));
     }
     // A specified order, because an unspecified one in a contract is a promise
     // nobody can rely on and everybody will. Overdue first, then the day, then

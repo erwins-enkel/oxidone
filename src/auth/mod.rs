@@ -22,7 +22,29 @@ pub trait TokenStore: Send + Sync {
     fn load(&self) -> anyhow::Result<Option<String>>;
     fn save(&self, token: &str) -> anyhow::Result<()>;
     fn clear(&self) -> anyhow::Result<()>;
+
+    /// Take the store's exclusive lock, which spans a whole
+    /// load → refresh → save (see [`cached_or_refreshed`]) rather than any one
+    /// of them.
+    ///
+    /// `Ok(None)` means somebody else holds it *right now* — the caller retries;
+    /// `Err` means the lock itself could not be established, which is a broken
+    /// store and never a missing grant.
+    ///
+    /// It belongs to the store rather than to the refresh exchange because only
+    /// the store knows what its contents *are*: a file needs an OS lock, and a
+    /// keychain backend — the reason this trait exists at all (ADR-0002) — would
+    /// hand back a guard that locks nothing. `refresh` stays storage-agnostic.
+    ///
+    /// Exclusion is across **processes**, which is the point: `SingleFlight`
+    /// coalesces within one, and since ADR-0010 a `oxidone json` call and the TUI
+    /// can both want the same grant.
+    fn try_lock(&self) -> anyhow::Result<Option<Box<dyn TokenGuard>>>;
 }
+
+/// A held [`TokenStore::try_lock`]. Releasing is dropping it; there is nothing
+/// to call, so a lock cannot be leaked past its scope by forgetting to.
+pub trait TokenGuard: Send {}
 
 /// Hands out a fresh bearer token, refreshing as needed.
 #[async_trait::async_trait]

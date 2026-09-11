@@ -22,13 +22,25 @@ use time::{Duration, OffsetDateTime};
 use yup_oauth2::storage::TokenInfo;
 use yup_oauth2::ApplicationSecret;
 
-use super::TokenStore;
+use super::{TokenGuard, TokenStore};
 use crate::api::ApiError;
 
 /// Cap on how much of Google's body is quoted into an [`ApiError`]. The token
 /// endpoint's own errors are a line of JSON, but a proxy in the way can answer
 /// with a whole HTML page, and this text ends up in a single-row status line.
 const MAX_QUOTED_BODY: usize = 200;
+
+/// How long to wait for the other process's refresh before giving up. A refresh
+/// is one POST, so this is generous by an order of magnitude — it is sized to
+/// outlast a slow exchange, not to outlast a hung one, and a wait that ends is
+/// what keeps a wedged peer from wedging us too.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Gap between attempts at the store lock. `try_lock` cannot be awaited, so the
+/// wait is a poll — but an *async* one, which is the point: a blocking acquire
+/// would park a runtime worker for the whole of somebody else's network round
+/// trip.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Hand back a usable bearer for the stored grant, refreshing it against
 /// Google's token endpoint when the cached access token is spent — or whenever
@@ -40,6 +52,18 @@ const MAX_QUOTED_BODY: usize = 200;
 /// dropped connection, a rejected `client_secret.json`, or a token file that
 /// cannot be read or written can never be mistaken for a dead grant and answered
 /// with a browser window.
+///
+/// The exchange itself runs under the store's cross-process lock (ADR-0010), so
+/// a `oxidone json` call and the TUI cannot both POST and race to rewrite the
+/// stored grant. Serializing the two POSTs would not be enough on its own —
+/// Google may rotate the refresh token, and the loser would then be sending one
+/// that has just been replaced — so the store is **re-read under the lock** and
+/// the decision to refresh remade against what is actually on disk now. A caller
+/// that queued behind a successful refresh returns *that* token and never posts
+/// at all.
+///
+/// The common case never takes the lock: a cached, unexpired access token is
+/// answered before the slow path begins.
 pub async fn cached_or_refreshed(
     http: &reqwest::Client,
     secret: &ApplicationSecret,
@@ -53,15 +77,26 @@ pub async fn cached_or_refreshed(
         return Err(ApiError::AuthExpired);
     };
 
-    if !force {
-        if let Some(access) = stored.access_token.as_deref() {
-            // `TokenInfo::is_expired` carries yup-oauth2's one-minute margin —
-            // borrowed rather than reinvented, so there is a single definition of
-            // "spent" in the codebase.
-            if !stored.is_expired() {
-                return Ok(access.to_owned());
-            }
-        }
+    if let Some(access) = usable(&stored, force) {
+        return Ok(access);
+    }
+
+    // Whichever access token we just rejected. Under the lock, a *different* one
+    // is proof that somebody else refreshed while we queued — which retires our
+    // `force`, since `force` means "the server rejected the token we had", and
+    // this is no longer that token.
+    let rejected = stored.access_token;
+
+    let _guard = lock(store).await?;
+
+    let Some(stored) = load(store)? else {
+        // Reachable: the process ahead of us can have found the grant dead and
+        // cleared the store (see `refused`). Consent is the remedy, once.
+        return Err(ApiError::AuthExpired);
+    };
+    let force = force && stored.access_token == rejected;
+    if let Some(access) = usable(&stored, force) {
+        return Ok(access);
     }
 
     let Some(refresh_token) = stored.refresh_token.as_deref() else {
@@ -127,6 +162,59 @@ pub async fn cached_or_refreshed(
     };
     persist(store, &token).map_err(ApiError::TokenStoreFailed)?;
     Ok(bearer)
+}
+
+/// The access token to answer with, or `None` when one has to be fetched.
+///
+/// `force` is the 401 replay: the server has already rejected whatever is
+/// cached, so nothing cached can satisfy the caller however fresh it looks.
+///
+/// Otherwise `TokenInfo::is_expired` decides, carrying yup-oauth2's one-minute
+/// margin — borrowed rather than reinvented, so there is a single definition of
+/// "spent" in the codebase.
+///
+/// Split out because it is asked twice: once before taking the store lock and
+/// again under it, against whatever another process left behind. Two spellings
+/// of this rule could disagree about a token by one minute, which is a bug that
+/// would surface as an occasional extra POST and nothing else.
+fn usable(stored: &TokenInfo, force: bool) -> Option<String> {
+    if force || stored.is_expired() {
+        return None;
+    }
+    stored.access_token.clone()
+}
+
+/// Take the store's cross-process lock, waiting for a peer's refresh to finish.
+///
+/// Polled rather than blocked on: [`TokenStore::try_lock`] is synchronous, and
+/// blocking a runtime worker for the length of another process's network round
+/// trip would stall every other task on that thread — in the TUI, the frame.
+///
+/// Bounded by [`LOCK_TIMEOUT`], so a peer that hangs mid-exchange costs this
+/// process 30 seconds rather than the rest of its life. The timeout reports as
+/// [`ApiError::TokenStoreFailed`]: the store is what was unavailable, the grant
+/// is untouched, and — like every other store failure — it must never be
+/// answered with a browser window.
+async fn lock(store: &dyn TokenStore) -> Result<Box<dyn TokenGuard>, ApiError> {
+    let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match store.try_lock() {
+            Ok(Some(guard)) => return Ok(guard),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = format!("{e:#}");
+                tracing::error!(error = %detail, "the token lock could not be taken");
+                return Err(ApiError::TokenStoreFailed(detail));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let detail =
+                format!("another oxidone process has held the token lock for {LOCK_TIMEOUT:?}");
+            tracing::error!(error = %detail, "gave up waiting for the token lock");
+            return Err(ApiError::TokenStoreFailed(detail));
+        }
+        tokio::time::sleep(LOCK_POLL).await;
+    }
 }
 
 /// Read and parse the stored token cache.

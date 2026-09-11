@@ -2,11 +2,19 @@
 //! (ADR-0002). The stored blob is the yup-oauth2 token cache JSON; keeping it
 //! behind the trait lets an OS-keychain backend replace it later.
 
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::TokenStore;
+use super::{TokenGuard, TokenStore};
+
+/// Extension of the token file's name for its lock sibling. A **separate** file,
+/// never `token.json` itself: `save` truncates that one and `clear` *unlinks* it,
+/// and a lock on an unlinked inode excludes nobody — the next process opens the
+/// replacement and locks that instead. The lock file is created once, empty, and
+/// never removed, so every process locks the same inode. It holds no secret.
+const LOCK_EXTENSION: &str = "lock";
 
 /// A plaintext token file, created `0600` on unix.
 pub struct FileTokenStore {
@@ -29,6 +37,13 @@ impl FileTokenStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The sibling lock file — the token path with its extension replaced by
+    /// [`LOCK_EXTENSION`], so `token.json` is guarded by `token.lock`. Derived
+    /// rather than stored, so it cannot drift from `path`.
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension(LOCK_EXTENSION)
     }
 }
 
@@ -59,7 +74,54 @@ impl TokenStore for FileTokenStore {
             }
         }
     }
+
+    fn try_lock(&self) -> anyhow::Result<Option<Box<dyn TokenGuard>>> {
+        let path = self.lock_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
+        }
+        // `write`, because an advisory exclusive lock needs a writable handle on
+        // some platforms; `truncate(false)`, because the file's *existence* is the
+        // whole content and truncating a lock other processes hold open would be
+        // pure side effect.
+        let file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening token lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Box::new(FileTokenGuard { file }))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking token lock {}", path.display()))
+            }
+        }
+    }
 }
+
+/// The held lock on [`FileTokenStore::lock_path`], released when it is dropped.
+struct FileTokenGuard {
+    file: File,
+}
+
+impl Drop for FileTokenGuard {
+    fn drop(&mut self) {
+        // Closing the handle would release the lock on its own, so this is
+        // belt-and-braces — but it is the line that says *where* the lock ends,
+        // and it is why the handle is a field that is read rather than one merely
+        // parked here to keep the descriptor open.
+        //
+        // Logged, not propagated: a destructor has nobody to return to, and the
+        // lock is gone the moment the file closes either way.
+        if let Err(e) = self.file.unlock() {
+            tracing::warn!(error = %e, "could not release the token lock");
+        }
+    }
+}
+
+impl TokenGuard for FileTokenGuard {}
 
 /// Write `contents` to `path`, ensuring the file is only readable/writable by
 /// the current user (`0600`) on unix.

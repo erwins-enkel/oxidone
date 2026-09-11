@@ -12,8 +12,8 @@ use chrono::NaiveDate;
 use crate::config::Flavor;
 use crate::dateparse;
 use crate::domain::{
-    due_before, due_on_or_before, EntryType, List, ListId, Selection, SortView, Status, Task,
-    TaskId, WEEK_DAYS,
+    due_before, due_on_or_before, migrated_due, EntryType, List, ListId, Selection, SortView,
+    Status, Task, TaskId, WEEK_DAYS,
 };
 use crate::keymap::{self, Action};
 use crate::links::{self, Link, OpenableUrl};
@@ -1231,9 +1231,7 @@ impl Model {
             && task.status != Status::Completed
             && self.week_pool_list() == Some(&task.list);
         let scheduled = crate::domain::in_week(task.due, self.week_start())
-            // `map_or(true, …)` rather than `is_none_or`, which postdates the
-            // crate's `rust-version`.
-            && self.week_scope().map_or(true, |id| id == &task.list);
+            && self.week_scope().is_none_or(|id| id == &task.list);
         pool || scheduled
     }
 
@@ -2807,10 +2805,9 @@ fn open_edit_title(model: &mut Model) {
 /// Migrate the selected Task: push its due date one day past whichever is later,
 /// today or its current due date. Bullet Journal's `>` disposition.
 ///
-/// `max(today, due) + 1` rather than a flat "tomorrow" so the verb composes:
-/// an overdue Task lands on tomorrow, a future one shifts a day, and repeated
-/// presses defer repeatedly. An undated Task gets tomorrow — `max` has nothing
-/// to compare against.
+/// The arithmetic is [`crate::domain::migrated_due`], shared with the JSON CLI's
+/// `migrate` op (ADR-0010) so the two surfaces cannot defer by different amounts.
+/// It declines at the end of the calendar, and so does this.
 ///
 /// Refuses a Completed Task. Migration is for Tasks still `needsAction`;
 /// re-dating a finished one is semantically empty, and `m` is pressed rapidly
@@ -2838,7 +2835,11 @@ fn migrate(model: &mut Model) -> Vec<Command> {
         return Vec::new();
     };
     let today = model.now.date_naive();
-    let due = Some(current.map_or(today, |d| d.max(today)) + chrono::Duration::days(1));
+    let Some(next) = migrated_due(current, today) else {
+        model.status_line = Some("there is no day after this one to migrate to".to_string());
+        return Vec::new();
+    };
+    let due = Some(next);
     model
         .pending_writes
         .insert(id.clone(), model.tasks[index].clone());

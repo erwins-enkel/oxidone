@@ -214,11 +214,21 @@ impl TasksApi for FakeTasksApi {
             .filter(|e| &e.task.list == list && !e.deleted)
             .filter(|e| show_hidden || !e.hidden)
             .filter(|e| show_completed || e.task.status != Status::Completed)
-            .filter(|e| updated_min.map_or(true, |min| e.task.updated >= min))
+            .filter(|e| updated_min.is_none_or(|min| e.task.updated >= min))
             .map(|e| e.task.clone())
             .collect();
         out.sort_by(|a, b| a.position.cmp(&b.position));
         Ok(out)
+    }
+
+    async fn get_task(&self, list: &ListId, id: &TaskId) -> Result<Task, ApiError> {
+        let mut st = self.state.lock().unwrap();
+        st.take_error()?;
+        // `entry_pos` excludes Deleted but not Hidden, matching Google: a
+        // **Cleared** Task is swept out of the active view and still readable by
+        // id, a Deleted one is gone.
+        let pos = st.entry_pos(list, id).ok_or(ApiError::NotFound)?;
+        Ok(st.tasks[pos].task.clone())
     }
 
     async fn insert_task(&self, list: &ListId, task: NewTask) -> Result<Task, ApiError> {

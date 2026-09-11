@@ -195,6 +195,58 @@ async fn list_tasks_sends_show_flags_and_updated_min() {
 }
 
 #[tokio::test]
+async fn get_task_reads_one_task_by_id_and_carries_its_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks/T7"))
+        .and(header("authorization", bearer().as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "T7", "title": "○ Standup", "etag": "e7",
+            "updated": "2023-11-14T22:13:20.000Z", "status": "needsAction",
+            "due": "2023-12-25T00:00:00.000Z",
+            "notes": "daily",
+            "position": "00000000000000000000"
+        })))
+        .mount(&server)
+        .await;
+
+    let task = client(&server)
+        .get_task(&ListId("L1".into()), &TaskId("T7".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(task.id, TaskId("T7".into()));
+    // Google's per-Task response carries no tasklist id, so the caller's own is
+    // what lands on the domain type.
+    assert_eq!(task.list, ListId("L1".into()));
+    assert_eq!(task.title, "○ Standup");
+    assert_eq!(task.notes.as_deref(), Some("daily"));
+    assert_eq!(
+        task.due,
+        Some(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap())
+    );
+    assert_eq!(task.status, Status::NeedsAction);
+}
+
+#[tokio::test]
+async fn get_task_reports_a_missing_task_as_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lists/L1/tasks/gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": 404, "message": "Task not found." }
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .get_task(&ListId("L1".into()), &TaskId("gone".into()))
+        .await
+        .expect_err("a missing task");
+    assert_eq!(error, ApiError::NotFound);
+}
+
+#[tokio::test]
 async fn insert_task_posts_body_with_due_date_only() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

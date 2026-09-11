@@ -8,6 +8,7 @@ pub mod api; // TasksApi trait + reqwest impl + in-memory fake
 pub mod app; // The Elm Architecture: Model, Message, update, view wiring
 pub mod auth; // OAuth loopback flow + TokenStore trait
 pub mod cache; // SQLite pure-mirror cache + completion_log
+pub mod cli; // `oxidone json`: the machine-readable entry point (ADR-0010)
 pub mod config; // TOML config + platform paths
 pub mod dateparse; // pure natural-language + ISO due-date parser (local TZ)
 pub mod domain; // Task, List, Subtask, Status, DueDate — the ubiquitous language

@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/erwins-enkel/oxidone/compare/v1.1.0...v1.2.0) (2026-09-11)
+
+
+### Features
+
+* **auth:** accept a pasted callback URL, and own the consent flow ([#139](https://github.com/erwins-enkel/oxidone/issues/139)) ([bb5696c](https://github.com/erwins-enkel/oxidone/commit/bb5696cd9c7b7352f29efcea6609adf5e571d0cf))
+
+
+### Bug Fixes
+
+* **cli:** narrow `json today` to today's completions ([#137](https://github.com/erwins-enkel/oxidone/issues/137)) ([141fbaa](https://github.com/erwins-enkel/oxidone/commit/141fbaa95633130e7c00722d3bc042bbc72a7fe1))
+
 ## [1.1.0](https://github.com/erwins-enkel/oxidone/compare/v1.0.0...v1.1.0) (2026-09-11)
 
 

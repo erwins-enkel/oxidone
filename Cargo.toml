@@ -1,6 +1,6 @@
 [package]
 name = "oxidone"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 # 1.89 is where `std::fs::File::{try_lock, unlock}` stabilised — the
 # cross-process lock around the refresh exchange (ADR-0009/ADR-0010) uses it

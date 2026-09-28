@@ -48,7 +48,9 @@ a Tasks costume.
   step to next week and back. The dot *is* the due date, so a plan syncs to your
   phone and shows up in Today on its day
 - Notes edited in your `$EDITOR`
-- Full list management (create / rename / delete)
+- Full list management (create / rename / delete). List order is Google's —
+  the API can't reorder Lists, so drag them in the Google Tasks web app and
+  refresh (`r`)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
   due → title → "my order" (Google's), the only view a reorder writes to
 - An Omnibox (`p`, or `Ctrl-P`) over one query: jump to a List, run a command

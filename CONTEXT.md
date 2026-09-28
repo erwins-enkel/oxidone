@@ -44,6 +44,14 @@ _Avoid_: description, body, note.
 A Task's title with its type glyph removed — what the pane shows and the editor opens on. Equal to the raw title for a Task. Note this means "prefix removed", not "glyph-free": a title Google stores in a non-canonical form (`○Standup`, no space) is read as an untyped Task and keeps its glyph on screen until `t` normalises it.
 _Avoid_: clean title, stripped title.
 
+**Tag**:
+A `#name` word in an entry's **Display title** — `#alice`, `#team-meeting` — marking who or what it is for, the way GTD's Agendas group follow-ups by person or meeting. Derived from the title, never stored (as the **Entry type** is, ADR-0008), so it round-trips through every Google client as plain text. The `#` must start the title or follow whitespace, and the name is one or more letters, digits, `-` or `_`; anything else ends it, so `#alice:` is `alice` while `C#` and `issue#12` are not Tags. Notes are never read for Tags.
+
+A Tag is **named** lower-cased and without its `#` — one spelling wherever it is offered: the `#` picker, the Omnibox TAG band, the JSON CLI's `tags`. The title keeps whatever casing was typed.
+
+Filtering by one is the `/` filter, not a second one: a query word that is a whole Tag matches exactly that Tag (`#al` does not match `#alex`), and the picker simply commits `#name` as the query. Local and read-only like every view filter.
+_Avoid_: label, context, category, hashtag field.
+
 **Due date**:
 A **date, never a time**. Google's API discards the time portion, so oxidone never stores or shows a due time.
 _Avoid_: deadline, due time, due-at.

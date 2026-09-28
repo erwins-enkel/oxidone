@@ -46,6 +46,9 @@ pub enum Action {
     /// Open the title/notes filter input (`/`): a live view filter narrowing the
     /// task pane by a case-insensitive substring of a row's title or notes.
     Filter,
+    /// Open the tag picker (`#`): pick a **Tag** in view to filter the pane by,
+    /// committed as the `/` query `#name`.
+    TagFilter,
     /// Enter the cross-List **Search** pane (`S`): the whole cached corpus,
     /// narrowed live by the `/` query. When Search is already active, reopens the
     /// query input over the existing query.
@@ -259,6 +262,13 @@ pub fn bindings() -> &'static [Binding] {
             key: KeyCode::Char('/'),
             action: Action::Filter,
             help: "filter by title/notes",
+        },
+        // Beside `/`, which it drives: the pick lands as the `/` query `#name`.
+        // No legend cell, for `/`'s reason.
+        Binding {
+            key: KeyCode::Char('#'),
+            action: Action::TagFilter,
+            help: "filter by tag",
         },
         // Beside `/`, and like it: no always-visible legend cell (the 80-column
         // TASKS row is full through `c completed` — see `legend`), so this lives in
@@ -497,6 +507,9 @@ pub enum LegendContext {
     /// `^N`/`^P`, `^U`/`^W` edit the query, `Enter` performs the Move and `Esc`
     /// cancels it.
     ListPicker,
+    /// The tag picker: the list picker's keys, but `Enter` filters the pane by
+    /// the highlighted Tag.
+    TagPicker,
     /// The title/notes filter input: characters narrow the pane live, `Enter`
     /// keeps the filter applied, `Esc` drops it entirely, and `^U` clears just
     /// the query text. `Esc`'s cell names its scope rather than saying "clear",
@@ -875,6 +888,23 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         KILL_WORD,
     ];
 
+    const TAG_PICKER: &[LegendEntry] = &[
+        LegendEntry {
+            keys: LegendKeys::Literal("Up/Down ^N/^P"),
+            label: "move",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Enter"),
+            label: "filter",
+        },
+        LegendEntry {
+            keys: LegendKeys::Literal("Esc"),
+            label: "cancel",
+        },
+        KILL_LINE,
+        KILL_WORD,
+    ];
+
     // The filter narrows live as you type; `Enter` keeps it applied and `Esc`
     // discards it entirely — neither of which the plain text-input legend would
     // have said.
@@ -957,6 +987,7 @@ pub fn legend(context: LegendContext) -> &'static [LegendEntry] {
         LegendContext::Confirm => CONFIRM,
         LegendContext::LinkPicker => LINK_PICKER,
         LegendContext::ListPicker => LIST_PICKER,
+        LegendContext::TagPicker => TAG_PICKER,
         LegendContext::Omnibox => OMNIBOX,
         LegendContext::Filter => FILTER,
         LegendContext::SearchFilter => SEARCH_FILTER,

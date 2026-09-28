@@ -22,13 +22,14 @@ use std::collections::HashMap;
 
 use crate::app::text_input::TextInput;
 use crate::app::{
-    move_target_rows, omnibox_rows, on_off, renders_as_subtask, split_command, AuthPrompt,
-    CaptureRow, CommandState, Focus, JumpTarget, Model, MoveRow, OmniCommand, OmniRow, Overlay,
+    move_target_rows, omnibox_rows, on_off, renders_as_subtask, split_command, tag_rows,
+    AuthPrompt, CaptureRow, CommandState, Focus, JumpTarget, Model, MoveRow, OmniCommand, OmniRow,
+    Overlay, TagRow,
 };
 use crate::dateparse::{self, format_due_relative, split_title_and_due};
 use crate::domain::{
-    due_before, due_on_or_before, week_column, EntryType, ListId, Selection, Status, Task, TaskId,
-    WEEK_DAYS,
+    due_before, due_on_or_before, tag_ranges, week_column, EntryType, ListId, Selection, Status,
+    Task, TaskId, WEEK_DAYS,
 };
 use crate::keymap;
 use crate::links::{self, Link};
@@ -195,6 +196,11 @@ fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, model: &Mode
             selected,
             ..
         } => return render_list_picker(frame, area, targets, query, *selected, theme),
+        Overlay::TagPicker {
+            tags,
+            query,
+            selected,
+        } => return render_tag_picker(frame, area, tags, query, *selected, theme),
         // The filter input draws no popup — the pane header carries its query and
         // caret (see `header_title`), so the narrowed pane stays fully visible.
         Overlay::Filter => return,
@@ -550,6 +556,7 @@ fn omnibox_line(
                 None => String::new(),
             },
         ),
+        OmniRow::Tag(row) => (format!("#{}", row.name), tag_count(row)),
         OmniRow::Command(command) => {
             let mut trail = match &command.state {
                 CommandState::NeedsArgument { .. } => match command.command {
@@ -748,49 +755,130 @@ fn render_list_picker(
     selected: usize,
     theme: &Theme,
 ) {
-    /// What the popup says in place of rows, when the query matches no candidate.
-    /// Word for word the Omnibox MOVE band's refusal for the same condition
-    /// (`move_rows`): one sentence for one meaning, whichever surface asked.
-    const NO_MATCH: &str = "no list matches";
+    // Narrowed by the same function the reducer resolves `Enter` with, so what is
+    // on screen and what a Move would pick cannot drift apart.
+    let labels = move_target_rows(targets, query)
+        .into_iter()
+        .map(|list| list.title.clone())
+        .collect();
+    // Word for word the Omnibox MOVE band's refusal for the same condition
+    // (`move_rows`): one sentence for one meaning, whichever surface asked.
+    let text = PickerText {
+        title: "Move to list",
+        no_match: "no list matches",
+    };
+    render_query_picker(frame, area, text, query, labels, selected, theme);
+}
 
+/// The tag picker (`#`): the Tags a type-ahead query leaves standing, each with
+/// its open count, titled with the query.
+fn render_tag_picker(
+    frame: &mut Frame,
+    area: Rect,
+    tags: &[TagRow],
+    query: &str,
+    selected: usize,
+    theme: &Theme,
+) {
+    let labels = tag_rows(tags, query)
+        .into_iter()
+        .map(|row| format!("#{}  {}", row.name, tag_count(row)))
+        .collect();
+    let text = PickerText {
+        title: "Filter by tag",
+        no_match: "no tag matches",
+    };
+    render_query_picker(frame, area, text, query, labels, selected, theme);
+}
+
+/// A Tag's open count as a row trails it.
+fn tag_count(row: &TagRow) -> String {
+    format!("{} open", row.count)
+}
+
+/// A type-ahead picker's fixed wording: its popup title, and the row it draws
+/// when the query matches nothing.
+struct PickerText {
+    title: &'static str,
+    no_match: &'static str,
+}
+
+/// A type-ahead picker: `labels` are the rows the query leaves standing, and the
+/// popup is titled with the query itself.
+///
+/// A query can narrow the rows to none — which draws one dimmed `no_match` row,
+/// and **no cursor**: there is no row to put one on, and a highlight would offer
+/// a pick that `Enter` refuses.
+fn render_query_picker(
+    frame: &mut Frame,
+    area: Rect,
+    text: PickerText,
+    query: &str,
+    labels: Vec<String>,
+    selected: usize,
+    theme: &Theme,
+) {
     // Same reasoning as the link picker: keep it clear of the status line and the
-    // legend spelling out `Up/Down ^N/^P move  Enter move here  Esc cancel`.
+    // legend spelling out the picker's own keys.
     let body = Rect {
         height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
         ..area
     };
-    // Narrowed by the same function the reducer resolves `Enter` with, so what is
-    // on screen and what a Move would pick cannot drift apart.
-    let rows = move_target_rows(targets, query);
     // `max(1)` for the no-match row: it is one line like any other, and sizing off
-    // an empty `rows` would leave a borders-only box with nothing between them.
+    // an empty `labels` would leave a borders-only box with nothing between them.
     let popup = centered(
         body,
         OVERLAY_WIDTH,
-        picker_height(rows.len().max(1), body.height),
+        picker_height(labels.len().max(1), body.height),
     );
     let width =
         (popup.width.saturating_sub(OVERLAY_BORDERS) as usize).saturating_sub(LIST_CURSOR.width());
-    let items: Vec<ListItem> = if rows.is_empty() {
+    let items: Vec<ListItem> = if labels.is_empty() {
         vec![ListItem::new(Line::styled(
-            truncate(NO_MATCH, width, "…"),
+            truncate(text.no_match, width, "…"),
             Style::new().fg(theme.muted),
         ))]
     } else {
-        rows.iter()
-            .map(|list| ListItem::new(truncate(&list.title, width, "…")))
+        labels
+            .iter()
+            .map(|label| ListItem::new(truncate(label, width, "…")))
             .collect()
     };
     frame.render_widget(Clear, popup);
     render_selectable(
         frame,
         popup,
-        &query_title("Move to list", query, width),
+        &query_title(text.title, query, width),
         items,
-        (!rows.is_empty()).then_some(selected),
+        (!labels.is_empty()).then_some(selected),
         true,
         theme,
     );
+}
+
+/// A row's display title as spans in the row's `style`, each **Tag** in the
+/// `tag` hue when `color_tags` — off on a Completed row, which reads dim
+/// throughout. Splits only; the text drawn is the title verbatim.
+fn title_spans(title: &str, style: Style, color_tags: bool, theme: &Theme) -> Vec<Span<'static>> {
+    if !color_tags {
+        return vec![Span::styled(title.to_string(), style)];
+    }
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for range in tag_ranges(title) {
+        if range.start > at {
+            spans.push(Span::styled(title[at..range.start].to_string(), style));
+        }
+        spans.push(Span::styled(
+            title[range.clone()].to_string(),
+            style.fg(theme.tag),
+        ));
+        at = range.end;
+    }
+    if at < title.len() || spans.is_empty() {
+        spans.push(Span::styled(title[at..].to_string(), style));
+    }
+    spans
 }
 
 /// `text` cut to `width` *display cells*, the last spent on `ellipsis` so a
@@ -1344,7 +1432,8 @@ fn render_task_pane(frame: &mut Frame, area: Rect, model: &Model, ascii: bool, t
             if let Some(cell) = cell {
                 spans.push(Span::styled(cell, style));
             }
-            spans.push(Span::styled(t.display_title().to_string(), style));
+            let completed = t.status == Status::Completed;
+            spans.extend(title_spans(t.display_title(), style, !completed, theme));
             // What the row actually put on screen, not what the Task stores: the
             // signifier cell plus the *display* title. The Subtask meter budgets
             // against this, so it must be derived from the same two values that
@@ -2137,6 +2226,7 @@ fn legend_context(model: &Model) -> keymap::LegendContext {
         Some(Overlay::Confirm(_)) => keymap::LegendContext::Confirm,
         Some(Overlay::OpenLink { .. }) => keymap::LegendContext::LinkPicker,
         Some(Overlay::MoveToList { .. }) => keymap::LegendContext::ListPicker,
+        Some(Overlay::TagPicker { .. }) => keymap::LegendContext::TagPicker,
         // Its own legend: `j`/`k` type, movement is `Up`/`Down`, and `Enter`
         // runs a row rather than saving a buffer — none of which `TextInput`
         // would have said.
@@ -2664,7 +2754,7 @@ mod tests {
         // The branch that separates an uncapped search from a fixed cap of two.
         // Reachable on a real terminal, so it is exercised on the real table.
         let rows = help_rows();
-        let layout = help_layout(Rect::new(0, 0, 120, 14), &rows);
+        let layout = help_layout(Rect::new(0, 0, 120, 15), &rows);
 
         assert_eq!(layout.cols.len(), 3);
         assert_eq!(layout.hidden, 0);

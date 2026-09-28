@@ -47,6 +47,11 @@ a Tasks costume.
   `✕`); `1`–`5` assign a day outright, `0` returns a row to the pool, and `]`/`[`
   step to next week and back. The dot *is* the due date, so a plan syncs to your
   phone and shows up in Today on its day
+- Tags: write `#alice` or `#team-meeting` anywhere in a title (it syncs like any
+  other text) and filter by it — `#` opens a type-ahead picker of the tags in
+  view, most open entries first, and `p` then `#ali…` offers the same. A `#tag`
+  word in the `/` filter matches that whole tag only (`#al` does not match
+  `#alex`). Tags draw in their own colour
 - Notes edited in your `$EDITOR`
 - Full list management (create / rename / delete)
 - Opens in due order, Subtasks still grouped under their parent; `s` cycles
@@ -58,7 +63,8 @@ a Tasks costume.
 - Braille completion meters and a due-load histogram
 - Instant startup from a local SQLite cache; works offline for *viewing*
 
-Not planned: local-only priorities/tags/times (they wouldn't round-trip to Google),
+Not planned: local-only priorities/times (they wouldn't round-trip to Google — tags
+do, because they live in the title),
 recurrence and reminders (not exposed by the API).
 
 ## Install

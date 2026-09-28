@@ -5,7 +5,7 @@
 
 pub mod text_input; // the editable line behind every text overlay
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
 
@@ -307,6 +307,8 @@ struct PendingListMove {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Jump,
+    /// Tags to filter the pane by, drawn only for a query starting with `#`.
+    Tag,
     Command,
     Search,
     /// Destinations the selected Task may be relocated to — the same cross-List
@@ -328,6 +330,7 @@ impl Group {
     pub fn header(self) -> &'static str {
         match self {
             Group::Jump => "JUMP",
+            Group::Tag => "TAG · filter this pane",
             Group::Command => "COMMAND · settings are session only",
             Group::Search => "SEARCH",
             // Says whose destinations these are: a MOVE row draws a List title,
@@ -510,6 +513,14 @@ pub enum MoveRow {
     },
 }
 
+/// One **Tag** on offer to filter by: its name and how many entries still
+/// `needsAction` carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRow {
+    pub name: String,
+    pub count: usize,
+}
+
 /// Where a JUMP row goes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JumpTarget {
@@ -534,6 +545,7 @@ pub enum JumpTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OmniRow {
     Jump(JumpTarget),
+    Tag(TagRow),
     Command(CommandRow),
     /// Carries the query rather than letting the renderer re-read it from the
     /// overlay: two readers of one string can disagree, and this one is echoed
@@ -549,6 +561,7 @@ impl OmniRow {
     pub fn group(&self) -> Group {
         match self {
             OmniRow::Jump(_) => Group::Jump,
+            OmniRow::Tag(_) => Group::Tag,
             OmniRow::Command(_) => Group::Command,
             OmniRow::Search { .. } => Group::Search,
             OmniRow::Move(_) => Group::Move,
@@ -655,6 +668,15 @@ pub enum Overlay {
         query: String,
         selected: usize,
     },
+    /// Pick a **Tag** to filter the pane by (`#`). `tags` is the candidate set
+    /// as captured at open ([`tag_candidates`]); `query` narrows it through
+    /// [`tag_rows`], and `selected` indexes that narrowed sequence — the same
+    /// shape as [`MoveToList`](Self::MoveToList), edited by the same keys.
+    TagPicker {
+        tags: Vec<TagRow>,
+        query: String,
+        selected: usize,
+    },
 }
 
 impl Overlay {
@@ -689,7 +711,8 @@ impl Overlay {
             | Overlay::Omnibox { .. }
             | Overlay::Confirm(_)
             | Overlay::OpenLink { .. }
-            | Overlay::MoveToList { .. } => None,
+            | Overlay::MoveToList { .. }
+            | Overlay::TagPicker { .. } => None,
         }
     }
 }
@@ -1215,12 +1238,18 @@ impl Model {
     /// predicates and the Today pair cannot fire — the lens is off on the Today
     /// row — so `within_week` is the only thing deciding membership there.
     fn is_visible(&self, task: &Task) -> bool {
+        self.within_view(task) && self.matches_filter(task)
+    }
+
+    /// [`is_visible`](Self::is_visible) minus the `/` filter: what the pane would
+    /// show with no query. The tag picker counts over this, so switching from one
+    /// Tag to another still offers every Tag in view.
+    fn within_view(&self, task: &Task) -> bool {
         self.completed_visible(task)
             && self.within_horizon(task)
             && self.within_today(task)
             && self.within_completion_day(task)
             && self.within_week(task)
-            && self.matches_filter(task)
     }
 
     /// The **Weekly spread** membership filter: outside the spread a no-op;
@@ -1259,6 +1288,11 @@ impl Model {
     /// query — the input just opened, before any character — matches everything,
     /// so opening the filter never blanks the pane.
     ///
+    /// A query word that is a whole **Tag** (`#alice`) instead requires the row
+    /// to carry exactly that Tag, so `#al` does not match `#alex`; every such word
+    /// must match. The remaining words, rejoined with single spaces, are the
+    /// substring needle. A query with no Tag word is used verbatim, as before.
+    ///
     /// A per-row predicate like the other view filters, so a matching Subtask
     /// under a non-matching parent renders flush-left as an orphan, exactly as the
     /// distant-due horizon already does.
@@ -1269,7 +1303,24 @@ impl Model {
         if query.is_empty() {
             return true;
         }
-        let needle = query.to_lowercase();
+        let wanted: Vec<String> = query
+            .split_whitespace()
+            .filter_map(crate::domain::tag_name)
+            .collect();
+        let needle = if wanted.is_empty() {
+            query.to_lowercase()
+        } else {
+            let tags = task.tags();
+            if !wanted.iter().all(|name| tags.contains(name)) {
+                return false;
+            }
+            query
+                .split_whitespace()
+                .filter(|word| crate::domain::tag_name(word).is_none())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
         task.display_title().to_lowercase().contains(&needle)
             || task
                 .notes
@@ -2794,6 +2845,7 @@ fn apply(model: &mut Model, action: Action) -> Vec<Command> {
             })
         }
         Action::Filter => open_filter(model),
+        Action::TagFilter => open_tag_picker(model),
         // In Search already, `S` reopens the query input over the existing query
         // (like `/`), never re-entering: `enter_search` would clear the corpus,
         // discard the typed query, and re-fan-out the whole account.
@@ -3550,6 +3602,64 @@ fn fuzzy_match(haystack: &str, query: &str) -> bool {
         .all(|needle| rest.any(|c| c == needle))
 }
 
+/// Every **Tag** on the entries the pane would show with no `/` query, with how
+/// many of those entries still `needsAction`: most first, ties by name. A Tag
+/// only Completed entries carry is not offered — its count would be zero.
+///
+/// The one candidate set behind both the `#` picker and the Omnibox TAG band.
+pub fn tag_candidates(model: &Model) -> Vec<TagRow> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for task in model
+        .tasks
+        .iter()
+        .filter(|t| t.status == Status::NeedsAction && model.within_view(t))
+    {
+        for name in task.tags() {
+            *counts.entry(name).or_default() += 1;
+        }
+    }
+    let mut rows: Vec<TagRow> = counts
+        .into_iter()
+        .map(|(name, count)| TagRow { name, count })
+        .collect();
+    // Stable, over name order: ties stay alphabetical.
+    rows.sort_by_key(|row| std::cmp::Reverse(row.count));
+    rows
+}
+
+/// The candidates `query` leaves standing: those whose name it is a fuzzy
+/// subsequence of, in candidate order. One leading `#` is ignored, so typing
+/// the Tag as it is written narrows too.
+pub fn tag_rows<'a>(tags: &'a [TagRow], query: &str) -> Vec<&'a TagRow> {
+    let query = query.strip_prefix('#').unwrap_or(query);
+    tags.iter()
+        .filter(|row| fuzzy_match(&row.name, query))
+        .collect()
+}
+
+/// Open the tag picker (`#`) over the Tags in view, or say there are none.
+fn open_tag_picker(model: &mut Model) {
+    let tags = tag_candidates(model);
+    if tags.is_empty() {
+        model.status_line = Some("no tags in view".to_string());
+        return;
+    }
+    model.overlay = Some(Overlay::TagPicker {
+        tags,
+        query: String::new(),
+        selected: 0,
+    });
+}
+
+/// Filter the pane to one **Tag**: commit `#name` as the `/` query, which
+/// [`Model::matches_filter`] reads as an exact Tag match. Focuses the task pane,
+/// as opening `/` does, and keeps the cursor on a row that still shows.
+fn apply_tag_filter(model: &mut Model, name: &str) {
+    model.focus = Focus::Tasks;
+    model.filter = Some(format!("#{name}"));
+    reselect_visible(model);
+}
+
 /// Perform the Move the picker has selected: remove the row optimistically and
 /// ask the worker to write it.
 fn finish_move_to_list(
@@ -3955,8 +4065,8 @@ fn open_delete_list_confirm(model: &mut Model) {
     }));
 }
 
-/// The Omnibox's rows for `query`, in group order: JUMP, COMMAND, SEARCH, MOVE,
-/// CAPTURE — the five [`Group::header`] names, and the order `selected == 0`
+/// The Omnibox's rows for `query`, in group order: JUMP, TAG, COMMAND, SEARCH,
+/// MOVE, CAPTURE — the six [`Group::header`] names, and the order `selected == 0`
 /// resolves against, so a write is always the last thing `Enter` can reach.
 ///
 /// The two **write** bands come last for that reason. MOVE precedes CAPTURE
@@ -3999,6 +4109,18 @@ pub fn omnibox_rows(model: &Model, query: &str) -> Vec<OmniRow> {
                 title: list.title.clone(),
             }));
         }
+    }
+
+    // TAG — only for a query that asks for it with a leading `#`, narrowed by
+    // the rest exactly as the `#` picker narrows. Not a write, so it may sit
+    // above SEARCH.
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let candidates = tag_candidates(model);
+        rows.extend(
+            tag_rows(&candidates, rest)
+                .into_iter()
+                .map(|row| OmniRow::Tag(row.clone())),
+        );
     }
 
     // COMMAND — split at the first space, strip one display-only `:`, match the
@@ -4765,12 +4887,13 @@ fn overlay_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
         // Routed before the shared text arm: it owns a selection alongside its
         // buffer, and `j`/`k` must type rather than move.
         Some(Overlay::Omnibox { .. }) => return omnibox_key(model, key),
-        // Both pickers, routed before the `Confirm` and text-buffer arms below:
+        // The pickers, routed before the `Confirm` and text-buffer arms below:
         // falling through would let `y` dismiss one, or swallow its keys. One
-        // handler each, not one shared: the list picker's printable keys type
-        // into its type-ahead query, where the link picker's `j`/`k` move.
+        // handler each, not one shared: the list and tag pickers' printable keys
+        // type into their type-ahead query, where the link picker's `j`/`k` move.
         Some(Overlay::OpenLink { .. }) => return link_picker_key(model, key),
         Some(Overlay::MoveToList { .. }) => return list_picker_key(model, key),
+        Some(Overlay::TagPicker { .. }) => return tag_picker_key(model, key),
         Some(Overlay::Confirm(_)) => {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => execute_confirm(model),
@@ -4909,6 +5032,10 @@ fn omnibox_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Comman
             };
             match row {
                 OmniRow::Jump(target) => return jump_to(model, target),
+                OmniRow::Tag(row) => {
+                    apply_tag_filter(model, &row.name);
+                    return Vec::new();
+                }
                 OmniRow::Search { query } => return omnibox_search(model, query),
                 // Inert for the reason the CAPTURE arms below give: the refusal
                 // is already drawn on the row, so delegating would write it to
@@ -5331,12 +5458,25 @@ fn list_picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Co
     else {
         return Vec::new();
     };
+    let len = move_target_rows(targets, query).len();
+    edit_picker(query, selected, len, key);
+    Vec::new()
+}
+
+/// A type-ahead picker's editing keys, shared by the move-to-List and tag
+/// pickers: `len` is how many rows `query` currently leaves standing.
+fn edit_picker(
+    query: &mut String,
+    selected: &mut usize,
+    len: usize,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
     // Taken before the edit, because the reset rule is "the *query string*
     // changed", not "an editing key was pressed" — a `Backspace` on an empty
     // query leaves the buffer byte-identical and must leave the highlight alone,
     // the same distinction the Omnibox draws.
     let before = query.clone();
-    let len = move_target_rows(targets, query).len();
     let chord = keymap::is_control_chord(key.modifiers);
     match key.code {
         KeyCode::Char('u') if chord => query.clear(),
@@ -5355,6 +5495,30 @@ fn list_picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Co
     if *query != before {
         *selected = 0;
     }
+}
+
+/// Keys for the tag picker (`#`): the move-to-List picker's keys over the Tag
+/// candidates, with `Enter` applying the highlighted Tag as the pane's filter.
+fn tag_picker_key(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Command> {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Enter => return submit_picker(model),
+        KeyCode::Esc => {
+            model.overlay = None;
+            return Vec::new();
+        }
+        _ => {}
+    }
+    let Some(Overlay::TagPicker {
+        tags,
+        query,
+        selected,
+    }) = model.overlay.as_mut()
+    else {
+        return Vec::new();
+    };
+    let len = tag_rows(tags, query).len();
+    edit_picker(query, selected, len, key);
     Vec::new()
 }
 
@@ -5395,7 +5559,26 @@ fn submit_picker(model: &mut Model) -> Vec<Command> {
                 }
             }
         }
-        // Unreachable: the two picker handlers are the only callers and each has
+        Some(Overlay::TagPicker {
+            tags,
+            query,
+            selected,
+        }) => {
+            match tag_rows(&tags, &query).get(selected) {
+                Some(row) => apply_tag_filter(model, &row.name),
+                // Nothing matches: stay up, as the move picker does, rather than
+                // discard the pick over a typo.
+                None => {
+                    model.overlay = Some(Overlay::TagPicker {
+                        tags,
+                        query,
+                        selected,
+                    })
+                }
+            }
+            Vec::new()
+        }
+        // Unreachable: the picker handlers are the only callers and each has
         // already matched its own arm above. Restoring the overlay keeps a future
         // third caller from silently dismissing it.
         other => {

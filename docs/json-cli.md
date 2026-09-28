@@ -139,9 +139,10 @@ parser.
   "id": "cUhIcWNPYWxfaVJI",
   "list": "MTIzNDU2",
   "parent": null,
-  "title": "○ Standup",
-  "display_title": "Standup",
+  "title": "○ Standup #team",
+  "display_title": "Standup #team",
   "type": "event",
+  "tags": ["team"],
   "has_notes": false,
   "due": "2026-07-20",
   "status": "needsAction",
@@ -158,6 +159,7 @@ parser.
 | `title` | string | The title exactly as Google stores it, type glyph and all. |
 | `display_title` | string | The title with its type prefix removed — what a row should show. |
 | `type` | `"task"` \| `"event"` \| `"note"` | The **Entry type**. |
+| `tags` | string[] | The **Tags** in `display_title` (`#alice` → `"alice"`): lower-cased, no `#`, deduplicated, in order of appearance. Empty when there are none. |
 | `has_notes` | boolean | Whether the entry carries non-empty `notes`. |
 | `due` | date \| null | `YYYY-MM-DD`. A **date, never a time** — Google discards the time part. |
 | `status` | `"needsAction"` \| `"completed"` | Google's own two spellings. |
@@ -166,7 +168,7 @@ parser.
 
 **Do not parse `title` yourself.** The Entry type lives in the title's leading
 glyph ([ADR-0008](adr/0008-entry-type-in-title.md)), and `display_title` and
-`type` are that one definition already applied. A second parser in a caller is how
+`type` are that one definition already applied — as `tags` is for the Tag grammar. A second parser in a caller is how
 the two surfaces start disagreeing about what an entry is called.
 
 `notes` itself is not exposed — a row shows that notes *exist*, and shipping

@@ -34,6 +34,10 @@ pub struct Entry {
     pub display_title: String,
     #[serde(rename = "type")]
     pub entry_type: EntryKind,
+    /// The **Tags** in the display title: lower-cased, without the `#`,
+    /// deduplicated in first-appearance order — so a caller filters on them
+    /// without parsing the title.
+    pub tags: Vec<String>,
     /// Whether Google's free-text `notes` field is non-empty. The field itself is
     /// not exposed: a bar row shows that notes *exist* (the `≡` marker), and
     /// shipping the body would put arbitrary user text through a pipe for nothing.
@@ -57,6 +61,7 @@ impl Entry {
             title: task.title.clone(),
             display_title: task.display_title().to_string(),
             entry_type: EntryKind::new(task.entry_type()),
+            tags: task.tags(),
             // `Some("")` is reachable — Google stores an empty string for notes
             // that were cleared in some clients — and an empty body is not a note
             // the user has. Presence means content.

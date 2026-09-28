@@ -1,6 +1,8 @@
 //! The ubiquitous language, as Rust types. Mirrors Google's model exactly
 //! (ADR-0003: pure mirror). See `CONTEXT.md` for definitions.
 
+use std::ops::Range;
+
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 
 /// A Google TaskList — a named container of Tasks.
@@ -80,6 +82,68 @@ impl Task {
     pub fn display_title(&self) -> &str {
         EntryType::parse(&self.title).1
     }
+
+    /// This entry's **Tags**, read from its display title. Never stored.
+    pub fn tags(&self) -> Vec<String> {
+        tags(self.display_title())
+    }
+}
+
+/// Whether `c` may appear in a Tag's name after the `#`.
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+/// The byte ranges of the **Tags** in `title`, each spanning `#name`.
+///
+/// A Tag is a `#` at the start of the title or after whitespace, followed by one
+/// or more letters, digits, `-` or `_`; the first other character ends it, so
+/// `#alice:` is the Tag `alice`. A `#` mid-word (`C#`, `issue#12`) or with no
+/// name after it is not a Tag.
+pub fn tag_ranges(title: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut after_space = true;
+    let mut chars = title.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        if c == '#' && after_space {
+            let mut end = start + 1;
+            while let Some(&(i, d)) = chars.peek() {
+                if !is_tag_char(d) {
+                    break;
+                }
+                end = i + d.len_utf8();
+                chars.next();
+            }
+            if end > start + 1 {
+                ranges.push(start..end);
+            }
+            after_space = false;
+            continue;
+        }
+        after_space = c.is_whitespace();
+    }
+    ranges
+}
+
+/// The Tag names in `title`: lower-cased, without the `#`, deduplicated in
+/// first-appearance order. The one spelling a Tag has wherever it is named — the
+/// tag picker, the `/` filter, the JSON CLI.
+pub fn tags(title: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for range in tag_ranges(title) {
+        let name = title[range.start + 1..range.end].to_lowercase();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The lower-cased Tag name `token` spells when the *whole* token is one Tag
+/// (`#alice` → `alice`), else `None` — a bare `#` or `#al:` names nothing.
+pub fn tag_name(token: &str) -> Option<String> {
+    let name = token.strip_prefix('#')?;
+    (!name.is_empty() && name.chars().all(is_tag_char)).then(|| name.to_lowercase())
 }
 
 /// The only two states a Task can be in.

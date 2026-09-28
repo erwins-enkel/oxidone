@@ -141,6 +141,7 @@ fn the_empty_query_lists_the_pinned_rows_then_lists_then_commands() {
                 OmniRow::Jump(JumpTarget::Today) => "Today".to_string(),
                 OmniRow::Jump(JumpTarget::Week) => "Week".to_string(),
                 OmniRow::Jump(JumpTarget::List { title, .. }) => title,
+                OmniRow::Tag(t) => format!("#{}", t.name),
                 OmniRow::Command(c) => format!(":{}", c.command.verb()),
                 OmniRow::Search { .. } => "SEARCH".to_string(),
                 OmniRow::Move(_) => "MOVE".to_string(),

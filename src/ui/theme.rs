@@ -21,6 +21,9 @@ pub struct Theme {
     pub accent: Color,
     /// A due date that has passed.
     pub overdue: Color,
+    /// A **Tag** (`#alice`) in a row's title — its own hue, so it never reads as
+    /// the `accent` focus highlight.
+    pub tag: Color,
 }
 
 impl Theme {
@@ -40,6 +43,7 @@ impl Theme {
             surface: conv(&c.surface1),
             accent: conv(&c.mauve),
             overdue: conv(&c.red),
+            tag: conv(&c.teal),
         }
     }
 }

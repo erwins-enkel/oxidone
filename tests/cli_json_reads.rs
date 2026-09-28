@@ -354,8 +354,8 @@ async fn an_entry_carries_everything_a_caller_needs_to_render_a_row() {
         .insert_task(
             &list,
             NewTask {
-                title: "○ Standup".into(),
-                notes: Some("daily".into()),
+                title: "○ Standup #Team #ops #team".into(),
+                notes: Some("daily #notes".into()),
                 due: Some(today()),
                 ..NewTask::default()
             },
@@ -370,9 +370,12 @@ async fn an_entry_carries_everything_a_caller_needs_to_render_a_row() {
     assert_eq!(row["id"], json!(id.0));
     assert_eq!(row["list"], json!(list.0));
     assert_eq!(row["parent"], Value::Null);
-    assert_eq!(row["title"], json!("○ Standup"));
-    assert_eq!(row["display_title"], json!("Standup"));
+    assert_eq!(row["title"], json!("○ Standup #Team #ops #team"));
+    assert_eq!(row["display_title"], json!("Standup #Team #ops #team"));
     assert_eq!(row["type"], json!("event"));
+    // Lower-cased, deduplicated in first-appearance order, and from the title
+    // only — never the notes.
+    assert_eq!(row["tags"], json!(["team", "ops"]));
     assert_eq!(row["has_notes"], json!(true));
     assert_eq!(row["due"], json!("2026-07-20"));
     assert_eq!(row["status"], json!("needsAction"));
@@ -400,6 +403,7 @@ async fn an_entry_carries_everything_a_caller_needs_to_render_a_row() {
             "parent",
             "position",
             "status",
+            "tags",
             "title",
             "type",
         ]

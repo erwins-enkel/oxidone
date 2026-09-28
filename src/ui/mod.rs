@@ -442,7 +442,7 @@ fn render_omnibox(
     selected: usize,
     theme: &Theme,
 ) {
-    // Clear of the status line and the legend, as both pickers are, and for the
+    // Clear of the status line and the legend, as the pickers are, and for the
     // same reason: that legend is what advertises this overlay's own keys.
     let body = Rect {
         height: area.height.saturating_sub(BOTTOM_CHROME_ROWS),
@@ -492,12 +492,13 @@ fn render_omnibox(
 }
 
 /// A panel title carrying a live query: the overlay's name, the query, and a
-/// caret. Shared by the Omnibox and the move-to-List picker, the two overlays
-/// whose query lives in their title rather than in a body line.
+/// caret. Shared by the Omnibox and the type-ahead pickers (move-to-List and
+/// tag, via `render_query_picker`), the overlays whose query lives in their
+/// title rather than in a body line.
 ///
 /// The name is always drawn, so the box is never nameless on an empty query, and
 /// the caret is unconditional — unlike `header_title`'s, which distinguishes a
-/// live filter from a committed one; neither of these two has committed state.
+/// live filter from a committed one; none of these has committed state.
 ///
 /// **Clipped from the left**, keeping the query's tail. `truncate` drops the
 /// tail, which here would hide the characters just typed *and* the caret with

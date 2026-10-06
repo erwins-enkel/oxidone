@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/erwins-enkel/oxidone/compare/v1.2.0...v1.3.0) (2026-10-06)
+
+
+### Features
+
+* **tags:** filter by #tag via picker, omnibox, colour and JSON ([#145](https://github.com/erwins-enkel/oxidone/issues/145)) ([4ab4766](https://github.com/erwins-enkel/oxidone/commit/4ab4766303f58a2fefedb2d10de72ec8147e3154))
+
 ## [1.2.0](https://github.com/erwins-enkel/oxidone/compare/v1.1.0...v1.2.0) (2026-09-11)
 
 
